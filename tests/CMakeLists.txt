@@ -80,6 +80,16 @@ target_link_libraries(test_update_manifest PRIVATE rtprotect_licensing rtprotect
 target_include_directories(test_update_manifest PRIVATE ${CMAKE_SOURCE_DIR})
 add_test(NAME test_update_manifest COMMAND test_update_manifest)
 
+add_executable(test_antitamper test_antitamper.cpp)
+target_link_libraries(test_antitamper PRIVATE rtprotect_antitamper)
+target_include_directories(test_antitamper PRIVATE ${CMAKE_SOURCE_DIR})
+add_test(NAME test_antitamper COMMAND test_antitamper)
+
+add_executable(test_opcode_map test_opcode_map.cpp)
+target_link_libraries(test_opcode_map PRIVATE rtprotect_vm)
+target_include_directories(test_opcode_map PRIVATE ${CMAKE_SOURCE_DIR})
+add_test(NAME test_opcode_map COMMAND test_opcode_map)
+
 # Phase 6 tests only exist when the experimental module itself is built --
 # see top-level CMakeLists.txt's RTPROTECT_ENABLE_EXPERIMENTAL_RUNTIME_RECONSTRUCTION.
 if(RTPROTECT_ENABLE_EXPERIMENTAL_RUNTIME_RECONSTRUCTION)

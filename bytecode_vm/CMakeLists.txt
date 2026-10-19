@@ -2,6 +2,7 @@ add_library(rtprotect_vm STATIC
     verifier.cpp
     vm.cpp
     serialize.cpp
+    opcode_map.cpp
 )
 
 target_include_directories(rtprotect_vm PUBLIC

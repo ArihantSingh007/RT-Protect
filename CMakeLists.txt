@@ -119,6 +119,7 @@ add_subdirectory(crypto)
 add_subdirectory(bytecode_vm)
 add_subdirectory(integrity)
 add_subdirectory(licensing)
+add_subdirectory(antitamper)
 add_subdirectory(obfuscation)
 
 if(RTPROTECT_ENABLE_EXPERIMENTAL_RUNTIME_RECONSTRUCTION)
