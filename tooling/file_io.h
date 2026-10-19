@@ -38,11 +38,13 @@
 
 namespace rtprotect::tooling {
 
+inline constexpr std::size_t kMaxFileReadBytes = 64 * 1024 * 1024;  // 64 MB
+
 inline std::optional<std::vector<std::uint8_t>> ReadFile(const std::string& path) {
   std::ifstream f(path, std::ios::binary | std::ios::ate);
   if (!f) return std::nullopt;
   std::streamsize size = f.tellg();
-  if (size < 0) return std::nullopt;
+  if (size < 0 || static_cast<std::size_t>(size) > kMaxFileReadBytes) return std::nullopt;
   f.seekg(0, std::ios::beg);
   std::vector<std::uint8_t> data(static_cast<std::size_t>(size));
   if (size > 0 && !f.read(reinterpret_cast<char*>(data.data()), size)) return std::nullopt;
@@ -50,14 +52,44 @@ inline std::optional<std::vector<std::uint8_t>> ReadFile(const std::string& path
 }
 
 inline bool WriteFile(const std::string& path, const std::uint8_t* data, std::size_t len) {
-  std::ofstream f(path, std::ios::binary | std::ios::trunc);
-  if (!f) return false;
-  if (len > 0) f.write(reinterpret_cast<const char*>(data), static_cast<std::streamsize>(len));
-  return static_cast<bool>(f);
+  // Atomic write via temporary file + rename
+  std::string tmp_path = path + ".tmp";
+  {
+    std::ofstream f(tmp_path, std::ios::binary | std::ios::trunc);
+    if (!f) return false;
+    if (len > 0) f.write(reinterpret_cast<const char*>(data), static_cast<std::streamsize>(len));
+    if (!f) {
+      std::remove(tmp_path.c_str());
+      return false;
+    }
+  }
+#if defined(_WIN32)
+  if (!MoveFileExA(tmp_path.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING)) {
+    std::remove(tmp_path.c_str());
+    return false;
+  }
+  return true;
+#else
+  if (std::rename(tmp_path.c_str(), path.c_str()) != 0) {
+    std::remove(tmp_path.c_str());
+    return false;
+  }
+  return true;
+#endif
 }
 
 inline bool WriteFile(const std::string& path, const std::vector<std::uint8_t>& data) {
   return WriteFile(path, data.data(), data.size());
+}
+
+inline std::optional<std::string> ReadTextFile(const std::string& path) {
+  auto bytes = ReadFile(path);
+  if (!bytes.has_value()) return std::nullopt;
+  return std::string(reinterpret_cast<const char*>(bytes->data()), bytes->size());
+}
+
+inline bool WriteTextFile(const std::string& path, const std::string& content) {
+  return WriteFile(path, reinterpret_cast<const std::uint8_t*>(content.data()), content.size());
 }
 
 #if defined(_WIN32)
