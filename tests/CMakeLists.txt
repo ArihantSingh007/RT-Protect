@@ -65,6 +65,21 @@ add_executable(test_checksum_flattened test_checksum_flattened.cpp)
 target_include_directories(test_checksum_flattened PRIVATE ${CMAKE_SOURCE_DIR})
 add_test(NAME test_checksum_flattened COMMAND test_checksum_flattened)
 
+add_executable(test_license test_license.cpp)
+target_link_libraries(test_license PRIVATE rtprotect_licensing rtprotect_licensing_buildtools rtprotect_integrity_buildtools)
+target_include_directories(test_license PRIVATE ${CMAKE_SOURCE_DIR})
+add_test(NAME test_license COMMAND test_license)
+
+add_executable(test_hardware_id test_hardware_id.cpp)
+target_link_libraries(test_hardware_id PRIVATE rtprotect_licensing)
+target_include_directories(test_hardware_id PRIVATE ${CMAKE_SOURCE_DIR})
+add_test(NAME test_hardware_id COMMAND test_hardware_id)
+
+add_executable(test_update_manifest test_update_manifest.cpp)
+target_link_libraries(test_update_manifest PRIVATE rtprotect_licensing rtprotect_licensing_buildtools rtprotect_integrity_buildtools)
+target_include_directories(test_update_manifest PRIVATE ${CMAKE_SOURCE_DIR})
+add_test(NAME test_update_manifest COMMAND test_update_manifest)
+
 # Phase 6 tests only exist when the experimental module itself is built --
 # see top-level CMakeLists.txt's RTPROTECT_ENABLE_EXPERIMENTAL_RUNTIME_RECONSTRUCTION.
 if(RTPROTECT_ENABLE_EXPERIMENTAL_RUNTIME_RECONSTRUCTION)

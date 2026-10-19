@@ -32,6 +32,7 @@ inline constexpr std::size_t kEd25519PublicKeyLen = 32;
 inline constexpr std::size_t kEd25519SignatureLen = 64;
 
 using Ed25519PublicKey = std::array<std::uint8_t, kEd25519PublicKeyLen>;
+using Ed25519Signature = std::array<std::uint8_t, kEd25519SignatureLen>;
 
 // Non-copyable, wipe-on-destruction, wipe-on-move-from. A fixed-size
 // (32-byte) secret, so unlike crypto::SecureBuffer this never reallocates
