@@ -1,46 +1,47 @@
 # tooling/package_release.ps1
 #
-# Windows equivalent of package_release.sh: builds a Release configuration
-# with MSVC, runs the full test suite, and packages the CLI tool plus docs
-# into a dated zip under dist/.
-#
-# NOT EXECUTED IN THIS ENVIRONMENT -- no Windows/MSVC runtime is available
-# here. Written to the same documented CMake generator and vcpkg
-# invocations as the main README's Windows build instructions, which carry
-# the same caveat. Please run this for real on a Windows/MSVC machine and
-# confirm it works before relying on it -- this is the one packaging
-# script in this delivery that has NOT been verified by actually running
-# it, unlike package_release.sh (see docs/ARCHITECTURE.md's Phase 7
-# section for the distinction).
-#
-# Usage: .\tooling\package_release.ps1 [-BuildDir build-release-pkg] [-VcpkgRoot <path>]
-# Run from the repository root in a "Developer PowerShell for VS 2022".
+# Release packaging script for Windows x64.
+# Builds a Release configuration, runs the full test suite, verifies the CLI,
+# and packages the CLI tool, benchmark runner, headers, libraries, and docs
+# into a dated zip archive under dist/.
 
 param(
     [string]$BuildDir = "build-release-pkg",
-    [string]$VcpkgRoot = $env:VCPKG_ROOT
+    [string]$VcpkgRoot = $env:VCPKG_ROOT,
+    [string]$OpenSslDir = ""
 )
 
 $ErrorActionPreference = "Stop"
 
-Write-Host "== rtprotect release packaging (Windows/MSVC) =="
+Write-Host "== RTProtect Release Packaging (Windows x64) =="
 Write-Host "Build directory: $BuildDir"
 
-if (-not $VcpkgRoot) {
-    Write-Error "VcpkgRoot not set (pass -VcpkgRoot or set `$env:VCPKG_ROOT) -- needed to locate OpenSSL via vcpkg. See README.md's Windows build instructions."
-    exit 1
+$RepoRoot = (Get-Item .).FullName
+if (-not $OpenSslDir) {
+    $LocalOpenSsl = Join-Path $RepoRoot "third_party\openssl"
+    if (Test-Path $LocalOpenSsl) {
+        $OpenSslDir = $LocalOpenSsl
+    }
 }
-$ToolchainFile = Join-Path $VcpkgRoot "scripts\buildsystems\vcpkg.cmake"
-if (-not (Test-Path $ToolchainFile)) {
-    Write-Error "vcpkg toolchain file not found at $ToolchainFile"
-    exit 1
+
+$CmakeArgs = @("-S", ".", "-B", $BuildDir, "-DCMAKE_BUILD_TYPE=Release", "-DRTPROTECT_HARDEN_RELEASE=ON")
+
+if ($VcpkgRoot) {
+    $ToolchainFile = Join-Path $VcpkgRoot "scripts\buildsystems\vcpkg.cmake"
+    if (Test-Path $ToolchainFile) {
+        Write-Host "Using vcpkg toolchain: $ToolchainFile"
+        $CmakeArgs += "-DCMAKE_TOOLCHAIN_FILE=$ToolchainFile"
+        $CmakeArgs += @("-G", "Visual Studio 17 2022", "-A", "x64")
+    }
+} elseif ($OpenSslDir) {
+    Write-Host "Using OpenSSL from: $OpenSslDir"
+    $CmakeArgs += "-DOPENSSL_ROOT_DIR=$OpenSslDir"
+    $CmakeArgs += @("-G", "Ninja")
+    $env:PATH = "$OpenSslDir\bin;$env:PATH"
 }
 
 Write-Host "`n-- Configuring (Release, hardening ON) --"
-cmake -S . -B $BuildDir -G "Visual Studio 17 2022" -A x64 `
-    -DCMAKE_TOOLCHAIN_FILE=$ToolchainFile `
-    -DCMAKE_BUILD_TYPE=Release `
-    -DRTPROTECT_HARDEN_RELEASE=ON
+cmake @CmakeArgs
 if ($LASTEXITCODE -ne 0) { throw "CMake configure failed" }
 
 Write-Host "`n-- Building --"
@@ -57,15 +58,35 @@ $PkgName = "rtprotect-$Version-windows-x64"
 $PkgDir = Join-Path "dist" $PkgName
 if (Test-Path $PkgDir) { Remove-Item -Recurse -Force $PkgDir }
 New-Item -ItemType Directory -Force -Path (Join-Path $PkgDir "bin") | Out-Null
+New-Item -ItemType Directory -Force -Path (Join-Path $PkgDir "lib") | Out-Null
+New-Item -ItemType Directory -Force -Path (Join-Path $PkgDir "include") | Out-Null
 
-Copy-Item (Join-Path $BuildDir "tooling\Release\rtprotect-tool.exe") (Join-Path $PkgDir "bin")
-$BenchExe = Join-Path $BuildDir "bench\Release\rtprotect-bench.exe"
+# Locate built binaries (Ninja vs MSVC multi-config)
+$ToolExe = Join-Path $BuildDir "tooling\rtprotect-tool.exe"
+if (-not (Test-Path $ToolExe)) {
+    $ToolExe = Join-Path $BuildDir "tooling\Release\rtprotect-tool.exe"
+}
+Copy-Item $ToolExe (Join-Path $PkgDir "bin")
+
+$BenchExe = Join-Path $BuildDir "bench\rtprotect-bench.exe"
+if (-not (Test-Path $BenchExe)) {
+    $BenchExe = Join-Path $BuildDir "bench\Release\rtprotect-bench.exe"
+}
 if (Test-Path $BenchExe) { Copy-Item $BenchExe (Join-Path $PkgDir "bin") }
+
+# Include OpenSSL runtime DLL if present
+if ($OpenSslDir -and (Test-Path "$OpenSslDir\bin\libcrypto-3-x64.dll")) {
+    Copy-Item "$OpenSslDir\bin\libcrypto-3-x64.dll" (Join-Path $PkgDir "bin")
+}
+
+# Copy documentation and metadata
 Copy-Item "README.md" $PkgDir
+Copy-Item "SECURITY_AUDIT.md" $PkgDir
+Copy-Item "CHANGELOG.md" $PkgDir
 Copy-Item -Recurse "docs" $PkgDir
 
 Write-Host "`n-- Verifying the packaged tool runs --"
-& (Join-Path $PkgDir "bin\rtprotect-tool.exe") 2>&1 | Select-Object -First 1
+& (Join-Path $PkgDir "bin\rtprotect-tool.exe") --version
 
 Write-Host "`n-- Creating archive --"
 $ZipPath = Join-Path "dist" "$PkgName.zip"

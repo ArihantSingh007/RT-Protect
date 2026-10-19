@@ -90,6 +90,11 @@ target_link_libraries(test_opcode_map PRIVATE rtprotect_vm)
 target_include_directories(test_opcode_map PRIVATE ${CMAKE_SOURCE_DIR})
 add_test(NAME test_opcode_map COMMAND test_opcode_map)
 
+add_executable(test_integration_engine test_integration_engine.cpp)
+target_link_libraries(test_integration_engine PRIVATE rtprotect_tooling)
+target_include_directories(test_integration_engine PRIVATE ${CMAKE_SOURCE_DIR})
+add_test(NAME test_integration_engine COMMAND test_integration_engine)
+
 # Phase 6 tests only exist when the experimental module itself is built --
 # see top-level CMakeLists.txt's RTPROTECT_ENABLE_EXPERIMENTAL_RUNTIME_RECONSTRUCTION.
 if(RTPROTECT_ENABLE_EXPERIMENTAL_RUNTIME_RECONSTRUCTION)

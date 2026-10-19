@@ -1,0 +1,9 @@
+build/
+build-*/
+build_exp/
+dist/
+*.obj
+*.exe
+*.a
+*.dll.a
+*.tmp
