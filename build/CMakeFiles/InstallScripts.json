@@ -1,0 +1,14 @@
+{
+	"InstallScripts" : 
+	[
+		"C:/Users/Arihant Singh/Downloads/rtprotect_hardening_WIP/build/cmake_install.cmake",
+		"C:/Users/Arihant Singh/Downloads/rtprotect_hardening_WIP/build/crypto/cmake_install.cmake",
+		"C:/Users/Arihant Singh/Downloads/rtprotect_hardening_WIP/build/bytecode_vm/cmake_install.cmake",
+		"C:/Users/Arihant Singh/Downloads/rtprotect_hardening_WIP/build/integrity/cmake_install.cmake",
+		"C:/Users/Arihant Singh/Downloads/rtprotect_hardening_WIP/build/obfuscation/cmake_install.cmake",
+		"C:/Users/Arihant Singh/Downloads/rtprotect_hardening_WIP/build/tooling/cmake_install.cmake",
+		"C:/Users/Arihant Singh/Downloads/rtprotect_hardening_WIP/build/bench/cmake_install.cmake",
+		"C:/Users/Arihant Singh/Downloads/rtprotect_hardening_WIP/build/tests/cmake_install.cmake"
+	],
+	"Parallel" : false
+}

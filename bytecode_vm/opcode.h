@@ -1,0 +1,108 @@
+// bytecode_vm/opcode.h
+//
+// Instruction set for the rtprotect bytecode VM (Phase 3).
+//
+// Design goals (see docs/ARCHITECTURE.md Phase 3 section for rationale):
+//   - Small, closed, explicitly enumerated instruction set -- no "escape
+//     hatch" opcode that calls arbitrary native code or memory addresses.
+//   - Fixed-width operands per opcode, decoded by a verifier pass before
+//     any execution (bytecode_vm/verifier.h) so the interpreter itself
+//     never needs to re-validate during a hot loop.
+//   - 64-bit signed integer as the only value type. This VM is scoped to
+//     protecting small numeric/logic functions (e.g. license/entitlement
+//     checks, checksum-style validation) -- it is explicitly NOT a
+//     general-purpose language VM. See docs/THREAT_MODEL.md for what
+//     "protecting" a function in this VM does and does not achieve.
+//
+// Encoding: one opcode byte, followed by zero or more operand bytes
+// (little-endian), per the table below.
+
+#pragma once
+
+#include <cstdint>
+
+namespace rtprotect::vm {
+
+enum class Opcode : std::uint8_t {
+  // --- stack manipulation ---
+  kPushConst = 0x01,  // operand: u16 constant-pool index. Pushes constants[idx].
+  kPushLocal = 0x02,  // operand: u8 local index. Pushes locals[idx].
+  kStoreLocal = 0x03, // operand: u8 local index. Pops top, stores into locals[idx].
+  kDup = 0x04,        // no operand. Duplicates top of stack.
+  kPop = 0x05,        // no operand. Discards top of stack.
+
+  // --- arithmetic (pop b, pop a, push a OP b) ---
+  kAdd = 0x10,
+  kSub = 0x11,
+  kMul = 0x12,
+  kDiv = 0x13,  // integer division; division by zero is a runtime fault (see VmError)
+  kMod = 0x14,  // modulo by zero is a runtime fault
+
+  // --- bitwise (pop b, pop a, push a OP b) ---
+  kAnd = 0x20,
+  kOr = 0x21,
+  kXor = 0x22,
+  kNot = 0x23,  // unary: pop a, push ~a
+
+  // --- comparison (pop b, pop a, push 1 or 0) ---
+  kCmpEq = 0x30,
+  kCmpLt = 0x31,
+  kCmpGt = 0x32,
+
+  // --- control flow ---
+  kJmp = 0x40,  // operand: u16 absolute byte offset into code. Unconditional jump.
+  kJz = 0x41,   // operand: u16 absolute byte offset. Pop a; jump if a == 0.
+  kJnz = 0x42,  // operand: u16 absolute byte offset. Pop a; jump if a != 0.
+
+  // --- termination ---
+  kRet = 0x50,  // no operand. Pop a, halt execution, a is the function's result.
+};
+
+// Returns the number of operand bytes following the opcode byte (0, 1, or 2).
+// Returns -1 for a byte that is not a recognized opcode, which the verifier
+// treats as a hard rejection (see verifier.h: kInvalidOpcode).
+inline int OperandBytes(Opcode op) {
+  switch (op) {
+    case Opcode::kPushConst:
+    case Opcode::kJmp:
+    case Opcode::kJz:
+    case Opcode::kJnz:
+      return 2;
+    case Opcode::kPushLocal:
+    case Opcode::kStoreLocal:
+      return 1;
+    case Opcode::kDup:
+    case Opcode::kPop:
+    case Opcode::kAdd:
+    case Opcode::kSub:
+    case Opcode::kMul:
+    case Opcode::kDiv:
+    case Opcode::kMod:
+    case Opcode::kAnd:
+    case Opcode::kOr:
+    case Opcode::kXor:
+    case Opcode::kNot:
+    case Opcode::kCmpEq:
+    case Opcode::kCmpLt:
+    case Opcode::kCmpGt:
+    case Opcode::kRet:
+      return 0;
+  }
+  return -1;
+}
+
+inline bool IsValidOpcode(std::uint8_t byte) {
+  switch (static_cast<Opcode>(byte)) {
+    case Opcode::kPushConst: case Opcode::kPushLocal: case Opcode::kStoreLocal:
+    case Opcode::kDup: case Opcode::kPop:
+    case Opcode::kAdd: case Opcode::kSub: case Opcode::kMul: case Opcode::kDiv: case Opcode::kMod:
+    case Opcode::kAnd: case Opcode::kOr: case Opcode::kXor: case Opcode::kNot:
+    case Opcode::kCmpEq: case Opcode::kCmpLt: case Opcode::kCmpGt:
+    case Opcode::kJmp: case Opcode::kJz: case Opcode::kJnz:
+    case Opcode::kRet:
+      return true;
+  }
+  return false;
+}
+
+}  // namespace rtprotect::vm

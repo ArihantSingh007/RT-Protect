@@ -1,0 +1,451 @@
+Start testing: Oct 20 02:11 India Standard Time
+----------------------------------------------------------
+1/12 Testing: test_aead
+1/12 Test: test_aead
+Command: "C:/Users/Arihant Singh/Downloads/rtprotect_hardening_WIP/build/tests/test_aead.exe"
+Directory: C:/Users/Arihant Singh/Downloads/rtprotect_hardening_WIP/build/tests
+"test_aead" start time: Oct 20 02:11 India Standard Time
+Output:
+----------------------------------------------------------
+[ RUN      ] RoundTrip_PlaintextRecoveredExactly
+[       OK ] RoundTrip_PlaintextRecoveredExactly
+[ RUN      ] RoundTrip_EmptyPlaintextWithAad
+[       OK ] RoundTrip_EmptyPlaintextWithAad
+[ RUN      ] Decrypt_FailsWithWrongKey
+[       OK ] Decrypt_FailsWithWrongKey
+[ RUN      ] Decrypt_FailsWithModifiedCiphertext
+[       OK ] Decrypt_FailsWithModifiedCiphertext
+[ RUN      ] Decrypt_FailsWithModifiedTag
+[       OK ] Decrypt_FailsWithModifiedTag
+[ RUN      ] Decrypt_FailsWithModifiedAad
+[       OK ] Decrypt_FailsWithModifiedAad
+[ RUN      ] Decrypt_FailsOnInvalidKeyLength
+[       OK ] Decrypt_FailsOnInvalidKeyLength
+[ RUN      ] Deserialize_FailsOnTruncatedInput
+[       OK ] Deserialize_FailsOnTruncatedInput
+[ RUN      ] SerializeDeserialize_RoundTrip
+[       OK ] SerializeDeserialize_RoundTrip
+[ RUN      ] Nonce_GeneratedValuesAreDistinct
+[       OK ] Nonce_GeneratedValuesAreDistinct
+[ RUN      ] Encrypt_SameKeyProducesDifferentCiphertextEachCall
+[       OK ] Encrypt_SameKeyProducesDifferentCiphertextEachCall
+[ RUN      ] Encrypt_RejectsOversizedPlaintext
+[       OK ] Encrypt_RejectsOversizedPlaintext
+[ RUN      ] Encrypt_RejectsOversizedAad
+[       OK ] Encrypt_RejectsOversizedAad
+[ RUN      ] Encrypt_AcceptsPlaintextExactlyAtBound
+[       OK ] Encrypt_AcceptsPlaintextExactlyAtBound
+[ RUN      ] Decrypt_RejectsOversizedAad
+[       OK ] Decrypt_RejectsOversizedAad
+[ RUN      ] Decrypt_WrongTag_DoesNotReturnPartialPlaintext
+[       OK ] Decrypt_WrongTag_DoesNotReturnPartialPlaintext
+---- 16/16 tests passed ----
+<end of output>
+Test time =   0.13 sec
+----------------------------------------------------------
+Test Passed.
+"test_aead" end time: Oct 20 02:11 India Standard Time
+"test_aead" time elapsed: 00:00:00
+----------------------------------------------------------
+
+2/12 Testing: test_kdf
+2/12 Test: test_kdf
+Command: "C:/Users/Arihant Singh/Downloads/rtprotect_hardening_WIP/build/tests/test_kdf.exe"
+Directory: C:/Users/Arihant Singh/Downloads/rtprotect_hardening_WIP/build/tests
+"test_kdf" start time: Oct 20 02:11 India Standard Time
+Output:
+----------------------------------------------------------
+[ RUN      ] Hkdf_RFC5869_TestCase1_BasicWithSaltAndInfo
+[       OK ] Hkdf_RFC5869_TestCase1_BasicWithSaltAndInfo
+[ RUN      ] Hkdf_RFC5869_TestCase3_EmptySaltAndEmptyInfo
+[       OK ] Hkdf_RFC5869_TestCase3_EmptySaltAndEmptyInfo
+[ RUN      ] Hkdf_DeterministicForSameInputs
+[       OK ] Hkdf_DeterministicForSameInputs
+[ RUN      ] Hkdf_DifferentInfoProducesDifferentKeys
+[       OK ] Hkdf_DifferentInfoProducesDifferentKeys
+[ RUN      ] Hkdf_DifferentSaltProducesDifferentKeys
+[       OK ] Hkdf_DifferentSaltProducesDifferentKeys
+[ RUN      ] Hkdf_SupportsArbitraryOutputLength
+[       OK ] Hkdf_SupportsArbitraryOutputLength
+[ RUN      ] Hkdf_RejectsZeroOutputLength
+[       OK ] Hkdf_RejectsZeroOutputLength
+[ RUN      ] Hkdf_AcceptsOutputLengthExactlyAtMaximum
+[       OK ] Hkdf_AcceptsOutputLengthExactlyAtMaximum
+[ RUN      ] Hkdf_RejectsOutputLengthOneOverMaximum
+[       OK ] Hkdf_RejectsOutputLengthOneOverMaximum
+[ RUN      ] Hkdf_EmptySecret_HandledWithoutCrash
+[       OK ] Hkdf_EmptySecret_HandledWithoutCrash
+---- 10/10 tests passed ----
+<end of output>
+Test time =   0.10 sec
+----------------------------------------------------------
+Test Passed.
+"test_kdf" end time: Oct 20 02:11 India Standard Time
+"test_kdf" time elapsed: 00:00:00
+----------------------------------------------------------
+
+3/12 Testing: test_vm
+3/12 Test: test_vm
+Command: "C:/Users/Arihant Singh/Downloads/rtprotect_hardening_WIP/build/tests/test_vm.exe"
+Directory: C:/Users/Arihant Singh/Downloads/rtprotect_hardening_WIP/build/tests
+"test_vm" start time: Oct 20 02:11 India Standard Time
+Output:
+----------------------------------------------------------
+[ RUN      ] Vm_TrivialReturnValue
+[       OK ] Vm_TrivialReturnValue
+[ RUN      ] Vm_Arithmetic_AddSubMulDivMod
+[       OK ] Vm_Arithmetic_AddSubMulDivMod
+[ RUN      ] Vm_Bitwise_AndOrXorNot
+[       OK ] Vm_Bitwise_AndOrXorNot
+[ RUN      ] Vm_Comparisons
+[       OK ] Vm_Comparisons
+[ RUN      ] Vm_LocalsAndArgs
+[       OK ] Vm_LocalsAndArgs
+[ RUN      ] Vm_DupAndPop
+[       OK ] Vm_DupAndPop
+[ RUN      ] Vm_LoopWithJmpAndJz_SumOneToN
+[       OK ] Vm_LoopWithJmpAndJz_SumOneToN
+[ RUN      ] Vm_DivisionByZero_IsReportedNotUB
+[       OK ] Vm_DivisionByZero_IsReportedNotUB
+[ RUN      ] Vm_ModuloByZero_IsReported
+[       OK ] Vm_ModuloByZero_IsReported
+[ RUN      ] Vm_InfiniteLoop_HitsInstructionBudget
+[       OK ] Vm_InfiniteLoop_HitsInstructionBudget
+[ RUN      ] Vm_RuntimeInfiniteLoop_HitsInstructionBudget
+[       OK ] Vm_RuntimeInfiniteLoop_HitsInstructionBudget
+[ RUN      ] Vm_WrongNumberOfArgs_ExceedsLocals
+[       OK ] Vm_WrongNumberOfArgs_ExceedsLocals
+[ RUN      ] Verify_RejectsInvalidOpcodeByte
+[       OK ] Verify_RejectsInvalidOpcodeByte
+[ RUN      ] Verify_RejectsTruncatedOperand
+[       OK ] Verify_RejectsTruncatedOperand
+[ RUN      ] Verify_RejectsOutOfRangeConstantIndex
+[       OK ] Verify_RejectsOutOfRangeConstantIndex
+[ RUN      ] Verify_RejectsOutOfRangeLocalIndex
+[       OK ] Verify_RejectsOutOfRangeLocalIndex
+[ RUN      ] Verify_RejectsJumpTargetBeyondCodeBounds
+[       OK ] Verify_RejectsJumpTargetBeyondCodeBounds
+[ RUN      ] Verify_RejectsJumpTargetMisaligned
+[       OK ] Verify_RejectsJumpTargetMisaligned
+[ RUN      ] Verify_RejectsControlFlowFallingOffEnd
+[       OK ] Verify_RejectsControlFlowFallingOffEnd
+[ RUN      ] Verify_RejectsEmptyProgram
+[       OK ] Verify_RejectsEmptyProgram
+[ RUN      ] Verify_RejectsStackDepthConflictAtMergePoint
+[       OK ] Verify_RejectsStackDepthConflictAtMergePoint
+[ RUN      ] Verify_AcceptsConsistentStackDepthAtMergePoint
+[       OK ] Verify_AcceptsConsistentStackDepthAtMergePoint
+[ RUN      ] Verify_AcceptsValidJumpToInstructionBoundary
+[       OK ] Verify_AcceptsValidJumpToInstructionBoundary
+[ RUN      ] Verify_RejectsStaticStackUnderflow
+[       OK ] Verify_RejectsStaticStackUnderflow
+[ RUN      ] Verify_RejectsStaticStackOverflow
+[       OK ] Verify_RejectsStaticStackOverflow
+[ RUN      ] Vm_Div_Int64MinByNegOne_ReportsOverflowNotCrash
+[       OK ] Vm_Div_Int64MinByNegOne_ReportsOverflowNotCrash
+[ RUN      ] Vm_Mod_Int64MinByNegOne_ReportsOverflowNotCrash
+[       OK ] Vm_Mod_Int64MinByNegOne_ReportsOverflowNotCrash
+[ RUN      ] Vm_Div_RegularValues_StillWorkCorrectly
+[       OK ] Vm_Div_RegularValues_StillWorkCorrectly
+[ RUN      ] Vm_Mod_RegularValues_StillWorkCorrectly
+[       OK ] Vm_Mod_RegularValues_StillWorkCorrectly
+[ RUN      ] Vm_Add_Int64MaxPlusOne_ReportsOverflow
+[       OK ] Vm_Add_Int64MaxPlusOne_ReportsOverflow
+[ RUN      ] Vm_Add_RegularValues_StillWorkCorrectly
+[       OK ] Vm_Add_RegularValues_StillWorkCorrectly
+[ RUN      ] Vm_Sub_Int64MinMinusOne_ReportsOverflow
+[       OK ] Vm_Sub_Int64MinMinusOne_ReportsOverflow
+[ RUN      ] Vm_Sub_RegularValues_StillWorkCorrectly
+[       OK ] Vm_Sub_RegularValues_StillWorkCorrectly
+[ RUN      ] Vm_Mul_Int64MinTimesNegOne_ReportsOverflow
+[       OK ] Vm_Mul_Int64MinTimesNegOne_ReportsOverflow
+[ RUN      ] Vm_Mul_LargeValuesThatOverflow_ReportsOverflow
+[       OK ] Vm_Mul_LargeValuesThatOverflow_ReportsOverflow
+[ RUN      ] Vm_Mul_RegularValues_StillWorkCorrectly
+[       OK ] Vm_Mul_RegularValues_StillWorkCorrectly
+[ RUN      ] Vm_Div_ByZero_StillReportsDivisionByZeroNotOverflow
+[       OK ] Vm_Div_ByZero_StillReportsDivisionByZeroNotOverflow
+---- 37/37 tests passed ----
+<end of output>
+Test time =   0.02 sec
+----------------------------------------------------------
+Test Passed.
+"test_vm" end time: Oct 20 02:11 India Standard Time
+"test_vm" time elapsed: 00:00:00
+----------------------------------------------------------
+
+4/12 Testing: test_protected_checksum
+4/12 Test: test_protected_checksum
+Command: "C:/Users/Arihant Singh/Downloads/rtprotect_hardening_WIP/build/tests/test_protected_checksum.exe"
+Directory: C:/Users/Arihant Singh/Downloads/rtprotect_hardening_WIP/build/tests
+"test_protected_checksum" start time: Oct 20 02:11 India Standard Time
+Output:
+----------------------------------------------------------
+[ RUN      ] Checksum_VmMatchesNativeReference_UnencryptedBytecode
+[       OK ] Checksum_VmMatchesNativeReference_UnencryptedBytecode
+[ RUN      ] Checksum_EncryptedRoundTrip_CorrectValueForValidKey
+[       OK ] Checksum_EncryptedRoundTrip_CorrectValueForValidKey
+[ RUN      ] Checksum_EncryptedBlob_RejectsWrongKey
+[       OK ] Checksum_EncryptedBlob_RejectsWrongKey
+[ RUN      ] Checksum_EncryptedBlob_RejectsTamperedCiphertext
+[       OK ] Checksum_EncryptedBlob_RejectsTamperedCiphertext
+[ RUN      ] Checksum_EncryptedBlob_RejectsTruncatedBlob
+[       OK ] Checksum_EncryptedBlob_RejectsTruncatedBlob
+[ RUN      ] VerifiedChecksum_FullPipeline_CorrectValueForValidEverything
+[       OK ] VerifiedChecksum_FullPipeline_CorrectValueForValidEverything
+[ RUN      ] VerifiedChecksum_RejectsUntrustedPublicKey
+[       OK ] VerifiedChecksum_RejectsUntrustedPublicKey
+[ RUN      ] VerifiedChecksum_RejectsWholesaleBlobSubstitutionFromAnotherRelease
+[       OK ] VerifiedChecksum_RejectsWholesaleBlobSubstitutionFromAnotherRelease
+[ RUN      ] VerifiedChecksum_RejectsTamperedManifest
+[       OK ] VerifiedChecksum_RejectsTamperedManifest
+[ RUN      ] VerifiedChecksum_RejectsWrongMasterSecret
+[       OK ] VerifiedChecksum_RejectsWrongMasterSecret
+---- 10/10 tests passed ----
+<end of output>
+Test time =   0.14 sec
+----------------------------------------------------------
+Test Passed.
+"test_protected_checksum" end time: Oct 20 02:11 India Standard Time
+"test_protected_checksum" time elapsed: 00:00:00
+----------------------------------------------------------
+
+5/12 Testing: test_manifest
+5/12 Test: test_manifest
+Command: "C:/Users/Arihant Singh/Downloads/rtprotect_hardening_WIP/build/tests/test_manifest.exe"
+Directory: C:/Users/Arihant Singh/Downloads/rtprotect_hardening_WIP/build/tests
+"test_manifest" start time: Oct 20 02:11 India Standard Time
+Output:
+----------------------------------------------------------
+[ RUN      ] Manifest_AddResource_ComputesCorrectHashAndSize
+[       OK ] Manifest_AddResource_ComputesCorrectHashAndSize
+[ RUN      ] Manifest_Find_ReturnsNullForUnknownName
+[       OK ] Manifest_Find_ReturnsNullForUnknownName
+[ RUN      ] Manifest_SerializeDeserialize_RoundTrip
+[       OK ] Manifest_SerializeDeserialize_RoundTrip
+[ RUN      ] Manifest_Serialize_IsDeterministic
+[       OK ] Manifest_Serialize_IsDeterministic
+[ RUN      ] Manifest_Deserialize_RejectsTruncatedInput
+[       OK ] Manifest_Deserialize_RejectsTruncatedInput
+[ RUN      ] Manifest_Deserialize_RejectsTrailingGarbage
+[       OK ] Manifest_Deserialize_RejectsTrailingGarbage
+[ RUN      ] Sha256_SameInputSameOutput_DifferentInputDifferentOutput
+[       OK ] Sha256_SameInputSameOutput_DifferentInputDifferentOutput
+[ RUN      ] Manifest_AddResource_RejectsDuplicateName
+[       OK ] Manifest_AddResource_RejectsDuplicateName
+[ RUN      ] Manifest_AddResource_RejectsEmptyName
+[       OK ] Manifest_AddResource_RejectsEmptyName
+[ RUN      ] Manifest_Deserialize_RejectsSerializedDuplicateNames
+[       OK ] Manifest_Deserialize_RejectsSerializedDuplicateNames
+[ RUN      ] Manifest_Deserialize_RejectsSerializedEmptyName
+[       OK ] Manifest_Deserialize_RejectsSerializedEmptyName
+[ RUN      ] Manifest_Deserialize_RejectsExcessiveResourceCount
+[       OK ] Manifest_Deserialize_RejectsExcessiveResourceCount
+[ RUN      ] Manifest_ReleaseSequence_RoundTripsThroughSerialization
+[       OK ] Manifest_ReleaseSequence_RoundTripsThroughSerialization
+[ RUN      ] Manifest_ReleaseSequence_DefaultsToZero
+[       OK ] Manifest_ReleaseSequence_DefaultsToZero
+[ RUN      ] CheckRollback_AcceptsSequenceAtOrAboveMinimum
+[       OK ] CheckRollback_AcceptsSequenceAtOrAboveMinimum
+[ RUN      ] CheckRollback_RejectsSequenceBelowMinimum
+[       OK ] CheckRollback_RejectsSequenceBelowMinimum
+---- 16/16 tests passed ----
+<end of output>
+Test time =   0.11 sec
+----------------------------------------------------------
+Test Passed.
+"test_manifest" end time: Oct 20 02:11 India Standard Time
+"test_manifest" time elapsed: 00:00:00
+----------------------------------------------------------
+
+6/12 Testing: test_signing
+6/12 Test: test_signing
+Command: "C:/Users/Arihant Singh/Downloads/rtprotect_hardening_WIP/build/tests/test_signing.exe"
+Directory: C:/Users/Arihant Singh/Downloads/rtprotect_hardening_WIP/build/tests
+"test_signing" start time: Oct 20 02:11 India Standard Time
+Output:
+----------------------------------------------------------
+[ RUN      ] Signing_ValidSignature_Verifies
+[       OK ] Signing_ValidSignature_Verifies
+[ RUN      ] Signing_RejectsWrongPublicKey
+[       OK ] Signing_RejectsWrongPublicKey
+[ RUN      ] Signing_RejectsModifiedManifestBytes
+[       OK ] Signing_RejectsModifiedManifestBytes
+[ RUN      ] Signing_RejectsModifiedSignature
+[       OK ] Signing_RejectsModifiedSignature
+[ RUN      ] Signing_DifferentManifestsProduceDifferentSignatures
+[       OK ] Signing_DifferentManifestsProduceDifferentSignatures
+[ RUN      ] VerifyAndCheckResource_ValidEverything_Succeeds
+[       OK ] VerifyAndCheckResource_ValidEverything_Succeeds
+[ RUN      ] VerifyAndCheckResource_TamperedResource_FailsHashCheck
+[       OK ] VerifyAndCheckResource_TamperedResource_FailsHashCheck
+[ RUN      ] VerifyAndCheckResource_WholesaleBlobSubstitution_Detected
+[       OK ] VerifyAndCheckResource_WholesaleBlobSubstitution_Detected
+[ RUN      ] VerifyAndCheckResource_SignatureCheckedBeforeResourceLookup
+[       OK ] VerifyAndCheckResource_SignatureCheckedBeforeResourceLookup
+[ RUN      ] VerifyAndCheckResource_ResourceNotListed_Rejected
+[       OK ] VerifyAndCheckResource_ResourceNotListed_Rejected
+---- 10/10 tests passed ----
+<end of output>
+Test time =   0.10 sec
+----------------------------------------------------------
+Test Passed.
+"test_signing" end time: Oct 20 02:11 India Standard Time
+"test_signing" time elapsed: 00:00:00
+----------------------------------------------------------
+
+7/12 Testing: test_bound_key
+7/12 Test: test_bound_key
+Command: "C:/Users/Arihant Singh/Downloads/rtprotect_hardening_WIP/build/tests/test_bound_key.exe"
+Directory: C:/Users/Arihant Singh/Downloads/rtprotect_hardening_WIP/build/tests
+"test_bound_key" start time: Oct 20 02:11 India Standard Time
+Output:
+----------------------------------------------------------
+[ RUN      ] BoundKey_CorrectManifestAndResource_RoundTrips
+[       OK ] BoundKey_CorrectManifestAndResource_RoundTrips
+[ RUN      ] BoundKey_SwappedOlderRelease_FailsViaAeadAlone_NoHashCheckCalled
+[       OK ] BoundKey_SwappedOlderRelease_FailsViaAeadAlone_NoHashCheckCalled
+[ RUN      ] BoundKey_DifferentResourceNames_ProduceDifferentKeys
+[       OK ] BoundKey_DifferentResourceNames_ProduceDifferentKeys
+[ RUN      ] BoundKey_DifferentMasterSecrets_ProduceDifferentKeys
+[       OK ] BoundKey_DifferentMasterSecrets_ProduceDifferentKeys
+---- 4/4 tests passed ----
+<end of output>
+Test time =   0.12 sec
+----------------------------------------------------------
+Test Passed.
+"test_bound_key" end time: Oct 20 02:11 India Standard Time
+"test_bound_key" time elapsed: 00:00:00
+----------------------------------------------------------
+
+8/12 Testing: test_file_io
+8/12 Test: test_file_io
+Command: "C:/Users/Arihant Singh/Downloads/rtprotect_hardening_WIP/build/tests/test_file_io.exe"
+Directory: C:/Users/Arihant Singh/Downloads/rtprotect_hardening_WIP/build/tests
+"test_file_io" start time: Oct 20 02:11 India Standard Time
+Output:
+----------------------------------------------------------
+<end of output>
+Test time =   0.07 sec
+----------------------------------------------------------
+Test Passed.
+"test_file_io" end time: Oct 20 02:11 India Standard Time
+"test_file_io" time elapsed: 00:00:00
+----------------------------------------------------------
+
+9/12 Testing: test_checked_arith_fallback
+9/12 Test: test_checked_arith_fallback
+Command: "C:/Users/Arihant Singh/Downloads/rtprotect_hardening_WIP/build/tests/test_checked_arith_fallback.exe"
+Directory: C:/Users/Arihant Singh/Downloads/rtprotect_hardening_WIP/build/tests
+"test_checked_arith_fallback" start time: Oct 20 02:11 India Standard Time
+Output:
+----------------------------------------------------------
+[ RUN      ] FallbackAdd_MatchesBuiltin_EdgeCases
+[       OK ] FallbackAdd_MatchesBuiltin_EdgeCases
+[ RUN      ] FallbackSub_MatchesBuiltin_EdgeCases
+[       OK ] FallbackSub_MatchesBuiltin_EdgeCases
+[ RUN      ] FallbackMul_MatchesBuiltin_EdgeCases
+[       OK ] FallbackMul_MatchesBuiltin_EdgeCases
+[ RUN      ] FallbackAdd_MatchesBuiltin_2MillionRandomInputs
+[       OK ] FallbackAdd_MatchesBuiltin_2MillionRandomInputs
+[ RUN      ] FallbackSub_MatchesBuiltin_2MillionRandomInputs
+[       OK ] FallbackSub_MatchesBuiltin_2MillionRandomInputs
+[ RUN      ] FallbackMul_MatchesBuiltin_2MillionRandomInputs
+[       OK ] FallbackMul_MatchesBuiltin_2MillionRandomInputs
+---- 6/6 tests passed ----
+<end of output>
+Test time =   0.57 sec
+----------------------------------------------------------
+Test Passed.
+"test_checked_arith_fallback" end time: Oct 20 02:11 India Standard Time
+"test_checked_arith_fallback" time elapsed: 00:00:00
+----------------------------------------------------------
+
+10/12 Testing: test_secure_buffer
+10/12 Test: test_secure_buffer
+Command: "C:/Users/Arihant Singh/Downloads/rtprotect_hardening_WIP/build/tests/test_secure_buffer.exe"
+Directory: C:/Users/Arihant Singh/Downloads/rtprotect_hardening_WIP/build/tests
+"test_secure_buffer" start time: Oct 20 02:11 India Standard Time
+Output:
+----------------------------------------------------------
+[ RUN      ] SecureBuffer_SizeConstructor_ZeroInitializes
+[       OK ] SecureBuffer_SizeConstructor_ZeroInitializes
+[ RUN      ] SecureBuffer_PointerConstructor_CopiesContent
+[       OK ] SecureBuffer_PointerConstructor_CopiesContent
+[ RUN      ] SecureBuffer_EmptyBuffer_SafeToConstructAndDestroy
+[       OK ] SecureBuffer_EmptyBuffer_SafeToConstructAndDestroy
+[ RUN      ] SecureBuffer_MoveConstruct_TransfersOwnership
+[       OK ] SecureBuffer_MoveConstruct_TransfersOwnership
+[ RUN      ] SecureBuffer_MoveAssign_TransfersOwnershipAndWipesTarget
+[       OK ] SecureBuffer_MoveAssign_TransfersOwnershipAndWipesTarget
+[ RUN      ] SecureBuffer_SelfMoveAssign_DoesNotCorruptOrCrash
+[       OK ] SecureBuffer_SelfMoveAssign_DoesNotCorruptOrCrash
+[ RUN      ] SecureBuffer_Resize_Grow_PreservesPrefixAndZeroFillsTail
+[       OK ] SecureBuffer_Resize_Grow_PreservesPrefixAndZeroFillsTail
+[ RUN      ] SecureBuffer_Resize_Shrink_PreservesPrefix
+[       OK ] SecureBuffer_Resize_Shrink_PreservesPrefix
+[ RUN      ] SecureBuffer_Resize_ToZero_SafeAndEmpty
+[       OK ] SecureBuffer_Resize_ToZero_SafeAndEmpty
+[ RUN      ] SecureBuffer_RepeatedGrowShrink_NoCorruption
+[       OK ] SecureBuffer_RepeatedGrowShrink_NoCorruption
+[ RUN      ] SecureBuffer_Clone_IsIndependentCopy
+[       OK ] SecureBuffer_Clone_IsIndependentCopy
+---- 11/11 tests passed ----
+<end of output>
+Test time =   0.12 sec
+----------------------------------------------------------
+Test Passed.
+"test_secure_buffer" end time: Oct 20 02:11 India Standard Time
+"test_secure_buffer" time elapsed: 00:00:00
+----------------------------------------------------------
+
+11/12 Testing: test_obfuscated_string
+11/12 Test: test_obfuscated_string
+Command: "C:/Users/Arihant Singh/Downloads/rtprotect_hardening_WIP/build/tests/test_obfuscated_string.exe"
+Directory: C:/Users/Arihant Singh/Downloads/rtprotect_hardening_WIP/build/tests
+"test_obfuscated_string" start time: Oct 20 02:11 India Standard Time
+Output:
+----------------------------------------------------------
+[ RUN      ] ObfuscatedString_RoundTrip_RecoversOriginalExactly
+[       OK ] ObfuscatedString_RoundTrip_RecoversOriginalExactly
+[ RUN      ] ObfuscatedString_EmptyString_RoundTrips
+[       OK ] ObfuscatedString_EmptyString_RoundTrips
+[ RUN      ] ObfuscatedString_SizeExcludesNullTerminatorInSize
+[       OK ] ObfuscatedString_SizeExcludesNullTerminatorInSize
+[ RUN      ] ObfuscatedString_CipherBytesDifferFromPlaintext
+[       OK ] ObfuscatedString_CipherBytesDifferFromPlaintext
+[ RUN      ] ObfuscatedString_DifferentCallSites_ProduceDifferentSeeds
+[       OK ] ObfuscatedString_DifferentCallSites_ProduceDifferentSeeds
+---- 5/5 tests passed ----
+<end of output>
+Test time =   0.09 sec
+----------------------------------------------------------
+Test Passed.
+"test_obfuscated_string" end time: Oct 20 02:11 India Standard Time
+"test_obfuscated_string" time elapsed: 00:00:00
+----------------------------------------------------------
+
+12/12 Testing: test_checksum_flattened
+12/12 Test: test_checksum_flattened
+Command: "C:/Users/Arihant Singh/Downloads/rtprotect_hardening_WIP/build/tests/test_checksum_flattened.exe"
+Directory: C:/Users/Arihant Singh/Downloads/rtprotect_hardening_WIP/build/tests
+"test_checksum_flattened" start time: Oct 20 02:11 India Standard Time
+Output:
+----------------------------------------------------------
+[ RUN      ] Flattened_MatchesNativeReference
+[       OK ] Flattened_MatchesNativeReference
+[ RUN      ] Flattened_HandlesZeroAndNegativeInputs
+[       OK ] Flattened_HandlesZeroAndNegativeInputs
+[ RUN      ] Flattened_IndicativeTimingComparison_PrintedNotAsserted
+  [timing] native: 13.304 ms, flattened: 15.455 ms, over 200000 iterations (sinks: 99962347581298, 99962347581298)
+[       OK ] Flattened_IndicativeTimingComparison_PrintedNotAsserted
+---- 3/3 tests passed ----
+<end of output>
+Test time =   0.10 sec
+----------------------------------------------------------
+Test Passed.
+"test_checksum_flattened" end time: Oct 20 02:11 India Standard Time
+"test_checksum_flattened" time elapsed: 00:00:00
+----------------------------------------------------------
+
+End testing: Oct 20 02:11 India Standard Time

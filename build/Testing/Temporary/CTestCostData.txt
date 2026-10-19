@@ -1,0 +1,13 @@
+test_aead 2 0.0649834
+test_kdf 2 0.0484371
+test_vm 1 0.0216306
+test_protected_checksum 1 0.139058
+test_manifest 2 0.0543954
+test_signing 2 0.0517179
+test_bound_key 2 0.0624271
+test_file_io 2 0.0350512
+test_checked_arith_fallback 2 0.283999
+test_secure_buffer 2 0.0620379
+test_obfuscated_string 2 0.0429623
+test_checksum_flattened 2 0.0506038
+---
