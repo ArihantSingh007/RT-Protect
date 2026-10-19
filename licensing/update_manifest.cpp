@@ -4,6 +4,8 @@
 
 #include <cstring>
 #include <algorithm>
+#include <filesystem>
+#include <fstream>
 
 #include "integrity/signer.h"
 #include "integrity/verifier.h"
@@ -157,6 +159,67 @@ UpdateStatus VerifyUpdateMetadata(const UpdatePackage& pkg,
   }
 
   return UpdateStatus::kValid;
+}
+
+UpdateStatus VerifyUpdatePayload(const UpdatePackage& pkg, const std::string& update_dir) {
+  std::filesystem::path root(update_dir);
+  std::error_code ec;
+  if (!std::filesystem::exists(root, ec) || !std::filesystem::is_directory(root, ec)) {
+    return UpdateStatus::kFileNotFound;
+  }
+
+  for (const auto& file : pkg.files) {
+    if (!integrity::IsValidResourceIdentifier(file.name)) {
+      return UpdateStatus::kMalformedManifest;
+    }
+
+    std::filesystem::path full_path = root / file.name;
+    if (!std::filesystem::exists(full_path, ec) || !std::filesystem::is_regular_file(full_path, ec)) {
+      return UpdateStatus::kFileNotFound;
+    }
+
+    auto file_size = std::filesystem::file_size(full_path, ec);
+    if (ec || file_size != file.size) {
+      return UpdateStatus::kPayloadHashMismatch;
+    }
+
+    // Limit maximum single-file memory read to 512MB
+    if (file.size > 512ULL * 1024 * 1024) {
+      return UpdateStatus::kPayloadHashMismatch;
+    }
+
+    std::ifstream ifs(full_path, std::ios::binary);
+    if (!ifs) {
+      return UpdateStatus::kFileNotFound;
+    }
+
+    std::vector<std::uint8_t> buffer(file.size);
+    if (file.size > 0) {
+      ifs.read(reinterpret_cast<char*>(buffer.data()), file.size);
+      if (static_cast<std::size_t>(ifs.gcount()) != file.size) {
+        return UpdateStatus::kPayloadHashMismatch;
+      }
+    }
+
+    auto actual_hash = integrity::Sha256(buffer.data(), buffer.size());
+    if (!actual_hash.has_value() || *actual_hash != file.sha256) {
+      return UpdateStatus::kPayloadHashMismatch;
+    }
+  }
+
+  return UpdateStatus::kValid;
+}
+
+UpdateStatus VerifyUpdate(const UpdatePackage& pkg,
+                         const integrity::Ed25519PublicKey& pubkey,
+                         const std::string& expected_product,
+                         std::uint64_t current_installed_sequence,
+                         const std::string& update_dir) {
+  auto status = VerifyUpdateMetadata(pkg, pubkey, expected_product, current_installed_sequence);
+  if (status != UpdateStatus::kValid) {
+    return status;
+  }
+  return VerifyUpdatePayload(pkg, update_dir);
 }
 
 }  // namespace rtprotect::licensing

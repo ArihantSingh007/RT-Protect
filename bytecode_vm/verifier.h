@@ -85,10 +85,13 @@ enum class VerifyError {
 
 const char* ToString(VerifyError error);
 
+class OpcodeMap;
+
 // On success, returns the set of byte offsets where an instruction begins
 // (used internally to validate jump targets, exposed here mainly so tests
 // can inspect it). On failure, returns std::nullopt and sets *out_error.
+// If opcode_map is non-null, instruction opcodes are decoded through the map.
 std::optional<std::unordered_set<std::uint32_t>> VerifyProgram(
-    const Program& program, VerifyError* out_error);
+    const Program& program, VerifyError* out_error, const OpcodeMap* opcode_map = nullptr);
 
 }  // namespace rtprotect::vm

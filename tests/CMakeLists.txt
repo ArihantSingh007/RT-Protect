@@ -108,3 +108,8 @@ if(RTPROTECT_ENABLE_EXPERIMENTAL_RUNTIME_RECONSTRUCTION)
   target_include_directories(test_reconstructed_function PRIVATE ${CMAKE_SOURCE_DIR})
   add_test(NAME test_reconstructed_function COMMAND test_reconstructed_function)
 endif()
+
+if(WIN32 AND EXISTS "${CMAKE_SOURCE_DIR}/third_party/openssl/bin")
+  file(COPY "${CMAKE_SOURCE_DIR}/third_party/openssl/bin/libcrypto-3-x64.dll"
+       DESTINATION "${CMAKE_CURRENT_BINARY_DIR}")
+endif()

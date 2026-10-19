@@ -4,6 +4,7 @@
 #include <vector>
 
 #include "bytecode_vm/opcode.h"
+#include "bytecode_vm/opcode_map.h"
 
 namespace rtprotect::vm {
 
@@ -90,7 +91,8 @@ StackEffect GetStackEffect(Opcode op) {
 }  // namespace
 
 std::optional<std::unordered_set<std::uint32_t>> VerifyProgram(const Program& program,
-                                                                 VerifyError* out_error) {
+                                                                 VerifyError* out_error,
+                                                                 const OpcodeMap* opcode_map) {
   auto fail = [&](VerifyError e) -> std::optional<std::unordered_set<std::uint32_t>> {
     if (out_error) *out_error = e;
     return std::nullopt;
@@ -100,6 +102,9 @@ std::optional<std::unordered_set<std::uint32_t>> VerifyProgram(const Program& pr
   if (program.code.size() > kMaxCodeBytes) return fail(VerifyError::kCodeTooLarge);
   if (program.constants.size() > kMaxConstants) return fail(VerifyError::kTooManyConstants);
   if (program.num_locals > kMaxLocals) return fail(VerifyError::kTooManyLocals);
+
+  static const OpcodeMap kDefaultOpcodeMap;
+  const OpcodeMap& map = opcode_map ? *opcode_map : kDefaultOpcodeMap;
 
   const auto& code = program.code;
   const std::size_t n = code.size();
@@ -115,9 +120,10 @@ std::optional<std::unordered_set<std::uint32_t>> VerifyProgram(const Program& pr
   std::size_t i = 0;
   while (i < n) {
     std::uint8_t byte = code[i];
-    if (!IsValidOpcode(byte)) return fail(VerifyError::kInvalidOpcode);
+    auto decoded_op = map.Decode(byte);
+    if (!decoded_op.has_value()) return fail(VerifyError::kInvalidOpcode);
 
-    Opcode op = static_cast<Opcode>(byte);
+    Opcode op = *decoded_op;
     int operand_len = OperandBytes(op);  // already known valid, so >= 0
     instruction_starts.insert(static_cast<std::uint32_t>(i));
 
@@ -199,7 +205,9 @@ std::optional<std::unordered_set<std::uint32_t>> VerifyProgram(const Program& pr
     worklist.pop_back();
     int depth = depth_at[offset];
 
-    Opcode op = static_cast<Opcode>(code[offset]);
+    auto decoded_op = map.Decode(code[offset]);
+    if (!decoded_op.has_value()) return fail(VerifyError::kInvalidOpcode);
+    Opcode op = *decoded_op;
     int operand_len = OperandBytes(op);
     StackEffect effect = GetStackEffect(op);
 

@@ -30,29 +30,38 @@ bool GetU64(const std::uint8_t* p, std::size_t remaining, std::uint64_t* out) {
 
 }  // namespace
 
+bool IsValidResourceIdentifier(const std::string& name) {
+  if (name.empty() || name.size() > kMaxResourceNameLen) return false;
+  // Cannot start with '/' or '\' or have drive letter like 'C:'
+  if (name[0] == '/' || name[0] == '\\') return false;
+  if (name.find(':') != std::string::npos) return false;
+  // Cannot contain ".." traversal segments
+  if (name == ".." || name.find("/../") != std::string::npos ||
+      name.find("\\..\\") != std::string::npos ||
+      name.find("/..\\") != std::string::npos ||
+      name.find("\\../") != std::string::npos ||
+      name.find("../") == 0 || name.find("..\\") == 0) {
+    return false;
+  }
+  if (name.size() >= 3 && (name.substr(name.size() - 3) == "/.." || name.substr(name.size() - 3) == "\\..")) {
+    return false;
+  }
+  // Safe character set: letters, digits, '.', '_', '-', '/', '\'
+  for (char c : name) {
+    if (!std::isalnum(static_cast<unsigned char>(c)) &&
+        c != '.' && c != '_' && c != '-' && c != '/' && c != '\\') {
+      return false;
+    }
+  }
+  return true;
+}
+
 bool Manifest::AddResource(const std::string& name, const std::uint8_t* data, std::size_t len) {
-  // Empty names are rejected: a resource identity must be a non-empty,
-  // logical identifier (see manifest.h's ResourceEntry::name comment for
-  // "logical identifier, not a filesystem path"), and an empty string as
-  // that identifier is never meaningful -- it also collides trivially
-  // with itself (two resources both named "" would be indistinguishable
-  // duplicates, which the check immediately below already has to handle
-  // for non-empty names; rejecting empty up front is simpler than folding
-  // it into that general case).
-  if (name.empty()) return false;
-  if (name.size() > kMaxResourceNameLen) return false;
+  if (!IsValidResourceIdentifier(name)) return false;
+  if (len > 0 && data == nullptr) return false;
   if (resources.size() >= kMaxResourcesPerManifest) return false;
 
-  // Reject a duplicate resource identity outright, rather than silently
-  // allowing two entries to share a name. Before this check, AddResource
-  // would happily append a second entry for an already-used name, while
-  // Find() (a linear scan returning the FIRST match) would silently
-  // disagree with "the last one added" or "all of them" about which
-  // entry is authoritative for that name -- exactly the kind of
-  // AddResource/Find/Deserialize disagreement this project's hardening
-  // review was asked to close. A manifest either has one entry per
-  // logical resource identity, or it's rejected at the point of
-  // construction, not discovered as an ambiguity later during lookup.
+  // Reject a duplicate resource identity outright
   if (Find(name) != nullptr) return false;
 
   auto digest = Sha256(data, len);
@@ -116,6 +125,7 @@ inline std::size_t Remaining(std::size_t pos, std::size_t len) { return len - po
 }  // namespace
 
 std::optional<Manifest> DeserializeManifest(const std::uint8_t* data, std::size_t len) {
+  if (data == nullptr || len < 4) return std::nullopt;
   std::size_t pos = 0;
   Manifest m;
 
@@ -148,26 +158,18 @@ std::optional<Manifest> DeserializeManifest(const std::uint8_t* data, std::size_
     }
     pos += 4;
     if (name_len == 0 || name_len > kMaxResourceNameLen || name_len > Remaining(pos, len)) {
-      return std::nullopt;  // empty names rejected here too -- see
-                             // AddResource's comment on why; a
-                             // deserialized manifest must satisfy the same
-                             // identity rules a programmatically-built one
-                             // does, not a looser set just because it came
-                             // from bytes instead of AddResource() calls
+      return std::nullopt;
     }
 
     ResourceEntry entry;
     entry.name.assign(reinterpret_cast<const char*>(data + pos), name_len);
     pos += name_len;
 
-    // Reject a duplicate resource identity -- same reasoning as
-    // AddResource()'s check (see that function's comment): a manifest
-    // with two entries sharing a name is rejected outright rather than
-    // silently accepted with an ambiguous "which one is authoritative"
-    // left for Find() to arbitrarily resolve via first-match. Checked
-    // here (not deferred to a post-loop pass) so the specific malformed
-    // entry is caught at the point it's parsed, consistent with every
-    // other per-entry validation in this loop.
+    if (!IsValidResourceIdentifier(entry.name)) {
+      return std::nullopt;
+    }
+
+    // Reject a duplicate resource identity
     if (m.Find(entry.name) != nullptr) return std::nullopt;
 
     std::uint64_t size = 0;

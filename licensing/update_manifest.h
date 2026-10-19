@@ -59,4 +59,15 @@ UpdateStatus VerifyUpdateMetadata(const UpdatePackage& pkg,
                                   const std::string& expected_product,
                                   std::uint64_t current_installed_sequence);
 
+// Validates that each file declared in the update package exists in `update_dir`
+// with the expected size and SHA-256 hash. Enforces strict identifier validation.
+UpdateStatus VerifyUpdatePayload(const UpdatePackage& pkg, const std::string& update_dir);
+
+// Validates both update metadata/signature and file payload contents.
+UpdateStatus VerifyUpdate(const UpdatePackage& pkg,
+                         const integrity::Ed25519PublicKey& pubkey,
+                         const std::string& expected_product,
+                         std::uint64_t current_installed_sequence,
+                         const std::string& update_dir);
+
 }  // namespace rtprotect::licensing

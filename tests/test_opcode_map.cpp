@@ -1,6 +1,8 @@
 // tests/test_opcode_map.cpp
 
 #include "bytecode_vm/opcode_map.h"
+#include "bytecode_vm/vm.h"
+#include "bytecode_vm/verifier.h"
 #include <algorithm>
 #include "tests/micro_test.h"
 
@@ -56,6 +58,40 @@ MT_TEST(OpcodeMap_DifferentSeeds_ProduceDifferentMappings) {
   if (b1 != b2) any_difference = true;
 
   MT_CHECK(any_difference);
+}
+
+MT_TEST(OpcodeMap_Execution_WithPermutedOpcodes_Succeeds) {
+  OpcodeMap map = OpcodeMap::FromSeed(12345);
+
+  Program p;
+  p.constants = {40, 2};
+  p.num_locals = 0;
+
+  // Build program with permuted opcodes: PushConst 0, PushConst 1, Add, Ret
+  p.code.push_back(map.Encode(Opcode::kPushConst));
+  p.code.push_back(0);
+  p.code.push_back(0);
+
+  p.code.push_back(map.Encode(Opcode::kPushConst));
+  p.code.push_back(1);
+  p.code.push_back(0);
+
+  p.code.push_back(map.Encode(Opcode::kAdd));
+  p.code.push_back(map.Encode(Opcode::kRet));
+
+  // Running with the correct map succeeds
+  RunResult res = Run(p, {}, &map);
+  MT_CHECK(res.error == VmError::kNone);
+  MT_CHECK(res.value == 42);
+
+  // Running without the map (canonical decode) should fail verification
+  RunResult res_no_map = Run(p, {}, nullptr);
+  MT_CHECK(res_no_map.error == VmError::kVerificationFailed);
+
+  // Running with a different seed map should fail verification
+  OpcodeMap wrong_map = OpcodeMap::FromSeed(54321);
+  RunResult res_wrong_map = Run(p, {}, &wrong_map);
+  MT_CHECK(res_wrong_map.error == VmError::kVerificationFailed);
 }
 
 MT_MAIN()

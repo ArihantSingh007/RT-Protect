@@ -63,7 +63,7 @@ class Ed25519PrivateKey {
   // Validates length and copies `data` in. Returns std::nullopt if `len`
   // isn't exactly kEd25519PrivateKeyLen.
   static std::optional<Ed25519PrivateKey> FromBytes(const std::uint8_t* data, std::size_t len) {
-    if (len != kEd25519PrivateKeyLen) return std::nullopt;
+    if (data == nullptr || len != kEd25519PrivateKeyLen) return std::nullopt;
     Ed25519PrivateKey key;
     std::memcpy(key.bytes_.data(), data, kEd25519PrivateKeyLen);
     return key;

@@ -2,6 +2,7 @@
 
 #include "bytecode_vm/checked_arith.h"
 #include "bytecode_vm/opcode.h"
+#include "bytecode_vm/opcode_map.h"
 
 namespace rtprotect::vm {
 
@@ -27,11 +28,13 @@ std::uint16_t ReadU16(const std::uint8_t* p) {
 
 }  // namespace
 
-RunResult Run(const Program& program, const std::vector<std::int64_t>& args) {
+RunResult Run(const Program& program,
+              const std::vector<std::int64_t>& args,
+              const OpcodeMap* opcode_map) {
   RunResult result;
 
   VerifyError verr = VerifyError::kNone;
-  auto instruction_starts = VerifyProgram(program, &verr);
+  auto instruction_starts = VerifyProgram(program, &verr, opcode_map);
   if (!instruction_starts.has_value()) {
     result.error = VmError::kVerificationFailed;
     result.verify_error = verr;
@@ -64,6 +67,9 @@ RunResult Run(const Program& program, const std::vector<std::int64_t>& args) {
     return true;
   };
 
+  static const OpcodeMap kDefaultOpcodeMap;
+  const OpcodeMap& map = opcode_map ? *opcode_map : kDefaultOpcodeMap;
+
   const auto& code = program.code;
   std::size_t pc = 0;
   std::uint64_t executed = 0;
@@ -76,7 +82,8 @@ RunResult Run(const Program& program, const std::vector<std::int64_t>& args) {
     }
     ++executed;
 
-    Opcode op = static_cast<Opcode>(code[pc]);
+    auto decoded_op = map.Decode(code[pc]);
+    Opcode op = *decoded_op;
     const std::uint8_t* operand = (pc + 1 < code.size()) ? &code[pc + 1] : nullptr;
     int operand_len = OperandBytes(op);
     std::size_t next_pc = pc + 1 + static_cast<std::size_t>(operand_len);

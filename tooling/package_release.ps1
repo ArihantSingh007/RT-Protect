@@ -79,6 +79,23 @@ if ($OpenSslDir -and (Test-Path "$OpenSslDir\bin\libcrypto-3-x64.dll")) {
     Copy-Item "$OpenSslDir\bin\libcrypto-3-x64.dll" (Join-Path $PkgDir "bin")
 }
 
+# Copy full SDK public headers
+Write-Host "Copying SDK headers..."
+$Modules = @("crypto", "integrity", "licensing", "antitamper", "bytecode_vm", "obfuscation", "tooling")
+foreach ($m in $Modules) {
+    $targetInc = Join-Path $PkgDir "include\$m"
+    New-Item -ItemType Directory -Force -Path $targetInc | Out-Null
+    Copy-Item "$m\*.h" $targetInc
+}
+
+# Copy compiled static libraries
+Write-Host "Copying SDK static libraries..."
+Get-ChildItem -Path $BuildDir -Recurse -Include *.a, *.lib | Where-Object { 
+    $_.FullName -notmatch "CMakeFiles|third_party|Testing" 
+} | ForEach-Object {
+    Copy-Item $_.FullName (Join-Path $PkgDir "lib")
+}
+
 # Copy documentation and metadata
 Copy-Item "README.md" $PkgDir
 Copy-Item "SECURITY_AUDIT.md" $PkgDir

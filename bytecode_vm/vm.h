@@ -66,7 +66,10 @@ struct RunResult {
 // hard instruction-count budget is the runtime backstop against an
 // accidentally or deliberately non-terminating program denying service to
 // whatever embeds this VM. kMaxExecutedInstructions is generous for the
-// small numeric functions this VM targets (see opcode.h's scope note).
-RunResult Run(const Program& program, const std::vector<std::int64_t>& args);
+class OpcodeMap;
+
+RunResult Run(const Program& program,
+              const std::vector<std::int64_t>& args,
+              const OpcodeMap* opcode_map = nullptr);
 
 }  // namespace rtprotect::vm
