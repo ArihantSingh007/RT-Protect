@@ -30,6 +30,10 @@ namespace rtprotect::integrity {
 inline constexpr std::size_t kMaxResourceNameLen = 255;
 inline constexpr std::size_t kMaxResourcesPerManifest = 4096;
 
+// Validates that a resource identifier is a safe, relative path identifier
+// (no leading slashes, drive specifiers, ".." traversal, or unsafe characters).
+bool IsValidResourceIdentifier(const std::string& name);
+
 struct ResourceEntry {
   std::string name;       // logical name, e.g. "checksum.bin" -- not a filesystem path
   Sha256Digest sha256{};

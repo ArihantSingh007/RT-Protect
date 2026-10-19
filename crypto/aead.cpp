@@ -126,8 +126,8 @@ std::vector<std::uint8_t> EncryptedMessage::Serialize() const {
 
 std::optional<EncryptedMessage> EncryptedMessage::Deserialize(
     const std::uint8_t* data, std::size_t len) {
-  if (len < kGcmNonceLen + kGcmTagLen) {
-    return std::nullopt;  // too short to even contain nonce + tag
+  if (data == nullptr || len < kGcmNonceLen + kGcmTagLen) {
+    return std::nullopt;  // null pointer or too short to contain nonce + tag
   }
   EncryptedMessage msg;
   std::memcpy(msg.nonce.bytes, data, kGcmNonceLen);
@@ -145,10 +145,14 @@ std::optional<EncryptedMessage> Encrypt(const Aes256Key& key,
   if (key.bytes().size() != kAes256KeyLen) {
     return std::nullopt;
   }
-  // Checked BEFORE any length is narrowed to `int` below -- see
-  // kMaxAeadMessageLen's comment in aead.h for why this specific bound and
-  // why it matters for correctness, not just resource limits.
+  // Checked BEFORE any length is narrowed to `int` below
   if (plaintext_len > kMaxAeadMessageLen || aad_len > kMaxAeadMessageLen) {
+    return std::nullopt;
+  }
+  if (plaintext_len > 0 && plaintext == nullptr) {
+    return std::nullopt;
+  }
+  if (aad_len > 0 && aad == nullptr) {
     return std::nullopt;
   }
 
@@ -217,6 +221,9 @@ std::optional<std::vector<std::uint8_t>> Decrypt(const Aes256Key& key,
   // to `int` below.
   if (msg.ciphertext.size() > kMaxAeadMessageLen || aad_len > kMaxAeadMessageLen) {
     return fail(AeadError::kMessageTooLarge);
+  }
+  if (aad_len > 0 && aad == nullptr) {
+    return fail(AeadError::kOpenSslInternalError);
   }
 
   CipherCtx cc;

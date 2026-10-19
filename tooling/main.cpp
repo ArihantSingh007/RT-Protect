@@ -377,6 +377,12 @@ int CmdIntegrate(int argc, char** argv) {
       options.release_version = argv[++i];
     } else if (arg == "--rtprotect-root" && i + 1 < argc) {
       options.rtprotect_root = argv[++i];
+    } else if (arg == "--manifest-pubkey" && i + 1 < argc) {
+      options.manifest_pubkey_path = argv[++i];
+    } else if (arg == "--license-pubkey" && i + 1 < argc) {
+      options.license_pubkey_path = argv[++i];
+    } else if (arg == "--dev-keys-dir" && i + 1 < argc) {
+      options.dev_keys_dir = argv[++i];
     } else {
       std::fprintf(stderr, "Unknown option: %s\n", arg.c_str());
       return 2;

@@ -84,6 +84,7 @@ void TestDryRunDoesNotModifyDisk() {
   assert(!fs::exists(test_dir / "rtprotect_config.h"));
   assert(!fs::exists(test_dir / "rtprotect_runtime_glue.cpp"));
   assert(!fs::exists(test_dir / "release.pub"));
+  assert(!fs::exists(test_dir / "license.pub"));
   assert(!fs::exists(test_dir / "release.priv"));
   assert(!fs::exists(test_dir / "client.license"));
 
@@ -126,10 +127,19 @@ void TestTransactionalExecutionAndRollback() {
   assert(fs::exists(test_dir / "rtprotect_config.h"));
   assert(fs::exists(test_dir / "rtprotect_runtime_glue.cpp"));
   assert(fs::exists(test_dir / "release.pub"));
-  assert(fs::exists(test_dir / "release.priv"));
+  assert(fs::exists(test_dir / "license.pub"));
   assert(fs::exists(test_dir / "release.manifest"));
   assert(fs::exists(test_dir / "release.sig"));
   assert(fs::exists(test_dir / "client.license"));
+
+  // CRITICAL 1 VERIFICATION: Private key is NEVER in client project!
+  assert(!fs::exists(test_dir / "release.priv"));
+  assert(!fs::exists(test_dir / "license.priv"));
+  assert(!report.private_key_file.empty());
+  assert(fs::exists(report.private_key_file));
+
+  // Verify journal was created in backup directory
+  assert(fs::exists(fs::path(report.backup_path) / "integration_journal.json"));
 
   // 2. Verify config header contains product and profile
   auto cfg_text = ReadTextFile((test_dir / "rtprotect_config.h").string());
@@ -137,8 +147,8 @@ void TestTransactionalExecutionAndRollback() {
   assert(cfg_text->find("com.test.transaction") != std::string::npos);
   assert(cfg_text->find("balanced") != std::string::npos);
 
-  // 3. Verify client.license validity with generated public key
-  auto pub_data = ReadFile((test_dir / "release.pub").string());
+  // 3. Verify client.license validity with generated license public key
+  auto pub_data = ReadFile((test_dir / "license.pub").string());
   auto lic_data = ReadFile((test_dir / "client.license").string());
   assert(pub_data.has_value() && pub_data->size() == 32);
   assert(lic_data.has_value());
@@ -194,6 +204,7 @@ void TestTransactionalExecutionAndRollback() {
   assert(!fs::exists(test_dir / "rtprotect_config.h"));
   assert(!fs::exists(test_dir / "rtprotect_runtime_glue.cpp"));
   assert(!fs::exists(test_dir / "release.pub"));
+  assert(!fs::exists(test_dir / "license.pub"));
   assert(!fs::exists(test_dir / "release.priv"));
   assert(!fs::exists(test_dir / "release.manifest"));
   assert(!fs::exists(test_dir / "release.sig"));
@@ -233,6 +244,32 @@ void TestPathTraversalPrevention() {
   std::printf("  PASSED: Path traversal and directory boundary checks verified.\n");
 }
 
+void TestBuildFailureFailsClosed() {
+  std::printf("Running TestBuildFailureFailsClosed...\n");
+
+  fs::path test_dir = "temp_test_build_fail_proj";
+  CleanDir(test_dir);
+  fs::create_directories(test_dir);
+
+  // Intentionally broken C++ source file that fails compilation
+  std::string broken_cmake = "cmake_minimum_required(VERSION 3.20)\nproject(BrokenApp)\nadd_executable(broken main.cpp)\n";
+  WriteTextFile((test_dir / "CMakeLists.txt").string(), broken_cmake);
+  WriteTextFile((test_dir / "main.cpp").string(), "int main() { SYNTAX_ERROR_CANNOT_COMPILE_HERE; return 0; }\n");
+
+  IntegrationOptions opts;
+  opts.target_project_path = test_dir.string();
+  opts.run_build = true;
+
+  auto report = ExecuteIntegration(opts);
+  // HIGH 4 verification: Build failure MUST result in report.success == false!
+  assert(!report.success);
+  assert(!report.build_succeeded);
+  assert(!report.error_message.empty());
+
+  CleanDir(test_dir);
+  std::printf("  PASSED: Build failure fails closed with non-zero error report.\n");
+}
+
 }  // namespace
 
 int main() {
@@ -241,6 +278,7 @@ int main() {
   TestDryRunDoesNotModifyDisk();
   TestTransactionalExecutionAndRollback();
   TestPathTraversalPrevention();
+  TestBuildFailureFailsClosed();
   std::printf("ALL INTEGRATION ENGINE TESTS PASSED.\n");
   return 0;
 }

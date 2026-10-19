@@ -20,8 +20,13 @@ RiskAssessment AssessEnvironmentRisk() {
   }
 
   int score = 0;
-  if (r.debugger_present) score += 40;
-  if (r.remote_debugger_present) score += 40;
+  if (r.debugger_present || r.remote_debugger_present) {
+    score += 40;
+    // Small corroboration bump if both distinct indicators hit
+    if (r.debugger_present && r.remote_debugger_present) {
+      score += 10;
+    }
+  }
   if (r.hardware_breakpoints_detected) score += 50;
   if (r.timing_anomaly_detected) score += 30;
   if (r.hypervisor_detected) score += 15; // Low risk by itself to avoid penalizing legitimate VMs

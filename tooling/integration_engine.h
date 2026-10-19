@@ -35,7 +35,10 @@ struct IntegrationOptions {
   bool run_build = true;
   std::string product_id = "com.client.protected";
   std::string release_version = "1.0.0";
-  std::string rtprotect_root;       // Path to RTProtect repository
+  std::string rtprotect_root;        // Path to RTProtect repository / SDK
+  std::string manifest_pubkey_path;  // Optional external manifest public key
+  std::string license_pubkey_path;   // Optional external license public key
+  std::string dev_keys_dir;          // Output directory for dev keys (outside client project)
 };
 
 struct ChangePlan {
@@ -58,8 +61,10 @@ struct IntegrationReport {
   std::vector<std::string> modified_files;
   std::vector<std::string> generated_files;
   std::vector<std::string> warnings;
-  std::string public_key_file;
-  std::string private_key_file;
+  std::string public_key_file;          // Primary / manifest public key file
+  std::string manifest_public_key_file; // Manifest verification public key
+  std::string license_public_key_file;  // License verification public key
+  std::string private_key_file;         // Populated only in --dev-keys mode (in dev_keys_dir)
   std::string manifest_file;
   std::string signature_file;
   std::string license_file;
