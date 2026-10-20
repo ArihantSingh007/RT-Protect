@@ -36,10 +36,12 @@ void WriteU64(std::vector<std::uint8_t>& buf, std::uint64_t v) {
   for (int i = 0; i < 8; ++i) buf.push_back(static_cast<std::uint8_t>((v >> (i * 8)) & 0xFF));
 }
 
-void WriteString(std::vector<std::uint8_t>& buf, const std::string& str) {
-  std::uint16_t len = static_cast<std::uint16_t>(std::min(str.size(), static_cast<std::size_t>(0xFFFF)));
+bool WriteString(std::vector<std::uint8_t>& buf, const std::string& str) {
+  if (str.size() > 0xFFFF) return false;
+  std::uint16_t len = static_cast<std::uint16_t>(str.size());
   WriteU16(buf, len);
   buf.insert(buf.end(), str.data(), str.data() + len);
+  return true;
 }
 
 bool ReadU16(const std::uint8_t*& p, const std::uint8_t* end, std::uint16_t& out) {
@@ -70,19 +72,23 @@ bool ReadString(const std::uint8_t*& p, const std::uint8_t* end, std::string& ou
 
 std::vector<std::uint8_t> SerializeUpdateForSigning(const UpdatePackage& pkg) {
   std::vector<std::uint8_t> buf;
+  if (pkg.files.size() > 0xFFFF) return {};
+
   buf.reserve(512);
 
-  WriteString(buf, "RTPROTECT-UPDATE-V1");
-  WriteString(buf, pkg.target_product);
-  WriteString(buf, pkg.target_version);
+  if (!WriteString(buf, "RTPROTECT-UPDATE-V1") ||
+      !WriteString(buf, pkg.target_product) ||
+      !WriteString(buf, pkg.target_version)) {
+    return {};
+  }
   WriteU64(buf, pkg.sequence_number);
   WriteU64(buf, pkg.timestamp);
 
-  std::uint16_t file_count = static_cast<std::uint16_t>(std::min(pkg.files.size(), static_cast<std::size_t>(0xFFFF)));
+  std::uint16_t file_count = static_cast<std::uint16_t>(pkg.files.size());
   WriteU16(buf, file_count);
   for (std::size_t i = 0; i < file_count; ++i) {
     const auto& f = pkg.files[i];
-    WriteString(buf, f.name);
+    if (!WriteString(buf, f.name)) return {};
     WriteU64(buf, f.size);
     buf.insert(buf.end(), f.sha256.data(), f.sha256.data() + f.sha256.size());
   }
@@ -100,6 +106,7 @@ bool SignUpdatePackage(UpdatePackage& pkg, const integrity::Ed25519PrivateKey& p
 
 std::vector<std::uint8_t> SerializeUpdatePackage(const UpdatePackage& pkg) {
   std::vector<std::uint8_t> buf = SerializeUpdateForSigning(pkg);
+  if (buf.empty()) return {};
   buf.insert(buf.end(), pkg.signature.data(), pkg.signature.data() + pkg.signature.size());
   return buf;
 }

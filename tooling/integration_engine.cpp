@@ -2,6 +2,8 @@
 
 #include "tooling/integration_engine.h"
 
+#include <algorithm>
+#include <cctype>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -10,9 +12,18 @@
 #include <fstream>
 #include <sstream>
 
+#if defined(_WIN32)
+#include <windows.h>
+#else
+#include <sys/types.h>
+#include <sys/wait.h>
+#include <unistd.h>
+#endif
+
 #include "antitamper/risk_policy.h"
 #include "integrity/keys.h"
 #include "integrity/manifest.h"
+#include "integrity/sha256.h"
 #include "integrity/signer.h"
 #include "integrity/verifier.h"
 #include "licensing/hardware_id.h"
@@ -36,7 +47,13 @@ std::string EscapeJson(const std::string& str) {
     else if (c == '\n') out += "\\n";
     else if (c == '\r') out += "\\r";
     else if (c == '\t') out += "\\t";
-    else out += c;
+    else if (static_cast<unsigned char>(c) < 0x20) {
+      char buf[8];
+      std::snprintf(buf, sizeof(buf), "\\u%04x", static_cast<unsigned char>(c));
+      out += buf;
+    } else {
+      out += c;
+    }
   }
   return out;
 }
@@ -58,6 +75,146 @@ bool IsPathWithin(const fs::path& child, const fs::path& base) {
     return false;
   }
   return true;
+}
+
+bool IsValidIdentifier(const std::string& str) {
+  if (str.empty() || str.size() > 128) return false;
+  for (char c : str) {
+    if (!std::isalnum(static_cast<unsigned char>(c)) && c != '.' && c != '_' && c != '-') {
+      return false;
+    }
+  }
+  return true;
+}
+
+std::vector<std::string> DiscoverCMakeExecutableTargets(const fs::path& cmake_file) {
+  std::vector<std::string> targets;
+  auto content = ReadTextFile(cmake_file.string());
+  if (!content.has_value()) return targets;
+
+  std::string stripped;
+  std::istringstream stream(*content);
+  std::string line;
+  while (std::getline(stream, line)) {
+    auto comment_pos = line.find('#');
+    if (comment_pos != std::string::npos) {
+      line = line.substr(0, comment_pos);
+    }
+    stripped += line + "\n";
+  }
+
+  std::size_t pos = 0;
+  const std::string keyword = "add_executable";
+  while ((pos = stripped.find(keyword, pos)) != std::string::npos) {
+    std::size_t after_kw = pos + keyword.size();
+    while (after_kw < stripped.size() && std::isspace(static_cast<unsigned char>(stripped[after_kw]))) {
+      after_kw++;
+    }
+    if (after_kw < stripped.size() && stripped[after_kw] == '(') {
+      std::size_t start_token = after_kw + 1;
+      while (start_token < stripped.size() && std::isspace(static_cast<unsigned char>(stripped[start_token]))) {
+        start_token++;
+      }
+      std::size_t end_token = start_token;
+      while (end_token < stripped.size() &&
+             !std::isspace(static_cast<unsigned char>(stripped[end_token])) &&
+             stripped[end_token] != ')' &&
+             stripped[end_token] != ';') {
+        end_token++;
+      }
+      if (end_token > start_token) {
+        std::string target = stripped.substr(start_token, end_token - start_token);
+        if (target != "IMPORTED" && target != "ALIAS" && !target.empty() && target[0] != '$') {
+          if (std::find(targets.begin(), targets.end(), target) == targets.end()) {
+            targets.push_back(target);
+          }
+        }
+      }
+      pos = end_token;
+    } else {
+      pos = after_kw;
+    }
+  }
+  return targets;
+}
+
+int RunProcess(const std::string& exe, const std::vector<std::string>& args) {
+#if defined(_WIN32)
+  std::string cmd_line = "\"" + exe + "\"";
+  for (const auto& a : args) {
+    cmd_line += " ";
+    if (a.empty()) {
+      cmd_line += "\"\"";
+      continue;
+    }
+    bool need_quote = false;
+    for (char c : a) {
+      if (std::isspace(static_cast<unsigned char>(c)) || c == '"') {
+        need_quote = true;
+        break;
+      }
+    }
+    if (!need_quote) {
+      cmd_line += a;
+    } else {
+      cmd_line += "\"";
+      for (std::size_t i = 0; i < a.size(); ++i) {
+        std::size_t backslashes = 0;
+        while (i < a.size() && a[i] == '\\') {
+          backslashes++;
+          i++;
+        }
+        if (i == a.size()) {
+          cmd_line.append(backslashes * 2, '\\');
+          break;
+        } else if (a[i] == '"') {
+          cmd_line.append(backslashes * 2 + 1, '\\');
+          cmd_line += '"';
+        } else {
+          cmd_line.append(backslashes, '\\');
+          cmd_line += a[i];
+        }
+      }
+      cmd_line += "\"";
+    }
+  }
+
+  STARTUPINFOA si{};
+  si.cb = sizeof(si);
+  PROCESS_INFORMATION pi{};
+
+  std::vector<char> cmd_buf(cmd_line.begin(), cmd_line.end());
+  cmd_buf.push_back('\0');
+
+  BOOL ok = CreateProcessA(NULL, cmd_buf.data(), NULL, NULL, TRUE, 0, NULL, NULL, &si, &pi);
+  if (!ok) return -1;
+
+  WaitForSingleObject(pi.hProcess, INFINITE);
+  DWORD exit_code = 1;
+  GetExitCodeProcess(pi.hProcess, &exit_code);
+  CloseHandle(pi.hProcess);
+  CloseHandle(pi.hThread);
+  return static_cast<int>(exit_code);
+#else
+  pid_t pid = fork();
+  if (pid < 0) return -1;
+  if (pid == 0) {
+    std::vector<char*> argv_ptrs;
+    argv_ptrs.push_back(const_cast<char*>(exe.c_str()));
+    for (const auto& a : args) {
+      argv_ptrs.push_back(const_cast<char*>(a.c_str()));
+    }
+    argv_ptrs.push_back(nullptr);
+    execvp(exe.c_str(), argv_ptrs.data());
+    _exit(127);
+  }
+  int status = 0;
+  waitpid(pid, &status, 0);
+  if (WIFEXITED(status)) {
+    return WEXITSTATUS(status);
+  }
+  return -1;
+#endif
 }
 
 }  // namespace
@@ -109,6 +266,8 @@ std::string IntegrationReport::ToJson() const {
   std::ostringstream ss;
   ss << "{\n";
   ss << "  \"success\": " << (success ? "true" : "false") << ",\n";
+  ss << "  \"is_staged_only\": " << (is_staged_only ? "true" : "false") << ",\n";
+  ss << "  \"target_name\": \"" << EscapeJson(target_name) << "\",\n";
   ss << "  \"error_message\": \"" << EscapeJson(error_message) << "\",\n";
   ss << "  \"backup_path\": \"" << EscapeJson(backup_path) << "\",\n";
   ss << "  \"build_succeeded\": " << (build_succeeded ? "true" : "false") << ",\n";
@@ -159,8 +318,25 @@ ChangePlan PlanIntegration(const IntegrationOptions& options) {
   if (fs::exists(cmake_file)) {
     plan.detected_build_system = "CMake";
     plan.detected_language = "C++";
+
+    auto targets = DiscoverCMakeExecutableTargets(cmake_file);
+    if (targets.empty()) {
+      plan.is_supported = false;
+      plan.explanation = "No executable target (add_executable) detected in CMakeLists.txt";
+      return plan;
+    }
+
+    if (targets.size() > 1 && options.target_name.empty()) {
+      std::string t_list;
+      for (std::size_t i = 0; i < targets.size(); ++i) {
+        if (i > 0) t_list += ", ";
+        t_list += targets[i];
+      }
+      plan.warnings.push_back("Multiple executable targets found: [" + t_list + "]. Specify --target <name> to select.");
+    }
+
     plan.is_supported = true;
-    plan.files_to_modify.push_back((proj_path / "CMakeLists.txt").string());
+    plan.files_to_modify.push_back(cmake_file.string());
   } else {
     plan.explanation = "No supported build system found (CMakeLists.txt required)";
     return plan;
@@ -201,7 +377,51 @@ IntegrationReport ExecuteIntegration(const IntegrationOptions& options) {
     return report;
   }
 
+  // Validate identifiers
+  if (!IsValidIdentifier(options.product_id)) {
+    report.success = false;
+    report.error_message = "Invalid product identifier: '" + options.product_id + "'. Must match ^[A-Za-z0-9_.-]+$ and be <= 128 characters.";
+    return report;
+  }
+  if (!IsValidIdentifier(options.release_version)) {
+    report.success = false;
+    report.error_message = "Invalid release version: '" + options.release_version + "'. Must match ^[A-Za-z0-9_.-]+$ and be <= 128 characters.";
+    return report;
+  }
+
   fs::path proj_path = fs::canonical(options.target_project_path);
+
+  // Discover and validate target
+  fs::path cmake_file = proj_path / "CMakeLists.txt";
+  auto discovered_targets = DiscoverCMakeExecutableTargets(cmake_file);
+  std::string target_name;
+
+  if (!options.target_name.empty()) {
+    if (std::find(discovered_targets.begin(), discovered_targets.end(), options.target_name) == discovered_targets.end()) {
+      report.success = false;
+      report.error_message = "Specified target '" + options.target_name + "' was not found in CMakeLists.txt.";
+      return report;
+    }
+    target_name = options.target_name;
+  } else {
+    if (discovered_targets.size() == 1) {
+      target_name = discovered_targets[0];
+    } else if (discovered_targets.size() > 1) {
+      std::string t_list;
+      for (std::size_t i = 0; i < discovered_targets.size(); ++i) {
+        if (i > 0) t_list += ", ";
+        t_list += discovered_targets[i];
+      }
+      report.success = false;
+      report.error_message = "Multiple executable targets detected in CMakeLists.txt: [" + t_list + "]. Please specify the target to protect using --target <name>.";
+      return report;
+    } else {
+      report.success = false;
+      report.error_message = "No executable target found in CMakeLists.txt.";
+      return report;
+    }
+  }
+  report.target_name = target_name;
 
   // If dry-run requested, report planned changes and exit
   if (options.dry_run) {
@@ -215,9 +435,10 @@ IntegrationReport ExecuteIntegration(const IntegrationOptions& options) {
     return report;
   }
 
-  // 1. Transactional Backup & Journal
   auto now = std::chrono::system_clock::now().time_since_epoch();
   auto timestamp = std::chrono::duration_cast<std::chrono::seconds>(now).count();
+
+  // 1. Transactional Backup Directory
   fs::path backup_dir = options.backup_dir.empty()
       ? (proj_path / (".rtprotect_backup_" + std::to_string(timestamp)))
       : fs::path(options.backup_dir);
@@ -231,39 +452,8 @@ IntegrationReport ExecuteIntegration(const IntegrationOptions& options) {
   }
   report.backup_path = backup_dir.string();
 
-  // Dev keys directory (always stored outside client project root)
-  fs::path dev_keys_dir = options.dev_keys_dir.empty()
-      ? (backup_dir / "dev_keys")
-      : fs::path(options.dev_keys_dir);
-  fs::create_directories(dev_keys_dir, ec);
-
-  // Track planned creations and pre-existing file backups
-  std::vector<std::string> backed_up_relative;
-  std::vector<std::string> planned_created;
-
-  auto backup_if_exists = [&](const fs::path& target) {
-    if (fs::exists(target)) {
-      auto rel = fs::relative(target, proj_path);
-      auto dest = backup_dir / rel;
-      fs::create_directories(dest.parent_path(), ec);
-      fs::copy_file(target, dest, fs::copy_options::overwrite_existing, ec);
-      backed_up_relative.push_back(rel.string());
-    } else {
-      auto rel = fs::relative(target, proj_path);
-      planned_created.push_back(rel.string());
-    }
-  };
-
-  for (const auto& file_str : plan.files_to_modify) {
-    backup_if_exists(fs::path(file_str));
-  }
-  for (const auto& file_str : plan.files_to_create) {
-    backup_if_exists(fs::path(file_str));
-  }
-
-  // 2. Separate Manifest and License Keys
-  // 2. Separate Manifest and License Keys
-  // Production security: Private keys are NEVER placed in the client project.
+  // 2. Cryptographic Key Handling (CRITICAL 1 REMEDIATION)
+  // Production security: Private keys are NEVER placed in the client project or backup directory.
   integrity::Ed25519PublicKey manifest_pubkey{};
   integrity::Ed25519PublicKey license_pubkey{};
   std::optional<integrity::Ed25519PrivateKey> manifest_privkey;
@@ -271,52 +461,152 @@ IntegrationReport ExecuteIntegration(const IntegrationOptions& options) {
   bool has_manifest_privkey = false;
   bool has_license_privkey = false;
 
-  if (!options.manifest_pubkey_path.empty()) {
-    auto pub_bytes = ReadFile(options.manifest_pubkey_path);
-    if (!pub_bytes.has_value() || pub_bytes->size() != integrity::kEd25519PublicKeyLen) {
+  if (options.use_dev_keys) {
+    // Development-only testing workflow
+    fs::path dev_keys_dir;
+    if (!options.dev_keys_dir.empty()) {
+      dev_keys_dir = fs::path(options.dev_keys_dir);
+      if (IsPathWithin(dev_keys_dir, proj_path) || IsPathWithin(dev_keys_dir, backup_dir)) {
+        report.success = false;
+        report.error_message = "Security policy violation: --dev-keys-dir must point to a location outside the client project and backup directory.";
+        return report;
+      }
+    } else {
+      // Guaranteed outside client project: system temp directory
+      dev_keys_dir = fs::temp_directory_path() / ("rtprotect_dev_keys_" + std::to_string(timestamp));
+    }
+
+    fs::create_directories(dev_keys_dir, ec);
+    if (ec) {
+      report.success = false;
+      report.error_message = "Failed to create dev_keys directory: " + dev_keys_dir.string();
+      return report;
+    }
+
+    auto man_kp = integrity::GenerateEd25519KeyPair();
+    auto lic_kp = integrity::GenerateEd25519KeyPair();
+    if (!man_kp.has_value() || !lic_kp.has_value()) {
+      report.success = false;
+      report.error_message = "Failed to generate ephemeral development keypairs.";
+      return report;
+    }
+
+    manifest_pubkey = man_kp->public_key;
+    license_pubkey = lic_kp->public_key;
+
+    fs::path dev_man_priv = dev_keys_dir / "manifest.priv";
+    fs::path dev_lic_priv = dev_keys_dir / "license.priv";
+    WriteSecretFile(dev_man_priv.string(), man_kp->private_key.data(), man_kp->private_key.size());
+    WriteSecretFile(dev_lic_priv.string(), lic_kp->private_key.data(), lic_kp->private_key.size());
+
+    manifest_privkey = std::move(man_kp->private_key);
+    license_privkey = std::move(lic_kp->private_key);
+    has_manifest_privkey = true;
+    has_license_privkey = true;
+
+    report.private_key_file = dev_man_priv.string();
+    report.warnings.push_back("Development test keys generated outside project at: " + dev_keys_dir.string() + " (Not for production distribution)");
+  } else {
+    // Production integration workflow: public keys REQUIRED
+    if (options.manifest_pubkey_path.empty() || options.license_pubkey_path.empty()) {
+      report.success = false;
+      report.error_message = "Production integration requires pre-provisioned public verification keys (--manifest-pubkey and --license-pubkey). Private signing keys must be retained exclusively on vendor signing infrastructure. For isolated development/testing, explicitly supply --dev-keys.";
+      return report;
+    }
+
+    auto man_bytes = ReadFile(options.manifest_pubkey_path);
+    if (!man_bytes.has_value() || man_bytes->size() != integrity::kEd25519PublicKeyLen) {
       report.success = false;
       report.error_message = "Invalid or unreadable manifest public key file: " + options.manifest_pubkey_path;
       return report;
     }
-    std::memcpy(manifest_pubkey.data(), pub_bytes->data(), integrity::kEd25519PublicKeyLen);
-  } else {
-    auto kp = integrity::GenerateEd25519KeyPair();
-    if (!kp.has_value()) {
-      report.success = false;
-      report.error_message = "Failed to generate manifest signing keypair";
-      return report;
-    }
-    manifest_pubkey = kp->public_key;
-    has_manifest_privkey = true;
-    fs::path dev_manifest_priv = dev_keys_dir / "manifest.priv";
-    WriteSecretFile(dev_manifest_priv.string(), kp->private_key.data(), kp->private_key.size());
-    report.private_key_file = dev_manifest_priv.string();
-    manifest_privkey = std::move(kp->private_key);
-  }
+    std::memcpy(manifest_pubkey.data(), man_bytes->data(), integrity::kEd25519PublicKeyLen);
 
-  if (!options.license_pubkey_path.empty()) {
-    auto pub_bytes = ReadFile(options.license_pubkey_path);
-    if (!pub_bytes.has_value() || pub_bytes->size() != integrity::kEd25519PublicKeyLen) {
+    auto lic_bytes = ReadFile(options.license_pubkey_path);
+    if (!lic_bytes.has_value() || lic_bytes->size() != integrity::kEd25519PublicKeyLen) {
       report.success = false;
       report.error_message = "Invalid or unreadable license public key file: " + options.license_pubkey_path;
       return report;
     }
-    std::memcpy(license_pubkey.data(), pub_bytes->data(), integrity::kEd25519PublicKeyLen);
-  } else {
-    auto kp = integrity::GenerateEd25519KeyPair();
-    if (!kp.has_value()) {
-      report.success = false;
-      report.error_message = "Failed to generate license signing keypair";
-      return report;
+    std::memcpy(license_pubkey.data(), lic_bytes->data(), integrity::kEd25519PublicKeyLen);
+
+    // Optional signing keys for authorized build machine
+    if (!options.sign_manifest_key_path.empty()) {
+      auto m_priv = ReadFile(options.sign_manifest_key_path);
+      if (m_priv.has_value() && m_priv->size() == integrity::kEd25519PrivateKeyLen) {
+        manifest_privkey = integrity::Ed25519PrivateKey::FromBytes(m_priv->data(), m_priv->size());
+        if (manifest_privkey.has_value()) {
+          has_manifest_privkey = true;
+        }
+      }
     }
-    license_pubkey = kp->public_key;
-    has_license_privkey = true;
-    fs::path dev_license_priv = dev_keys_dir / "license.priv";
-    WriteSecretFile(dev_license_priv.string(), kp->private_key.data(), kp->private_key.size());
-    license_privkey = std::move(kp->private_key);
+    if (!options.sign_license_key_path.empty()) {
+      auto l_priv = ReadFile(options.sign_license_key_path);
+      if (l_priv.has_value() && l_priv->size() == integrity::kEd25519PrivateKeyLen) {
+        license_privkey = integrity::Ed25519PrivateKey::FromBytes(l_priv->data(), l_priv->size());
+        if (license_privkey.has_value()) {
+          has_license_privkey = true;
+        }
+      }
+    }
   }
 
-  // Write ONLY public keys to client project
+  // 3. Track File Operations and Back Up Pre-existing Files Safely
+  std::vector<std::string> backed_up_relative;
+  std::vector<std::string> planned_created;
+
+  auto backup_file = [&](const fs::path& target) -> bool {
+    if (fs::exists(target)) {
+      auto rel = fs::relative(target, proj_path);
+      auto dest = backup_dir / rel;
+      fs::create_directories(dest.parent_path(), ec);
+      if (ec) return false;
+      fs::copy_file(target, dest, fs::copy_options::overwrite_existing, ec);
+      if (ec) return false;
+      backed_up_relative.push_back(rel.string());
+    } else {
+      auto rel = fs::relative(target, proj_path);
+      planned_created.push_back(rel.string());
+    }
+    return true;
+  };
+
+  for (const auto& f_str : plan.files_to_modify) {
+    if (!backup_file(fs::path(f_str))) {
+      report.success = false;
+      report.error_message = "Backup copy failed for modified file: " + f_str;
+      return report;
+    }
+  }
+  for (const auto& f_str : plan.files_to_create) {
+    if (!backup_file(fs::path(f_str))) {
+      report.success = false;
+      report.error_message = "Backup copy failed for target file: " + f_str;
+      return report;
+    }
+  }
+
+  // Write Transactional Journal BEFORE performing file modifications
+  {
+    std::ostringstream jss;
+    jss << "{\n";
+    jss << "  \"timestamp\": " << timestamp << ",\n";
+    jss << "  \"target_project\": \"" << EscapeJson(proj_path.string()) << "\",\n";
+    jss << "  \"created_files\": [\n";
+    for (std::size_t i = 0; i < planned_created.size(); ++i) {
+      jss << "    \"" << EscapeJson(planned_created[i]) << "\"" << (i + 1 < planned_created.size() ? "," : "") << "\n";
+    }
+    jss << "  ],\n";
+    jss << "  \"backed_up_files\": [\n";
+    for (std::size_t i = 0; i < backed_up_relative.size(); ++i) {
+      jss << "    \"" << EscapeJson(backed_up_relative[i]) << "\"" << (i + 1 < backed_up_relative.size() ? "," : "") << "\n";
+    }
+    jss << "  ]\n";
+    jss << "}\n";
+    WriteTextFile((backup_dir / "integration_journal.json").string(), jss.str());
+  }
+
+  // 4. Write Public Keys to Project
   fs::path manifest_pub_path = proj_path / "release.pub";
   fs::path license_pub_path = proj_path / "license.pub";
   WriteFile(manifest_pub_path.string(), manifest_pubkey.data(), manifest_pubkey.size());
@@ -328,18 +618,27 @@ IntegrationReport ExecuteIntegration(const IntegrationOptions& options) {
   report.generated_files.push_back(manifest_pub_path.string());
   report.generated_files.push_back(license_pub_path.string());
 
-  // 3. Generate rtprotect_config.h
+  std::string expected_exe_name = target_name;
+#if defined(_WIN32)
+  expected_exe_name += ".exe";
+#endif
+
+  // 5. Generate rtprotect_config.h
   fs::path config_header_path = proj_path / "rtprotect_config.h";
   {
     std::ostringstream ss;
     ss << "// Generated by RTProtect Integration Engine\n";
     ss << "#pragma once\n\n";
     ss << "#include <cstdint>\n";
-    ss << "#include <array>\n\n";
+    ss << "#include <array>\n";
+    ss << "#include <string>\n\n";
     ss << "namespace rtprotect_client {\n\n";
     ss << "inline constexpr const char* kProductId = \"" << options.product_id << "\";\n";
     ss << "inline constexpr const char* kReleaseVersion = \"" << options.release_version << "\";\n";
-    ss << "inline constexpr const char* kProtectionProfile = \"" << ToString(options.profile) << "\";\n\n";
+    ss << "inline constexpr const char* kProtectionProfile = \"" << ToString(options.profile) << "\";\n";
+    ss << "inline constexpr const char* kExpectedExecutableName = \"" << expected_exe_name << "\";\n";
+    ss << "inline constexpr std::uint64_t kRequiredCapabilities = 0x01; // kCapCoreExecution\n";
+    ss << "inline constexpr std::uint64_t kMinimumReleaseSequence = 1;\n\n";
 
     auto dump_key = [&](const char* name, const integrity::Ed25519PublicKey& k) {
       ss << "// Embedded " << name << " Verification Key\n";
@@ -356,17 +655,19 @@ IntegrationReport ExecuteIntegration(const IntegrationOptions& options) {
 
     dump_key("kManifestPublicKey", manifest_pubkey);
     dump_key("kLicensePublicKey", license_pubkey);
-    // Legacy alias
     dump_key("kPublicKey", manifest_pubkey);
 
-    ss << "bool VerifyClientIntegrityAndLicense();\n\n";
+    ss << "bool VerifyClientIntegrityAndLicense();\n";
+    ss << "std::string GetLicenseEdition();\n";
+    ss << "std::uint64_t GetLicenseCapabilities();\n";
+    ss << "bool HasCapability(std::uint64_t cap);\n\n";
     ss << "}  // namespace rtprotect_client\n";
 
     WriteTextFile(config_header_path.string(), ss.str());
     report.generated_files.push_back(config_header_path.string());
   }
 
-  // 4. Generate rtprotect_runtime_glue.cpp
+  // 6. Generate rtprotect_runtime_glue.cpp (CRITICAL 2 REMEDIATION: FAIL-CLOSED RUNTIME INTEGRITY)
   fs::path glue_path = proj_path / "rtprotect_runtime_glue.cpp";
   {
     std::ostringstream ss;
@@ -385,7 +686,9 @@ IntegrationReport ExecuteIntegration(const IntegrationOptions& options) {
     ss << "#include <cstdlib>\n";
     ss << "#include <cstring>\n";
     ss << "#include <filesystem>\n";
-    ss << "#include <string>\n\n";
+    ss << "#include <fstream>\n";
+    ss << "#include <string>\n";
+    ss << "#include <vector>\n\n";
 
     ss << "#if defined(_WIN32)\n";
     ss << "#include <windows.h>\n";
@@ -396,36 +699,53 @@ IntegrationReport ExecuteIntegration(const IntegrationOptions& options) {
     ss << "#endif\n\n";
 
     ss << "namespace rtprotect_client {\n\n";
+    ss << "static bool s_license_validated = false;\n";
+    ss << "static rtprotect::licensing::License s_validated_license{};\n\n";
 
     ss << "namespace {\n\n";
     ss << "std::string GetCurrentExecutablePath() {\n";
     ss << "#if defined(_WIN32)\n";
-    ss << "  char buf[MAX_PATH] = {0};\n";
-    ss << "  ::GetModuleFileNameA(NULL, buf, MAX_PATH);\n";
-    ss << "  return std::string(buf);\n";
+    ss << "  DWORD size = 512;\n";
+    ss << "  while (size <= 65536) {\n";
+    ss << "    std::vector<char> buf(size);\n";
+    ss << "    DWORD ret = ::GetModuleFileNameA(NULL, buf.data(), size);\n";
+    ss << "    if (ret == 0) return \"\";\n";
+    ss << "    if (ret < size - 1) return std::string(buf.data(), ret);\n";
+    ss << "    size *= 2;\n";
+    ss << "  }\n";
+    ss << "  return \"\";\n";
     ss << "#elif defined(__APPLE__)\n";
-    ss << "  char buf[1024] = {0};\n";
-    ss << "  uint32_t size = sizeof(buf);\n";
-    ss << "  if (_NSGetExecutablePath(buf, &size) == 0) return std::string(buf);\n";
+    ss << "  uint32_t size = 0;\n";
+    ss << "  _NSGetExecutablePath(nullptr, &size);\n";
+    ss << "  if (size == 0) return \"\";\n";
+    ss << "  std::vector<char> buf(size);\n";
+    ss << "  if (_NSGetExecutablePath(buf.data(), &size) == 0) return std::string(buf.data());\n";
     ss << "  return \"\";\n";
     ss << "#else\n";
-    ss << "  char buf[1024] = {0};\n";
-    ss << "  ssize_t len = ::readlink(\"/proc/self/exe\", buf, sizeof(buf) - 1);\n";
-    ss << "  if (len > 0) { buf[len] = '\\0'; return std::string(buf); }\n";
+    ss << "  size_t size = 1024;\n";
+    ss << "  while (size <= 65536) {\n";
+    ss << "    std::vector<char> buf(size);\n";
+    ss << "    ssize_t ret = ::readlink(\"/proc/self/exe\", buf.data(), buf.size() - 1);\n";
+    ss << "    if (ret <= 0) return \"\";\n";
+    ss << "    if (static_cast<size_t>(ret) < buf.size() - 1) {\n";
+    ss << "      buf[ret] = '\\0';\n";
+    ss << "      return std::string(buf.data(), ret);\n";
+    ss << "    }\n";
+    ss << "    size *= 2;\n";
+    ss << "  }\n";
     ss << "  return \"\";\n";
     ss << "#endif\n";
     ss << "}\n\n";
 
+    // HIGH 9 REMEDIATION: Authoritative auxiliary file location ONLY next to binary
     ss << "std::optional<std::vector<std::uint8_t>> ReadAuxiliaryFile(const std::string& name) {\n";
     ss << "  namespace fs = std::filesystem;\n";
     ss << "  std::string exe = GetCurrentExecutablePath();\n";
-    ss << "  if (!exe.empty()) {\n";
-    ss << "    auto next_to_exe = fs::path(exe).parent_path() / name;\n";
-    ss << "    if (fs::exists(next_to_exe)) return rtprotect::tooling::ReadFile(next_to_exe.string());\n";
+    ss << "  if (exe.empty()) return std::nullopt;\n";
+    ss << "  auto auth_path = fs::path(exe).parent_path() / name;\n";
+    ss << "  if (fs::exists(auth_path)) {\n";
+    ss << "    return rtprotect::tooling::ReadFile(auth_path.string());\n";
     ss << "  }\n";
-    ss << "  if (fs::exists(name)) return rtprotect::tooling::ReadFile(name);\n";
-    ss << "  auto parent_rel = fs::path(\"..\") / name;\n";
-    ss << "  if (fs::exists(parent_rel)) return rtprotect::tooling::ReadFile(parent_rel.string());\n";
     ss << "  return std::nullopt;\n";
     ss << "}\n\n";
     ss << "}  // namespace\n\n";
@@ -451,6 +771,9 @@ IntegrationReport ExecuteIntegration(const IntegrationOptions& options) {
     ss << "  rtprotect::licensing::License lic;\n";
     ss << "  auto lic_status = rtprotect::licensing::VerifyLicenseBytes(lic_data->data(), lic_data->size(), kLicensePublicKey, ctx, &lic);\n";
     ss << "  if (lic_status != rtprotect::licensing::LicenseStatus::kValid) return false;\n";
+    ss << "  if ((lic.capabilities & kRequiredCapabilities) != kRequiredCapabilities) return false;\n";
+    ss << "  s_validated_license = lic;\n";
+    ss << "  s_license_validated = true;\n";
 
     ss << "\n  // 3. Manifest signature and anti-rollback verification\n";
     ss << "  auto man_bytes = ReadAuxiliaryFile(\"release.manifest\");\n";
@@ -460,36 +783,36 @@ IntegrationReport ExecuteIntegration(const IntegrationOptions& options) {
     ss << "  std::memcpy(sig.data(), sig_bytes->data(), 64);\n";
     ss << "  if (!rtprotect::integrity::VerifyManifestSignature(*man_bytes, sig, kManifestPublicKey)) return false;\n";
     ss << "  auto manifest = rtprotect::integrity::DeserializeManifest(man_bytes->data(), man_bytes->size());\n";
-    ss << "  if (!manifest.has_value() || manifest->release_sequence < 1) return false;\n";
+    ss << "  if (!manifest.has_value() || manifest->release_sequence < kMinimumReleaseSequence) return false;\n";
 
-    ss << "\n  // 4. Runtime executable integrity verification\n";
+    ss << "\n  // 4. Executable integrity verification (FAIL CLOSED)\n";
     ss << "  std::string exe_path = GetCurrentExecutablePath();\n";
-    ss << "  if (!exe_path.empty()) {\n";
-    ss << "    auto exe_bytes = rtprotect::tooling::ReadFile(exe_path);\n";
-    ss << "    if (!exe_bytes.has_value()) return false;\n";
-    ss << "    auto actual_hash = rtprotect::integrity::Sha256(exe_bytes->data(), exe_bytes->size());\n";
-    ss << "    if (!actual_hash.has_value()) return false;\n";
-    ss << "    std::string exe_name = std::filesystem::path(exe_path).filename().string();\n";
-    ss << "    auto res = manifest->Find(exe_name);\n";
-    ss << "    if (!res) {\n";
-    ss << "      for (const auto& r : manifest->resources) {\n";
-    ss << "        if (r.name.find(exe_name) != std::string::npos || exe_name.find(r.name) != std::string::npos) {\n";
-    ss << "          res = &r;\n";
-    ss << "          break;\n";
-    ss << "        }\n";
-    ss << "      }\n";
-    ss << "    }\n";
-    ss << "    if (res != nullptr) {\n";
-    ss << "      if (res->size != exe_bytes->size() || res->sha256 != *actual_hash) return false;\n";
-    ss << "    }\n";
-    ss << "  }\n";
+    ss << "  if (exe_path.empty()) return false;\n";
+    ss << "  std::uint64_t actual_size = 0;\n";
+    ss << "  auto actual_hash = rtprotect::integrity::Sha256File(exe_path, &actual_size);\n";
+    ss << "  if (!actual_hash.has_value()) return false;\n";
+    ss << "  std::string exe_name = std::filesystem::path(exe_path).filename().string();\n";
+    ss << "  auto res = manifest->Find(exe_name);\n";
+    ss << "  if (!res) res = manifest->Find(kExpectedExecutableName);\n";
+    ss << "  if (!res) return false; // Mandatory executable resource missing in manifest -> FAIL\n";
+    ss << "  if (res->size != actual_size || res->sha256 != *actual_hash) return false;\n";
 
     ss << "  return true;\n";
     ss << "}\n\n";
 
+    ss << "std::string GetLicenseEdition() {\n";
+    ss << "  return s_license_validated ? s_validated_license.edition : \"\";\n";
+    ss << "}\n";
+    ss << "std::uint64_t GetLicenseCapabilities() {\n";
+    ss << "  return s_license_validated ? s_validated_license.capabilities : 0;\n";
+    ss << "}\n";
+    ss << "bool HasCapability(std::uint64_t cap) {\n";
+    ss << "  return s_license_validated && ((s_validated_license.capabilities & cap) == cap);\n";
+    ss << "}\n\n";
+
     ss << "}  // namespace rtprotect_client\n\n";
 
-    ss << "// Automatic startup hook -- executes before main()\n";
+    // Automatic pre-main() startup constructor hook
     ss << "#if defined(_MSC_VER)\n";
     ss << "static int InitializeRtProtectStartupHook() {\n";
     ss << "  if (!rtprotect_client::VerifyClientIntegrityAndLicense()) {\n";
@@ -519,90 +842,83 @@ IntegrationReport ExecuteIntegration(const IntegrationOptions& options) {
   std::string root_str = ec_root ? root : abs_root.string();
   std::replace(root_str.begin(), root_str.end(), '\\', '/');
 
-  // 5. Update CMakeLists.txt
-  fs::path cmake_path = proj_path / "CMakeLists.txt";
-  std::string target_name;
-  auto cmake_content = ReadTextFile(cmake_path.string());
+  // 7. Update CMakeLists.txt (HIGH 7 REMEDIATION: Relocatable SDK and Source Tree Support)
+  auto cmake_content = ReadTextFile(cmake_file.string());
   if (cmake_content.has_value()) {
-
-    auto pos = cmake_content->find("add_executable(");
-    if (pos != std::string::npos) {
-      pos += 15;
-      while (pos < cmake_content->size() && std::isspace(static_cast<unsigned char>((*cmake_content)[pos]))) pos++;
-      auto end_pos = pos;
-      while (end_pos < cmake_content->size() && !std::isspace(static_cast<unsigned char>((*cmake_content)[end_pos])) && (*cmake_content)[end_pos] != ')') {
-        end_pos++;
-      }
-      if (end_pos > pos) {
-        target_name = cmake_content->substr(pos, end_pos - pos);
-      }
-    }
-
     std::ostringstream ss;
     ss << "\n# --- Added by RTProtect Integration Tool ---\n";
     ss << "if(NOT DEFINED OPENSSL_ROOT_DIR AND EXISTS \"" << root_str << "/third_party/openssl\")\n";
     ss << "  set(OPENSSL_ROOT_DIR \"" << root_str << "/third_party/openssl\")\n";
     ss << "endif()\n";
     ss << "find_package(OpenSSL REQUIRED)\n";
-    if (!target_name.empty()) {
-      ss << "target_include_directories(" << target_name << " PRIVATE\n";
-      ss << "    \"" << root_str << "\"\n";
-      ss << "    \"" << root_str << "/third_party/openssl/include\"\n";
-      ss << ")\n";
-      ss << "target_link_directories(" << target_name << " PRIVATE\n";
-      ss << "    \"" << root_str << "/build/integrity\"\n";
-      ss << "    \"" << root_str << "/build/licensing\"\n";
-      ss << "    \"" << root_str << "/build/antitamper\"\n";
-      ss << "    \"" << root_str << "/build/crypto\"\n";
-      ss << "    \"" << root_str << "/build-reconst/integrity\"\n";
-      ss << "    \"" << root_str << "/build-reconst/licensing\"\n";
-      ss << "    \"" << root_str << "/build-reconst/antitamper\"\n";
-      ss << "    \"" << root_str << "/build-reconst/crypto\"\n";
-      ss << "    \"" << root_str << "/third_party/openssl/lib\"\n";
-      ss << "    \"" << root_str << "/lib\"\n";
-      ss << ")\n";
-      ss << "target_sources(" << target_name << " PRIVATE rtprotect_runtime_glue.cpp)\n";
-      ss << "target_link_libraries(" << target_name << " PRIVATE\n";
-      ss << "    rtprotect_licensing\n";
-      ss << "    rtprotect_integrity\n";
-      ss << "    rtprotect_antitamper\n";
-      ss << "    rtprotect_crypto\n";
-      ss << "    OpenSSL::Crypto\n";
-      ss << "    $<$<PLATFORM_ID:Windows>:iphlpapi>\n";
-      ss << "    $<$<PLATFORM_ID:Windows>:ws2_32>\n";
-      ss << ")\n";
 
-      ss << "\n# Compiler Hardening Profile: " << ToString(options.profile) << "\n";
-      if (options.profile == ProtectionProfile::kMaximum) {
-        ss << "if(MSVC)\n";
-        ss << "  target_compile_options(" << target_name << " PRIVATE /guard:cf /DYNAMICBASE /NXCOMPAT)\n";
-        ss << "else()\n";
-        ss << "  target_compile_options(" << target_name << " PRIVATE -fstack-protector-strong -fPIE)\n";
-        ss << "  target_link_options(" << target_name << " PRIVATE -pie)\n";
-        ss << "endif()\n";
-      } else if (options.profile == ProtectionProfile::kBalanced) {
-        ss << "if(NOT MSVC)\n";
-        ss << "  target_compile_options(" << target_name << " PRIVATE -fstack-protector)\n";
-        ss << "endif()\n";
-      }
+    ss << "# Support both packaged SDK layout (include/ and lib/) and source tree layout\n";
+    ss << "if(EXISTS \"" << root_str << "/include\" AND EXISTS \"" << root_str << "/lib\")\n";
+    ss << "  target_include_directories(" << target_name << " PRIVATE \"" << root_str << "/include\")\n";
+    ss << "  target_link_directories(" << target_name << " PRIVATE \"" << root_str << "/lib\")\n";
+    ss << "else()\n";
+    ss << "  target_include_directories(" << target_name << " PRIVATE\n";
+    ss << "      \"" << root_str << "\"\n";
+    ss << "      \"" << root_str << "/third_party/openssl/include\"\n";
+    ss << "  )\n";
+    ss << "  target_link_directories(" << target_name << " PRIVATE\n";
+    ss << "      \"" << root_str << "/build/integrity\"\n";
+    ss << "      \"" << root_str << "/build/licensing\"\n";
+    ss << "      \"" << root_str << "/build/antitamper\"\n";
+    ss << "      \"" << root_str << "/build/crypto\"\n";
+    ss << "      \"" << root_str << "/build-reconst/integrity\"\n";
+    ss << "      \"" << root_str << "/build-reconst/licensing\"\n";
+    ss << "      \"" << root_str << "/build-reconst/antitamper\"\n";
+    ss << "      \"" << root_str << "/build-reconst/crypto\"\n";
+    ss << "      \"" << root_str << "/third_party/openssl/lib\"\n";
+    ss << "      \"" << root_str << "/lib\"\n";
+    ss << "  )\n";
+    ss << "endif()\n";
+
+    ss << "target_sources(" << target_name << " PRIVATE rtprotect_runtime_glue.cpp)\n";
+    ss << "target_link_libraries(" << target_name << " PRIVATE\n";
+    ss << "    rtprotect_licensing\n";
+    ss << "    rtprotect_integrity\n";
+    ss << "    rtprotect_antitamper\n";
+    ss << "    rtprotect_crypto\n";
+    ss << "    OpenSSL::Crypto\n";
+    ss << "    $<$<PLATFORM_ID:Windows>:iphlpapi>\n";
+    ss << "    $<$<PLATFORM_ID:Windows>:ws2_32>\n";
+    ss << ")\n";
+
+    ss << "\n# Compiler & Linker Hardening Profile: " << ToString(options.profile) << "\n";
+    if (options.profile == ProtectionProfile::kMaximum) {
+      ss << "if(MSVC)\n";
+      ss << "  target_compile_options(" << target_name << " PRIVATE /guard:cf)\n";
+      ss << "  target_link_options(" << target_name << " PRIVATE /DYNAMICBASE /NXCOMPAT /HIGHENTROPYVA)\n";
+      ss << "else()\n";
+      ss << "  target_compile_options(" << target_name << " PRIVATE -fstack-protector-strong -fPIE)\n";
+      ss << "  target_link_options(" << target_name << " PRIVATE -pie -Wl,-z,relro,-z,now)\n";
+      ss << "endif()\n";
+    } else if (options.profile == ProtectionProfile::kBalanced) {
+      ss << "if(MSVC)\n";
+      ss << "  target_link_options(" << target_name << " PRIVATE /DYNAMICBASE /NXCOMPAT)\n";
+      ss << "else()\n";
+      ss << "  target_compile_options(" << target_name << " PRIVATE -fstack-protector)\n";
+      ss << "endif()\n";
     }
 
     std::string updated_cmake = *cmake_content + ss.str();
-    WriteTextFile(cmake_path.string(), updated_cmake);
-    report.modified_files.push_back(cmake_path.string());
+    WriteTextFile(cmake_file.string(), updated_cmake);
+    report.modified_files.push_back(cmake_file.string());
   }
 
-  // 6. Generate Default Client License
+  // 8. License Handling (CRITICAL 4 REMEDIATION)
   fs::path lic_path = proj_path / "client.license";
-  {
+  if (options.use_dev_keys) {
     licensing::License lic;
-    lic.license_id = "lic-auto-" + std::to_string(timestamp);
+    lic.license_id = "lic-dev-" + std::to_string(timestamp);
     lic.product_id = options.product_id;
-    lic.edition = "Standard";
-    lic.customer_id = "client@domain.local";
-    lic.capabilities = licensing::kCapCoreExecution | licensing::kCapCommercialUse;
+    lic.edition = "Development-Test";
+    lic.customer_id = "developer-local-test";
+    lic.capabilities = licensing::kCapCoreExecution | licensing::kCapCommercialUse | licensing::kCapAdvancedFeatures;
     lic.issued_at = static_cast<std::uint64_t>(std::time(nullptr));
-    lic.expires_at = 0; // Perpetual
+    lic.expires_at = 0; // Perpetual test license
     lic.hardware_id = licensing::GetLocalHardwareId();
 
     if (has_license_privkey && license_privkey.has_value()) {
@@ -610,12 +926,23 @@ IntegrationReport ExecuteIntegration(const IntegrationOptions& options) {
     }
     auto lic_bytes = licensing::SerializeLicense(lic);
     WriteFile(lic_path.string(), lic_bytes.data(), lic_bytes.size());
-
     report.license_file = lic_path.string();
     report.generated_files.push_back(lic_path.string());
+  } else if (!options.license_file_path.empty()) {
+    auto ldata = ReadFile(options.license_file_path);
+    if (!ldata.has_value()) {
+      report.success = false;
+      report.error_message = "Cannot read supplied license file: " + options.license_file_path;
+      return report;
+    }
+    WriteFile(lic_path.string(), ldata->data(), ldata->size());
+    report.license_file = lic_path.string();
+    report.generated_files.push_back(lic_path.string());
+  } else {
+    report.warnings.push_back("No license file provided. An authorized client.license must be generated via 'rtprotect-tool license-generate' and placed alongside the application.");
   }
 
-  // 7. Generate Initial Release Manifest
+  // 9. Initial Release Manifest
   fs::path manifest_path = proj_path / "release.manifest";
   fs::path sig_path = proj_path / "release.sig";
   {
@@ -623,9 +950,10 @@ IntegrationReport ExecuteIntegration(const IntegrationOptions& options) {
     manifest.release_version = options.release_version;
     manifest.release_sequence = 1;
 
-    auto cfg_data = ReadFile(config_header_path.string());
-    if (cfg_data.has_value()) {
-      manifest.AddResource("rtprotect_config.h", cfg_data->data(), cfg_data->size());
+    std::uint64_t cfg_size = 0;
+    auto cfg_hash = integrity::Sha256File(config_header_path.string(), &cfg_size);
+    if (cfg_hash.has_value()) {
+      manifest.AddResourceWithHash("rtprotect_config.h", *cfg_hash, cfg_size);
     }
 
     auto man_bytes = integrity::SerializeManifest(manifest);
@@ -641,40 +969,48 @@ IntegrationReport ExecuteIntegration(const IntegrationOptions& options) {
     report.manifest_file = manifest_path.string();
     report.signature_file = sig_path.string();
     report.generated_files.push_back(manifest_path.string());
-    report.generated_files.push_back(sig_path.string());
+    if (has_manifest_privkey) {
+      report.generated_files.push_back(sig_path.string());
+    }
   }
 
-  // 8. Build and Post-Build Executable Measurement
+  // 10. Build and Post-Build Measurement (HIGH 6 REMEDIATION: Process Invocation)
   if (options.run_build) {
     fs::path build_dir = proj_path / "build_protected";
-    std::string config_cmd = "cmake -B \"" + build_dir.string() + "\" -S \"" + proj_path.string() + "\"";
     std::string openssl_dir = root_str + "/third_party/openssl";
-    if (fs::exists(openssl_dir)) {
-      config_cmd += " -DOPENSSL_ROOT_DIR=\"" + openssl_dir + "\"";
-    }
-    std::string build_cmd = "cmake --build \"" + build_dir.string() + "\"";
 
-    int cr = std::system(config_cmd.c_str());
+    std::vector<std::string> cfg_args = {
+      "-B", build_dir.string(),
+      "-S", proj_path.string()
+    };
+    if (fs::exists(openssl_dir)) {
+      cfg_args.push_back("-DOPENSSL_ROOT_DIR=" + openssl_dir);
+    }
+
+    int cr = RunProcess("cmake", cfg_args);
     if (cr != 0) {
       report.build_succeeded = false;
       report.success = false;
-      report.error_message = "CMake configuration failed for target project";
+      report.error_message = "CMake configuration failed for target project (exit code " + std::to_string(cr) + ")";
       return report;
     }
 
-    int br = std::system(build_cmd.c_str());
+    std::vector<std::string> bld_args = {
+      "--build", build_dir.string()
+    };
+    int br = RunProcess("cmake", bld_args);
     if (br != 0) {
       report.build_succeeded = false;
       report.success = false;
-      report.error_message = "Protected build failed during compilation / linking";
+      report.error_message = "Protected build compilation failed (exit code " + std::to_string(br) + ")";
       return report;
     }
     report.build_succeeded = true;
 
     // Locate compiled binary
-    std::string exe_name = target_name.empty() ? "app" : target_name;
+    std::string exe_filename = target_name;
 #if defined(_WIN32)
-    exe_name += ".exe";
+    exe_filename += ".exe";
 #endif
 
     fs::path built_exe;
@@ -684,77 +1020,80 @@ IntegrationReport ExecuteIntegration(const IntegrationOptions& options) {
       build_dir / "Debug"
     };
     for (const auto& cd : candidate_dirs) {
-      if (fs::exists(cd / exe_name)) {
-        built_exe = cd / exe_name;
+      if (fs::exists(cd / exe_filename)) {
+        built_exe = cd / exe_filename;
         break;
       }
     }
 
-    // Measure the actual compiled executable and update signed manifest
+    if (built_exe.empty()) {
+      report.success = false;
+      report.error_message = "Compiled target binary '" + exe_filename + "' was not found in build outputs.";
+      return report;
+    }
+
+    // Measure the actual compiled executable via streaming SHA-256
     integrity::Manifest manifest;
     manifest.release_version = options.release_version;
     manifest.release_sequence = 1;
 
-    auto cfg_data = ReadFile(config_header_path.string());
-    if (cfg_data.has_value()) {
-      manifest.AddResource("rtprotect_config.h", cfg_data->data(), cfg_data->size());
+    std::uint64_t cfg_size = 0;
+    auto cfg_hash = integrity::Sha256File(config_header_path.string(), &cfg_size);
+    if (cfg_hash.has_value()) {
+      manifest.AddResourceWithHash("rtprotect_config.h", *cfg_hash, cfg_size);
     }
 
-    if (!built_exe.empty()) {
-      auto exe_data = ReadFile(built_exe.string());
-      if (exe_data.has_value()) {
-        manifest.AddResource(exe_name, exe_data->data(), exe_data->size());
-      }
+    std::uint64_t exe_size = 0;
+    auto exe_hash = integrity::Sha256File(built_exe.string(), &exe_size);
+    if (!exe_hash.has_value()) {
+      report.success = false;
+      report.error_message = "Failed to compute SHA-256 digest of built binary: " + built_exe.string();
+      return report;
     }
+    manifest.AddResourceWithHash(exe_filename, *exe_hash, exe_size);
 
     auto man_bytes = integrity::SerializeManifest(manifest);
     WriteFile(manifest_path.string(), man_bytes.data(), man_bytes.size());
 
+    // CRITICAL 3 REMEDIATION: Production signing check
     if (has_manifest_privkey && manifest_privkey.has_value()) {
       auto sig = integrity::SignManifestBytes(man_bytes, *manifest_privkey);
-      if (sig.has_value()) {
-        WriteFile(sig_path.string(), sig->data(), sig->size());
+      if (!sig.has_value()) {
+        report.success = false;
+        report.error_message = "Failed to sign release manifest.";
+        return report;
       }
-    }
+      WriteFile(sig_path.string(), sig->data(), sig->size());
 
-    // Deploy manifest, signature, license, and public keys alongside the built binary
-    if (!built_exe.empty()) {
+      // Deploy signed artifacts next to the executable
       auto dest_dir = built_exe.parent_path();
       fs::copy_file(manifest_path, dest_dir / "release.manifest", fs::copy_options::overwrite_existing, ec);
       fs::copy_file(sig_path, dest_dir / "release.sig", fs::copy_options::overwrite_existing, ec);
-      fs::copy_file(lic_path, dest_dir / "client.license", fs::copy_options::overwrite_existing, ec);
       fs::copy_file(manifest_pub_path, dest_dir / "release.pub", fs::copy_options::overwrite_existing, ec);
-    }
+      if (fs::exists(lic_path)) {
+        fs::copy_file(lic_path, dest_dir / "client.license", fs::copy_options::overwrite_existing, ec);
+      }
 
-    // Validate the protected build
-    std::string val_err;
-    report.validation_succeeded = ValidateProtectedBuild(
-        proj_path.string(), manifest_pub_path.string(), manifest_path.string(), sig_path.string(), &val_err);
-    if (!report.validation_succeeded) {
-      report.success = false;
-      report.error_message = "Protected build validation failed: " + val_err;
-      return report;
+      // Validate protected build
+      std::string val_err;
+      report.validation_succeeded = ValidateProtectedBuild(
+          proj_path.string(), manifest_pub_path.string(), manifest_path.string(), sig_path.string(), &val_err);
+      if (!report.validation_succeeded) {
+        report.success = false;
+        report.error_message = "Protected build validation failed: " + val_err;
+        return report;
+      }
+    } else {
+      // Unsigned production build
+      if (options.staging_only) {
+        report.is_staged_only = true;
+        report.warnings.push_back("Project compiled in staging mode without signing. Use 'rtprotect-tool sign-release' with vendor private key to sign release before distribution.");
+      } else {
+        report.success = false;
+        report.error_message = "Build succeeded, but release artifacts cannot be finalized without vendor signing key. Supply --sign-manifest-key or pass --staging to stage unsigned outputs.";
+        return report;
+      }
     }
-  }
-
-  // 9. Write Transactional Journal
-  {
-    std::ostringstream jss;
-    jss << "{\n";
-    jss << "  \"timestamp\": " << timestamp << ",\n";
-    jss << "  \"target_project\": \"" << EscapeJson(proj_path.string()) << "\",\n";
-    jss << "  \"created_files\": [\n";
-    for (std::size_t i = 0; i < planned_created.size(); ++i) {
-      jss << "    \"" << EscapeJson(planned_created[i]) << "\"" << (i + 1 < planned_created.size() ? "," : "") << "\n";
-    }
-    jss << "  ],\n";
-    jss << "  \"backed_up_files\": [\n";
-    for (std::size_t i = 0; i < backed_up_relative.size(); ++i) {
-      jss << "    \"" << EscapeJson(backed_up_relative[i]) << "\"" << (i + 1 < backed_up_relative.size() ? "," : "") << "\n";
-    }
-    jss << "  ]\n";
-    jss << "}\n";
-    WriteTextFile((backup_dir / "integration_journal.json").string(), jss.str());
   }
 
   report.success = true;
@@ -782,7 +1121,7 @@ bool ExecuteRollback(const std::string& target_project_path,
     return false;
   }
 
-  // Check if integration_journal.json exists
+  // Parse integration_journal.json
   fs::path journal_path = bkp_path / "integration_journal.json";
   if (fs::exists(journal_path)) {
     auto jtext = ReadTextFile(journal_path.string());
@@ -810,7 +1149,7 @@ bool ExecuteRollback(const std::string& target_project_path,
       auto created_files = extract_list(*jtext, "created_files");
       auto backed_up_files = extract_list(*jtext, "backed_up_files");
 
-      // Remove only files that were newly created
+      // Remove only files created by the integration transaction
       for (const auto& rel_file : created_files) {
         fs::path target_file = proj_path / rel_file;
         if (IsPathWithin(target_file, proj_path) && fs::exists(target_file)) {
@@ -855,7 +1194,6 @@ bool ExecuteRollback(const std::string& target_project_path,
     }
   }
 
-  // Remove standard generated files
   std::vector<std::string> to_remove = {
     "rtprotect_config.h",
     "rtprotect_runtime_glue.cpp",
@@ -870,6 +1208,111 @@ bool ExecuteRollback(const std::string& target_project_path,
     fs::path target_file = proj_path / f;
     if (IsPathWithin(target_file, proj_path) && fs::exists(target_file)) {
       fs::remove(target_file, ec);
+    }
+  }
+
+  return true;
+}
+
+bool SignRelease(const std::string& project_dir,
+                 const std::string& manifest_privkey_path,
+                 const std::string& license_file_path,
+                 std::string* error_out) {
+  std::error_code ec;
+  fs::path root = fs::canonical(project_dir, ec);
+  if (ec || !fs::is_directory(root)) {
+    if (error_out) *error_out = "Target project directory does not exist: " + project_dir;
+    return false;
+  }
+
+  auto priv_bytes = ReadFile(manifest_privkey_path);
+  if (!priv_bytes.has_value() || priv_bytes->size() != integrity::kEd25519PrivateKeyLen) {
+    if (error_out) *error_out = "Invalid or unreadable private key: " + manifest_privkey_path;
+    return false;
+  }
+  auto priv = integrity::Ed25519PrivateKey::FromBytes(priv_bytes->data(), priv_bytes->size());
+  if (!priv.has_value()) {
+    if (error_out) *error_out = "Failed to load private key bytes";
+    return false;
+  }
+
+  fs::path manifest_path = root / "release.manifest";
+  auto man_bytes = ReadFile(manifest_path.string());
+  if (!man_bytes.has_value()) {
+    if (error_out) *error_out = "Manifest file not found: " + manifest_path.string();
+    return false;
+  }
+
+  auto manifest = integrity::DeserializeManifest(man_bytes->data(), man_bytes->size());
+  if (!manifest.has_value()) {
+    if (error_out) *error_out = "Failed to deserialize release manifest";
+    return false;
+  }
+
+  // Update resource hashes for build output files
+  for (auto& res : manifest->resources) {
+    fs::path res_path = root / res.name;
+    if (!fs::exists(res_path)) {
+      std::vector<fs::path> candidate_dirs = {
+        root / "build_protected",
+        root / "build_protected" / "Release",
+        root / "build_protected" / "Debug",
+        root / "build",
+        root / "build" / "Release",
+        root / "build" / "Debug"
+      };
+      for (const auto& cd : candidate_dirs) {
+        if (fs::exists(cd / res.name)) {
+          res_path = cd / res.name;
+          break;
+        }
+      }
+    }
+    if (fs::exists(res_path)) {
+      std::uint64_t sz = 0;
+      auto h = integrity::Sha256File(res_path.string(), &sz);
+      if (h.has_value()) {
+        res.sha256 = *h;
+        res.size = sz;
+      }
+    }
+  }
+
+  auto updated_man_bytes = integrity::SerializeManifest(*manifest);
+  WriteFile(manifest_path.string(), updated_man_bytes.data(), updated_man_bytes.size());
+
+  auto sig = integrity::SignManifestBytes(updated_man_bytes, *priv);
+  if (!sig.has_value()) {
+    if (error_out) *error_out = "Failed to compute manifest signature with private key";
+    return false;
+  }
+
+  fs::path sig_path = root / "release.sig";
+  WriteFile(sig_path.string(), sig->data(), sig->size());
+
+  if (!license_file_path.empty()) {
+    auto ldata = ReadFile(license_file_path);
+    if (ldata.has_value()) {
+      WriteFile((root / "client.license").string(), ldata->data(), ldata->size());
+    }
+  }
+
+  // Copy signed manifest, sig, and license next to built executable
+  std::vector<fs::path> candidate_dirs = {
+    root / "build_protected",
+    root / "build_protected" / "Release",
+    root / "build_protected" / "Debug"
+  };
+  for (const auto& cd : candidate_dirs) {
+    if (fs::is_directory(cd)) {
+      fs::copy_file(manifest_path, cd / "release.manifest", fs::copy_options::overwrite_existing, ec);
+      fs::copy_file(sig_path, cd / "release.sig", fs::copy_options::overwrite_existing, ec);
+      if (fs::exists(root / "release.pub")) {
+        fs::copy_file(root / "release.pub", cd / "release.pub", fs::copy_options::overwrite_existing, ec);
+      }
+      if (fs::exists(root / "client.license")) {
+        fs::copy_file(root / "client.license", cd / "client.license", fs::copy_options::overwrite_existing, ec);
+      }
     }
   }
 
@@ -919,8 +1362,7 @@ bool ValidateProtectedBuild(const std::string& project_dir,
   fs::path root(project_dir);
   for (const auto& res : manifest->resources) {
     fs::path res_path = root / res.name;
-    std::optional<std::vector<std::uint8_t>> data = ReadFile(res_path.string());
-    if (!data.has_value()) {
+    if (!fs::exists(res_path)) {
       std::vector<fs::path> candidate_dirs = {
         root / "build_protected",
         root / "build_protected" / "Release",
@@ -931,19 +1373,26 @@ bool ValidateProtectedBuild(const std::string& project_dir,
       };
       for (const auto& cd : candidate_dirs) {
         if (fs::exists(cd / res.name)) {
-          data = ReadFile((cd / res.name).string());
+          res_path = cd / res.name;
           break;
         }
       }
     }
 
-    if (!data.has_value()) {
+    if (!fs::exists(res_path)) {
       if (error_out) *error_out = "Committed resource missing on disk: " + res.name;
       return false;
     }
-    auto err = integrity::CheckResource(*manifest, res.name, data->data(), data->size());
-    if (err != integrity::IntegrityError::kNone) {
-      if (error_out) *error_out = std::string("Committed resource verification failed: ") + res.name;
+
+    std::uint64_t actual_size = 0;
+    auto actual_hash = integrity::Sha256File(res_path.string(), &actual_size);
+    if (!actual_hash.has_value()) {
+      if (error_out) *error_out = "Cannot compute hash of resource: " + res.name;
+      return false;
+    }
+
+    if (actual_size != res.size || *actual_hash != res.sha256) {
+      if (error_out) *error_out = std::string("Committed resource verification failed (hash mismatch): ") + res.name;
       return false;
     }
   }

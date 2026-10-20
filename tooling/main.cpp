@@ -74,15 +74,25 @@ void PrintUsage() {
       "  Project Integration & Build Operations:\n"
       "    rtprotect-tool integrate <project-path> [options]\n"
       "      --profile <dev|balanced|maximum>   Protection hardening profile (default: balanced)\n"
+      "      --target <name>                   Specify CMake executable target to protect\n"
       "      --dry-run                         Preview plan without modifying files\n"
-      "      --dev-keys                        Use deterministic test keys instead of CSPRNG\n"
+      "      --dev-keys                        Use development test keys (outside client project)\n"
+      "      --manifest-pubkey <file>          External Ed25519 public key for manifest verification\n"
+      "      --license-pubkey <file>           External Ed25519 public key for license verification\n"
+      "      --sign-manifest-key <file>        Vendor private key for manifest signing\n"
+      "      --sign-license-key <file>         Vendor private key for license signing\n"
+      "      --license-file <file>             Deploy authorized vendor client.license\n"
+      "      --staging                         Stage project instrumentation without signing\n"
       "      --backup-dir <dir>                Custom location for project backup\n"
       "      --report <json-file>              Output JSON execution report to path\n"
       "      --product <id>                    Product identifier (default: com.client.protected)\n"
       "      --version <ver>                   Release version string (default: 1.0.0)\n"
-      "      --rtprotect-root <dir>            Root path to RTProtect distribution\n"
+      "      --rtprotect-root <dir>            Root path to RTProtect distribution / SDK\n"
       "      --no-build                        Skip automatic build and verification\n"
       "      --non-interactive                 Do not prompt for confirmation\n"
+      "\n"
+      "    rtprotect-tool sign-release <project-path> --manifest-key <file> [--license <file>]\n"
+      "      Signs and packages release manifest using vendor private key on signing machine.\n"
       "\n"
       "    rtprotect-tool rollback <project-path> <backup-dir>\n"
       "      Restores project to pre-integration state from designated backup.\n"
@@ -365,6 +375,10 @@ int CmdIntegrate(int argc, char** argv) {
       options.non_interactive = true;
     } else if (arg == "--no-build") {
       options.run_build = false;
+    } else if (arg == "--staging" || arg == "--prepare-only") {
+      options.staging_only = true;
+    } else if (arg == "--target" && i + 1 < argc) {
+      options.target_name = argv[++i];
     } else if (arg == "--profile" && i + 1 < argc) {
       options.profile = ParseProfile(argv[++i]);
     } else if (arg == "--backup-dir" && i + 1 < argc) {
@@ -381,6 +395,12 @@ int CmdIntegrate(int argc, char** argv) {
       options.manifest_pubkey_path = argv[++i];
     } else if (arg == "--license-pubkey" && i + 1 < argc) {
       options.license_pubkey_path = argv[++i];
+    } else if (arg == "--sign-manifest-key" && i + 1 < argc) {
+      options.sign_manifest_key_path = argv[++i];
+    } else if (arg == "--sign-license-key" && i + 1 < argc) {
+      options.sign_license_key_path = argv[++i];
+    } else if (arg == "--license-file" && i + 1 < argc) {
+      options.license_file_path = argv[++i];
     } else if (arg == "--dev-keys-dir" && i + 1 < argc) {
       options.dev_keys_dir = argv[++i];
     } else {
@@ -453,6 +473,42 @@ int CmdRollback(int argc, char** argv) {
     return 1;
   }
   std::printf("Rollback succeeded. Restored %s from %s\n", argv[2], argv[3]);
+  return 0;
+}
+
+int CmdSignRelease(int argc, char** argv) {
+  if (argc < 4) {
+    std::fprintf(stderr, "Usage: rtprotect-tool sign-release <project-path> --manifest-key <file> [--license <file>]\n");
+    return 2;
+  }
+  std::string proj_path = argv[2];
+  std::string manifest_privkey;
+  std::string license_file;
+
+  for (int i = 3; i < argc; ++i) {
+    std::string arg = argv[i];
+    if (arg == "--manifest-key" && i + 1 < argc) {
+      manifest_privkey = argv[++i];
+    } else if (arg == "--license" && i + 1 < argc) {
+      license_file = argv[++i];
+    } else {
+      std::fprintf(stderr, "Unknown option: %s\n", arg.c_str());
+      return 2;
+    }
+  }
+
+  if (manifest_privkey.empty()) {
+    std::fprintf(stderr, "Error: --manifest-key is required.\n");
+    return 2;
+  }
+
+  std::string err;
+  if (!SignRelease(proj_path, manifest_privkey, license_file, &err)) {
+    std::fprintf(stderr, "Release signing failed: %s\n", err.c_str());
+    return 1;
+  }
+
+  std::printf("Release signed and validated successfully for: %s\n", proj_path.c_str());
   return 0;
 }
 
@@ -713,6 +769,7 @@ int main(int argc, char** argv) {
 
   // Integration & Lifecycle commands
   if (cmd == "integrate") return CmdIntegrate(argc, argv);
+  if (cmd == "sign-release") return CmdSignRelease(argc, argv);
   if (cmd == "rollback") return CmdRollback(argc, argv);
   if (cmd == "validate-build") return CmdValidateBuild(argc, argv);
 

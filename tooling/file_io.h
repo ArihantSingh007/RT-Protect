@@ -21,9 +21,12 @@
 
 #pragma once
 
+#include <chrono>
 #include <cstdint>
+#include <cstdio>
 #include <fstream>
 #include <optional>
+#include <random>
 #include <string>
 #include <vector>
 
@@ -52,26 +55,56 @@ inline std::optional<std::vector<std::uint8_t>> ReadFile(const std::string& path
 }
 
 inline bool WriteFile(const std::string& path, const std::uint8_t* data, std::size_t len) {
-  // Atomic write via temporary file + rename
-  std::string tmp_path = path + ".tmp";
-  {
-    std::ofstream f(tmp_path, std::ios::binary | std::ios::trunc);
-    if (!f) return false;
-    if (len > 0) f.write(reinterpret_cast<const char*>(data), static_cast<std::streamsize>(len));
-    if (!f) {
-      std::remove(tmp_path.c_str());
-      return false;
-    }
-  }
+  if (!data && len > 0) return false;
+
+  // Generate unique, unguessable temporary filename suffix to prevent symlink attacks and race collisions
+  static thread_local std::mt19937_64 rng([]() {
+    std::random_device rd;
+    auto now = std::chrono::high_resolution_clock::now().time_since_epoch().count();
+    return (static_cast<std::uint64_t>(rd()) << 32) ^ static_cast<std::uint64_t>(now);
+  }());
+  std::uint64_t rand_id = rng();
+
+  char suffix[32];
+  std::snprintf(suffix, sizeof(suffix), ".tmp.%016llx", static_cast<unsigned long long>(rand_id));
+  std::string tmp_path = path + suffix;
+
 #if defined(_WIN32)
+  HANDLE h = CreateFileA(tmp_path.c_str(), GENERIC_WRITE, 0, NULL, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, NULL);
+  if (h == INVALID_HANDLE_VALUE) {
+    return false;
+  }
+  DWORD written = 0;
+  bool write_ok = true;
+  if (len > 0) {
+    write_ok = (::WriteFile(h, data, static_cast<DWORD>(len), &written, NULL) != 0) && (written == len);
+  }
+  CloseHandle(h);
+  if (!write_ok) {
+    DeleteFileA(tmp_path.c_str());
+    return false;
+  }
   if (!MoveFileExA(tmp_path.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING)) {
-    std::remove(tmp_path.c_str());
+    DeleteFileA(tmp_path.c_str());
     return false;
   }
   return true;
 #else
+  int fd = open(tmp_path.c_str(), O_WRONLY | O_CREAT | O_EXCL, 0600);
+  if (fd < 0) return false;
+  std::size_t total_written = 0;
+  while (total_written < len) {
+    ssize_t w = write(fd, data + total_written, len - total_written);
+    if (w <= 0) {
+      close(fd);
+      unlink(tmp_path.c_str());
+      return false;
+    }
+    total_written += static_cast<std::size_t>(w);
+  }
+  close(fd);
   if (std::rename(tmp_path.c_str(), path.c_str()) != 0) {
-    std::remove(tmp_path.c_str());
+    unlink(tmp_path.c_str());
     return false;
   }
   return true;

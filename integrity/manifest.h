@@ -65,6 +65,9 @@ struct Manifest {
   // kMaxResourcesPerManifest.
   bool AddResource(const std::string& name, const std::uint8_t* data, std::size_t len);
 
+  // Adds an entry with a precomputed SHA-256 digest and size (e.g. from Sha256File).
+  bool AddResourceWithHash(const std::string& name, const Sha256Digest& sha, std::uint64_t size);
+
   // Finds an entry by name, or nullptr if absent.
   const ResourceEntry* Find(const std::string& name) const;
 };

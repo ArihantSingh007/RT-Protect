@@ -52,7 +52,7 @@ std::vector<std::uint8_t> Serialize(const Program& program) {
 }
 
 std::optional<Program> Deserialize(const std::uint8_t* data, std::size_t len) {
-  if (len < 1 + 4) return std::nullopt;
+  if (!data || len < 1 + 4) return std::nullopt;
   std::size_t pos = 0;
 
   Program p;
@@ -63,8 +63,7 @@ std::optional<Program> Deserialize(const std::uint8_t* data, std::size_t len) {
   if (!GetU32(data + pos, len - pos, &code_len)) return std::nullopt;
   pos += 4;
 
-  if (pos + code_len > len) return std::nullopt;  // claimed length exceeds buffer
-  if (code_len > kMaxCodeBytes) return std::nullopt;
+  if (code_len > kMaxCodeBytes || code_len > (len - pos)) return std::nullopt;
   p.code.assign(data + pos, data + pos + code_len);
   pos += code_len;
 
@@ -73,7 +72,8 @@ std::optional<Program> Deserialize(const std::uint8_t* data, std::size_t len) {
   pos += 4;
 
   if (const_count > kMaxConstants) return std::nullopt;
-  if (pos + static_cast<std::size_t>(const_count) * 8 != len) {
+  std::size_t remaining_bytes = len - pos;
+  if (remaining_bytes != static_cast<std::size_t>(const_count) * 8) {
     // Require the buffer to be exactly consumed -- trailing garbage after a
     // claimed-valid structure is itself a sign of a malformed/tampered blob.
     return std::nullopt;

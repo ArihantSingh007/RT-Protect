@@ -75,6 +75,19 @@ bool Manifest::AddResource(const std::string& name, const std::uint8_t* data, st
   return true;
 }
 
+bool Manifest::AddResourceWithHash(const std::string& name, const Sha256Digest& sha, std::uint64_t size) {
+  if (!IsValidResourceIdentifier(name)) return false;
+  if (resources.size() >= kMaxResourcesPerManifest) return false;
+  if (Find(name) != nullptr) return false;
+
+  ResourceEntry entry;
+  entry.name = name;
+  entry.sha256 = sha;
+  entry.size = size;
+  resources.push_back(std::move(entry));
+  return true;
+}
+
 const ResourceEntry* Manifest::Find(const std::string& name) const {
   for (const auto& r : resources) {
     if (r.name == name) return &r;

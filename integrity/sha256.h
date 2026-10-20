@@ -16,6 +16,7 @@
 #include <array>
 #include <cstdint>
 #include <optional>
+#include <string>
 
 namespace rtprotect::integrity {
 
@@ -24,5 +25,11 @@ using Sha256Digest = std::array<std::uint8_t, kSha256DigestLen>;
 
 // Returns std::nullopt only on an internal OpenSSL failure (digest fetch).
 std::optional<Sha256Digest> Sha256(const std::uint8_t* data, std::size_t len);
+
+// Streaming SHA-256 computation over a file on disk in 64KB chunks.
+// Does NOT load the entire file into memory; supports files of arbitrary size.
+// Returns std::nullopt if the file cannot be opened, an I/O error occurs,
+// or OpenSSL fails. Optionally writes total file size to out_file_size.
+std::optional<Sha256Digest> Sha256File(const std::string& path, std::uint64_t* out_file_size = nullptr);
 
 }  // namespace rtprotect::integrity
