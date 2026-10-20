@@ -50,21 +50,80 @@ std::string FormatCapabilities(std::uint64_t caps) {
   return res;
 }
 
-std::uint64_t ParseCapabilities(const std::string& str) {
-  if (str.empty()) return licensing::kCapCoreExecution;
+bool ParseCapabilitiesExact(const std::string& str, std::uint64_t* out_caps, std::string* error_msg) {
+  if (!out_caps) return false;
+  *out_caps = 0;
+  if (str.empty()) {
+    *out_caps = licensing::kCapCoreExecution;
+    return true;
+  }
+
   char* end = nullptr;
   unsigned long long val = std::strtoull(str.c_str(), &end, 0);
   if (end != str.c_str() && *end == '\0') {
-    return static_cast<std::uint64_t>(val);
+    *out_caps = static_cast<std::uint64_t>(val);
+    return true;
   }
+
+  std::vector<std::string> tokens;
+  std::string current;
+  for (char c : str) {
+    if (c == ',' || c == '|' || c == ' ' || c == '\t' || c == ';') {
+      if (!current.empty()) {
+        tokens.push_back(current);
+        current.clear();
+      }
+    } else {
+      current += static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    }
+  }
+  if (!current.empty()) {
+    tokens.push_back(current);
+  }
+
   std::uint64_t caps = 0;
-  if (str.find("core") != std::string::npos) caps |= licensing::kCapCoreExecution;
-  if (str.find("adv") != std::string::npos) caps |= licensing::kCapAdvancedFeatures;
-  if (str.find("export") != std::string::npos) caps |= licensing::kCapExportData;
-  if (str.find("commercial") != std::string::npos) caps |= licensing::kCapCommercialUse;
-  if (str.find("trial") != std::string::npos) caps |= licensing::kCapTrialMode;
-  if (str.find("offline") != std::string::npos) caps |= licensing::kCapOfflineAllowed;
-  return caps != 0 ? caps : licensing::kCapCoreExecution;
+  std::vector<std::string> seen;
+
+  for (const auto& tok : tokens) {
+    if (std::find(seen.begin(), seen.end(), tok) != seen.end()) {
+      if (error_msg) *error_msg = "Duplicate capability flag: '" + tok + "'";
+      return false;
+    }
+    seen.push_back(tok);
+
+    if (tok == "core" || tok == "coreexecution" || tok == "kcapcoreexecution") {
+      caps |= licensing::kCapCoreExecution;
+    } else if (tok == "adv" || tok == "advanced" || tok == "advancedfeatures" || tok == "kcapadvancedfeatures") {
+      caps |= licensing::kCapAdvancedFeatures;
+    } else if (tok == "export" || tok == "exportdata" || tok == "kcapexportdata") {
+      caps |= licensing::kCapExportData;
+    } else if (tok == "commercial" || tok == "commercialuse" || tok == "kcapcommercialuse") {
+      caps |= licensing::kCapCommercialUse;
+    } else if (tok == "trial" || tok == "trialmode" || tok == "kcaptrialmode") {
+      caps |= licensing::kCapTrialMode;
+    } else if (tok == "offline" || tok == "offlineallowed" || tok == "kcapofflineallowed") {
+      caps |= licensing::kCapOfflineAllowed;
+    } else {
+      if (error_msg) *error_msg = "Unrecognized capability flag: '" + tok + "'. Valid options: core, adv, export, commercial, trial, offline";
+      return false;
+    }
+  }
+
+  if (caps == 0) {
+    caps = licensing::kCapCoreExecution;
+  }
+  *out_caps = caps;
+  return true;
+}
+
+[[maybe_unused]] std::uint64_t ParseCapabilities(const std::string& str) {
+  std::uint64_t caps = 0;
+  std::string err;
+  if (!ParseCapabilitiesExact(str, &caps, &err)) {
+    std::fprintf(stderr, "warning: %s. Defaulting to CoreExecution.\n", err.c_str());
+    return licensing::kCapCoreExecution;
+  }
+  return caps;
 }
 
 void PrintUsage() {
@@ -436,7 +495,26 @@ int CmdIntegrate(int argc, char** argv) {
     return 1;
   }
 
-  std::printf("Integration succeeded!\n");
+  switch (report.state) {
+    case IntegrationState::kValidated:
+      std::printf("Integration and validation succeeded! [STATE: VALIDATED (READY FOR RELEASE)]\n");
+      break;
+    case IntegrationState::kAwaitingSignature:
+      std::printf("Project staged successfully! [STATE: AWAITING SIGNATURE (STAGED, UNSIGNED)]\n");
+      std::printf("  NOTE: Release artifacts are unsigned. Run 'rtprotect-tool sign-release' on your vendor signing machine.\n");
+      break;
+    case IntegrationState::kIntegrated:
+      std::printf("Project instrumented successfully! [STATE: INTEGRATED (UNBUILT, UNSIGNED)]\n");
+      std::printf("  NOTE: Target project has not been built or validated.\n");
+      break;
+    case IntegrationState::kPlanned:
+      std::printf("Integration plan completed! [STATE: PLANNED]\n");
+      break;
+    default:
+      std::printf("Integration state: %s\n", ToString(report.state));
+      break;
+  }
+
   std::printf("  Backup created at: %s\n", report.backup_path.c_str());
   std::printf("  Generated files:\n");
   for (const auto& gf : report.generated_files) {
@@ -577,7 +655,13 @@ int CmdLicenseGenerate(int argc, char** argv) {
   lic.product_id = product_id;
   lic.edition = edition;
   lic.customer_id = customer_id;
-  lic.capabilities = ParseCapabilities(capabilities_str);
+  std::uint64_t caps = 0;
+  std::string cap_err;
+  if (!ParseCapabilitiesExact(capabilities_str, &caps, &cap_err)) {
+    std::fprintf(stderr, "error: %s\n", cap_err.c_str());
+    return 2;
+  }
+  lic.capabilities = caps;
   lic.issued_at = now;
   if (expires_in_days > 0) {
     lic.expires_at = now + static_cast<std::uint64_t>(expires_in_days) * 86400ULL;
