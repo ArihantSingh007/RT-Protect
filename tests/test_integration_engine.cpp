@@ -4,6 +4,10 @@
 // Integration Engine (PlanIntegration, ExecuteIntegration, Rollback,
 // SignRelease, and ValidateProtectedBuild).
 
+#ifdef NDEBUG
+#undef NDEBUG
+#endif
+
 #include <cassert>
 #include <cstdio>
 #include <cstdlib>
@@ -11,10 +15,25 @@
 #include <fstream>
 #include <string>
 
+#define RT_TEST_ASSERT(cond)                                                    \
+  do {                                                                          \
+    if (!(cond)) {                                                              \
+      std::fprintf(stderr, "RT_TEST_ASSERT FAILED at %s:%d: %s\n",              \
+                   __FILE__, __LINE__, #cond);                                  \
+      std::fflush(stderr);                                                      \
+      std::abort();                                                             \
+    }                                                                           \
+  } while (0)
+
+#undef assert
+#define assert(cond) RT_TEST_ASSERT(cond)
+
 #include "licensing/license.h"
+#include "licensing/license_signer.h"
 #include "licensing/license_verifier.h"
 #include "licensing/hardware_id.h"
 #include "integrity/manifest.h"
+#include "integrity/signer.h"
 #include "integrity/verifier.h"
 #include "tooling/file_io.h"
 #include "tooling/integration_engine.h"
@@ -426,6 +445,201 @@ void TestStreamingSha256LargeFile() {
   std::printf("  PASSED: MEDIUM 17 streaming SHA-256 verifies files > 64 MB smoothly.\n");
 }
 
+void TestSignReleaseKeyMismatchRejected() {
+  std::printf("Running TestSignReleaseKeyMismatchRejected (Finding 1)...\n");
+
+  fs::path test_dir = "temp_test_sign_mismatch";
+  CleanDir(test_dir);
+  fs::create_directories(test_dir);
+
+  auto kp_correct = integrity::GenerateEd25519KeyPair();
+  auto kp_wrong = integrity::GenerateEd25519KeyPair();
+  assert(kp_correct.has_value() && kp_wrong.has_value());
+
+  // Set up project with kp_correct public key
+  WriteFile((test_dir / "release.pub").string(), kp_correct->public_key.data(), kp_correct->public_key.size());
+
+  // Create a minimal manifest
+  integrity::Manifest m;
+  m.release_version = "1.0.0";
+  m.release_sequence = 1;
+  std::string dummy_data = "int main() { return 0; }";
+  WriteTextFile((test_dir / "main.cpp").string(), dummy_data);
+  m.AddResource("main.cpp", reinterpret_cast<const std::uint8_t*>(dummy_data.data()), dummy_data.size());
+  auto m_bytes = integrity::SerializeManifest(m);
+  WriteFile((test_dir / "release.manifest").string(), m_bytes.data(), m_bytes.size());
+
+  // Save kp_wrong private key to an external file
+  fs::path wrong_priv_file = test_dir / "wrong.priv";
+  WriteSecretFile(wrong_priv_file.string(), kp_wrong->private_key.data(), kp_wrong->private_key.size());
+
+  // Attempt to sign release using mismatched private key
+  std::string err;
+  bool ok = SignRelease(test_dir.string(), wrong_priv_file.string(), "", &err);
+
+  // Finding 1 verification: SignRelease MUST return false, report mismatch, and NOT create release.sig!
+  assert(!ok);
+  assert(!err.empty());
+  assert(err.find("Signing key mismatch") != std::string::npos || err.find("does not correspond") != std::string::npos);
+  assert(!fs::exists(test_dir / "release.sig"));
+
+  // Now sign with the correct key and verify it succeeds
+  fs::path correct_priv_file = test_dir / "correct.priv";
+  WriteSecretFile(correct_priv_file.string(), kp_correct->private_key.data(), kp_correct->private_key.size());
+  bool ok_correct = SignRelease(test_dir.string(), correct_priv_file.string(), "", &err);
+  assert(ok_correct);
+  assert(fs::exists(test_dir / "release.sig"));
+
+  CleanDir(test_dir);
+  std::printf("  PASSED: Finding 1 signing key mismatch strictly rejected.\n");
+}
+
+void TestNoBuildReportsIntegratedState() {
+  std::printf("Running TestNoBuildReportsIntegratedState (Finding 2)...\n");
+
+  fs::path test_dir = "temp_test_nobuild_state";
+  CleanDir(test_dir);
+  fs::create_directories(test_dir);
+
+  std::string orig_cmake = "cmake_minimum_required(VERSION 3.20)\nproject(ClientApp)\nadd_executable(client main.cpp)\n";
+  WriteTextFile((test_dir / "CMakeLists.txt").string(), orig_cmake);
+  WriteTextFile((test_dir / "main.cpp").string(), "int main() { return 0; }\n");
+
+  IntegrationOptions opts;
+  opts.target_project_path = test_dir.string();
+  opts.use_dev_keys = true;
+  opts.run_build = false;
+
+  auto report = ExecuteIntegration(opts);
+  // Finding 2 verification: --no-build must report kIntegrated, not kValidated or kAwaitingSignature
+  assert(report.success);
+  assert(report.state == IntegrationState::kIntegrated);
+  assert(!report.build_succeeded);
+  assert(!report.validation_succeeded);
+
+  CleanDir(test_dir);
+  std::printf("  PASSED: Finding 2 --no-build reports distinct kIntegrated state.\n");
+}
+
+void TestProductionLicenseSigningWorkflow() {
+  std::printf("Running TestProductionLicenseSigningWorkflow (Finding 3)...\n");
+
+  fs::path test_dir = "temp_test_prod_license";
+  CleanDir(test_dir);
+  fs::create_directories(test_dir);
+
+  auto man_kp = integrity::GenerateEd25519KeyPair();
+  auto lic_kp = integrity::GenerateEd25519KeyPair();
+  assert(man_kp.has_value() && lic_kp.has_value());
+
+  fs::path man_pub_file = test_dir / "external_man.pub";
+  fs::path lic_pub_file = test_dir / "external_lic.pub";
+  fs::path lic_priv_file = test_dir / "external_lic.priv";
+  WriteFile(man_pub_file.string(), man_kp->public_key.data(), man_kp->public_key.size());
+  WriteFile(lic_pub_file.string(), lic_kp->public_key.data(), lic_kp->public_key.size());
+  WriteSecretFile(lic_priv_file.string(), lic_kp->private_key.data(), lic_kp->private_key.size());
+
+  std::string orig_cmake = "cmake_minimum_required(VERSION 3.20)\nproject(ClientApp)\nadd_executable(client main.cpp)\n";
+  WriteTextFile((test_dir / "CMakeLists.txt").string(), orig_cmake);
+  WriteTextFile((test_dir / "main.cpp").string(), "int main() { return 0; }\n");
+
+  IntegrationOptions opts;
+  opts.target_project_path = test_dir.string();
+  opts.product_id = "com.test.prodlic";
+  opts.manifest_pubkey_path = man_pub_file.string();
+  opts.license_pubkey_path = lic_pub_file.string();
+  opts.sign_license_key_path = lic_priv_file.string();
+  opts.staging_only = true;
+  opts.run_build = false;
+
+  auto report = ExecuteIntegration(opts);
+  assert(report.success);
+  assert(fs::exists(test_dir / "client.license"));
+
+  // Verify the generated production license
+  auto lic_data = ReadFile((test_dir / "client.license").string());
+  assert(lic_data.has_value());
+
+  licensing::LicenseVerificationContext ctx;
+  ctx.expected_product_id = "com.test.prodlic";
+  ctx.current_hardware_id = licensing::GetLocalHardwareId();
+  licensing::License verified_lic;
+  auto status = licensing::VerifyLicenseBytes(lic_data->data(), lic_data->size(), lic_kp->public_key, ctx, &verified_lic);
+  assert(status == licensing::LicenseStatus::kValid);
+  assert(verified_lic.edition == "Production");
+  assert(verified_lic.product_id == "com.test.prodlic");
+
+  CleanDir(test_dir);
+  std::printf("  PASSED: Finding 3 production license signing workflow issues validated license.\n");
+}
+
+void TestValidateProtectedBuildEnforcesLicenseIntegrity() {
+  std::printf("Running TestValidateProtectedBuildEnforcesLicenseIntegrity (Finding 4)...\n");
+
+  fs::path test_dir = "temp_test_val_integrity";
+  CleanDir(test_dir);
+  fs::create_directories(test_dir);
+
+  auto man_kp = integrity::GenerateEd25519KeyPair();
+  auto lic_kp = integrity::GenerateEd25519KeyPair();
+  assert(man_kp.has_value() && lic_kp.has_value());
+
+  WriteFile((test_dir / "release.pub").string(), man_kp->public_key.data(), man_kp->public_key.size());
+  WriteFile((test_dir / "license.pub").string(), lic_kp->public_key.data(), lic_kp->public_key.size());
+
+  // Create valid license
+  licensing::License lic;
+  lic.license_id = "lic-val-1";
+  lic.product_id = "com.test.val";
+  lic.edition = "Standard";
+  lic.customer_id = "tester";
+  lic.capabilities = licensing::kCapCoreExecution;
+  lic.issued_at = static_cast<std::uint64_t>(std::time(nullptr));
+  lic.expires_at = 0;
+  lic.hardware_id = licensing::GetLocalHardwareId();
+  licensing::SignLicense(lic, lic_kp->private_key);
+  auto lic_bytes = licensing::SerializeLicense(lic);
+  WriteFile((test_dir / "client.license").string(), lic_bytes.data(), lic_bytes.size());
+
+  // Create valid manifest and signature
+  integrity::Manifest m;
+  m.release_version = "1.0.0";
+  m.release_sequence = 1;
+  std::string file_data = "binary content";
+  WriteTextFile((test_dir / "data.bin").string(), file_data);
+  m.AddResource("data.bin", reinterpret_cast<const std::uint8_t*>(file_data.data()), file_data.size());
+  auto m_bytes = integrity::SerializeManifest(m);
+  WriteFile((test_dir / "release.manifest").string(), m_bytes.data(), m_bytes.size());
+  auto sig = integrity::SignManifestBytes(m_bytes, man_kp->private_key);
+  assert(sig.has_value());
+  WriteFile((test_dir / "release.sig").string(), sig->data(), sig->size());
+
+  // Validation should pass on untampered directory
+  std::string val_err;
+  bool ok = ValidateProtectedBuild(test_dir.string(),
+                                  (test_dir / "release.pub").string(),
+                                  (test_dir / "release.manifest").string(),
+                                  (test_dir / "release.sig").string(),
+                                  &val_err);
+  assert(ok);
+  assert(val_err.empty());
+
+  // Tamper with client.license bytes -> ValidateProtectedBuild must fail!
+  std::vector<std::uint8_t> tampered_lic = lic_bytes;
+  tampered_lic[tampered_lic.size() - 5] ^= 0xFF;
+  WriteFile((test_dir / "client.license").string(), tampered_lic.data(), tampered_lic.size());
+  bool ok_tampered = ValidateProtectedBuild(test_dir.string(),
+                                           (test_dir / "release.pub").string(),
+                                           (test_dir / "release.manifest").string(),
+                                           (test_dir / "release.sig").string(),
+                                           &val_err);
+  assert(!ok_tampered);
+  assert(!val_err.empty());
+
+  CleanDir(test_dir);
+  std::printf("  PASSED: Finding 4 ValidateProtectedBuild strictly enforces license integrity.\n");
+}
+
 }  // namespace
 
 int main() {
@@ -439,6 +653,10 @@ int main() {
   TestPathTraversalPrevention();
   TestBuildFailureFailsClosed();
   TestStreamingSha256LargeFile();
+  TestSignReleaseKeyMismatchRejected();
+  TestNoBuildReportsIntegratedState();
+  TestProductionLicenseSigningWorkflow();
+  TestValidateProtectedBuildEnforcesLicenseIntegrity();
   std::printf("ALL INTEGRATION ENGINE TESTS PASSED.\n");
   return 0;
 }

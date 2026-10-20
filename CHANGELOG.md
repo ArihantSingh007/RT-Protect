@@ -5,6 +5,48 @@ This project adheres to Semantic Versioning and structured security reporting.
 
 ---
 
+## [2.2.0-hardened] - 2026-10-20
+
+### Security & Hardening Remediations (Audit WIP 3)
+
+- **Finding 1 — Cryptographic Key Correspondence Verification in `SignRelease` (RTP-SEC-033):**
+  - *Location:* `tooling/integration_engine.cpp:SignRelease`
+  - *Fix:* Before writing `release.sig` and reporting success, `SignRelease` now reads the target project's configured `release.pub` and cryptographically verifies `integrity::VerifyManifestSignature(updated_manifest_bytes, signature, project_pubkey)`. If the private key does not match `release.pub`, the operation fails closed, no signature file is created or left on disk, and a clear error is returned. Furthermore, `SignRelease` executes full post-signing validation (`ValidateProtectedBuild`) before returning true.
+  - *Verification:* `TestSignReleaseKeyMismatchRejected` in `tests/test_integration_engine.cpp`.
+
+- **Finding 2 — Integration Lifecycle State Machine & Unsigned Release Reporting (RTP-SEC-034):**
+  - *Location:* `tooling/integration_engine.h`, `tooling/integration_engine.cpp`, `tooling/main.cpp`
+  - *Fix:* Replaced ambiguous binary success reporting with an explicit lifecycle state enum `IntegrationState` (`kPlanned`, `kIntegrated`, `kBuilt`, `kAwaitingSignature`, `kValidated`, `kFailed`). Integration reports in `--no-build` mode now report `kIntegrated` (unbuilt, unsigned), while `--staging` builds report `kAwaitingSignature` (staged, unsigned). The CLI clearly announces whether artifacts require offline vendor signing, and only reports "Protected release ready" when the release is in state `kValidated`.
+  - *Verification:* `TestNoBuildReportsIntegratedState` in `tests/test_integration_engine.cpp`.
+
+- **Finding 3 — Production License Signing Automation (RTP-SEC-035):**
+  - *Location:* `tooling/integration_engine.cpp:ExecuteIntegration`
+  - *Fix:* Integrated `--sign-license-key` with the production licensing engine on authorized vendor build infrastructure. When provided, the integration engine automatically generates an authorized production license (`Edition: Production`), signs it with the vendor's private key, verifies it against `license.pub`, and places it in the project and build outputs.
+  - *Verification:* `TestProductionLicenseSigningWorkflow` in `tests/test_integration_engine.cpp`.
+
+- **Finding 4 — Mandatory Artifact Contract & License Enforcement in `ValidateProtectedBuild` (RTP-SEC-036):**
+  - *Location:* `tooling/integration_engine.cpp:ValidateProtectedBuild`
+  - *Fix:* `ValidateProtectedBuild` now enforces mandatory artifact presence and validity: non-empty manifest resources, streaming SHA-256 verification of executable binaries, and cryptographic verification of `client.license` against `license.pub` (rejecting tampered, corrupt, or expired licenses).
+  - *Verification:* `TestValidateProtectedBuildEnforcesLicenseIntegrity` in `tests/test_integration_engine.cpp`.
+
+- **Exact Capability Token Parsing & Rejection (RTP-SEC-037):**
+  - *Location:* `tooling/main.cpp:ParseCapabilitiesExact`
+  - *Fix:* Replaced substring searching with strict tokenization, duplicate flag rejection, and rejection of unrecognized capabilities with exit code 2 and helpful usage instructions.
+
+- **Safe Hardware Breakpoint Context Inspection on Windows (RTP-SEC-038):**
+  - *Location:* `antitamper/anti_debug.cpp:CheckHardwareBreakpoints`
+  - *Fix:* Replaced raw `GetThreadContext(GetCurrentThread())` with safe asynchronous thread context inspection via a monitoring thread that suspends the target thread, inspects `Dr0..Dr3` registers, and resumes it without faulting.
+
+- **External Default Backup Directory Isolation (RTP-SEC-040):**
+  - *Location:* `tooling/integration_engine.cpp:ExecuteIntegration`
+  - *Fix:* Moved the default transactional backup location from within the client project to an external system temporary directory with collision-resistant random hex suffixes. Prohibited custom `--backup-dir` paths pointing inside the client project.
+
+- **Always-Active Release-Mode Test Assertions (RTP-SEC-039):**
+  - *Location:* `tests/test_integration_engine.cpp`
+  - *Fix:* Introduced `RT_TEST_ASSERT` macro that aborts with full diagnostic context regardless of `NDEBUG`, ensuring all test assertions remain 100% active during Release builds and packaging scripts.
+
+---
+
 ## [2.1.0-hardened] - 2026-10-20
 
 ### 1. Critical Security Vulnerability Remediations

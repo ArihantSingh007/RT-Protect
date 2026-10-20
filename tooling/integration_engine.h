@@ -23,6 +23,17 @@ enum class ProtectionProfile {
 const char* ToString(ProtectionProfile p);
 ProtectionProfile ParseProfile(const std::string& str);
 
+enum class IntegrationState {
+  kPlanned = 0,
+  kIntegrated,
+  kBuilt,
+  kAwaitingSignature,
+  kValidated,
+  kFailed
+};
+
+const char* ToString(IntegrationState s);
+
 struct IntegrationOptions {
   std::string target_project_path;
   ProtectionProfile profile = ProtectionProfile::kBalanced;
@@ -61,6 +72,7 @@ struct ChangePlan {
 
 struct IntegrationReport {
   bool success = false;
+  IntegrationState state = IntegrationState::kFailed;
   bool is_staged_only = false;
   std::string target_name;
   std::string error_message;

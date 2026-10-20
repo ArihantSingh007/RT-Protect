@@ -47,13 +47,37 @@ bool CheckRemoteDebugger() {
 
 bool CheckHardwareBreakpoints() {
 #if defined(_WIN32)
-  CONTEXT ctx{};
-  ctx.ContextFlags = CONTEXT_DEBUG_REGISTERS;
-  HANDLE thread = ::GetCurrentThread();
-  if (::GetThreadContext(thread, &ctx)) {
-    return (ctx.Dr0 != 0 || ctx.Dr1 != 0 || ctx.Dr2 != 0 || ctx.Dr3 != 0);
+  DWORD current_tid = ::GetCurrentThreadId();
+  bool found_bp = false;
+  HANDLE helper = ::CreateThread(nullptr, 0, [](LPVOID param) -> DWORD {
+    DWORD target_tid = *reinterpret_cast<DWORD*>(param);
+    HANDLE target = ::OpenThread(THREAD_GET_CONTEXT | THREAD_SUSPEND_RESUME, FALSE, target_tid);
+    if (!target) return 0;
+    if (::SuspendThread(target) != static_cast<DWORD>(-1)) {
+      CONTEXT ctx{};
+      ctx.ContextFlags = CONTEXT_DEBUG_REGISTERS;
+      if (::GetThreadContext(target, &ctx)) {
+        if (ctx.Dr0 != 0 || ctx.Dr1 != 0 || ctx.Dr2 != 0 || ctx.Dr3 != 0) {
+          ::ResumeThread(target);
+          ::CloseHandle(target);
+          return 1;
+        }
+      }
+      ::ResumeThread(target);
+    }
+    ::CloseHandle(target);
+    return 0;
+  }, &current_tid, 0, nullptr);
+
+  if (helper) {
+    ::WaitForSingleObject(helper, 100);
+    DWORD exit_code = 0;
+    if (::GetExitCodeThread(helper, &exit_code) && exit_code == 1) {
+      found_bp = true;
+    }
+    ::CloseHandle(helper);
   }
-  return false;
+  return found_bp;
 #else
   return false;
 #endif
