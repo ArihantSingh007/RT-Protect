@@ -33,12 +33,17 @@ struct IntegrationOptions {
   bool non_interactive = false;
   bool use_dev_keys = false;
   bool run_build = true;
+  bool staging_only = false;         // If true, instrument project for vendor signing without requiring local signatures
   std::string product_id = "com.client.protected";
   std::string release_version = "1.0.0";
+  std::string target_name;           // Selected CMake executable target (required if multiple targets exist)
   std::string rtprotect_root;        // Path to RTProtect repository / SDK
-  std::string manifest_pubkey_path;  // Optional external manifest public key
-  std::string license_pubkey_path;   // Optional external license public key
-  std::string dev_keys_dir;          // Output directory for dev keys (outside client project)
+  std::string manifest_pubkey_path;  // External manifest public key
+  std::string license_pubkey_path;   // External license public key
+  std::string sign_manifest_key_path;// Optional vendor release signing private key
+  std::string sign_license_key_path; // Optional vendor license signing private key
+  std::string license_file_path;     // Optional pre-issued client.license to deploy
+  std::string dev_keys_dir;          // Output directory for dev keys (must be outside client project)
 };
 
 struct ChangePlan {
@@ -56,6 +61,8 @@ struct ChangePlan {
 
 struct IntegrationReport {
   bool success = false;
+  bool is_staged_only = false;
+  std::string target_name;
   std::string error_message;
   std::string backup_path;
   std::vector<std::string> modified_files;
@@ -64,7 +71,7 @@ struct IntegrationReport {
   std::string public_key_file;          // Primary / manifest public key file
   std::string manifest_public_key_file; // Manifest verification public key
   std::string license_public_key_file;  // License verification public key
-  std::string private_key_file;         // Populated only in --dev-keys mode (in dev_keys_dir)
+  std::string private_key_file;         // Populated only in --dev-keys mode (in external dev_keys_dir)
   std::string manifest_file;
   std::string signature_file;
   std::string license_file;
@@ -84,6 +91,12 @@ IntegrationReport ExecuteIntegration(const IntegrationOptions& options);
 bool ExecuteRollback(const std::string& target_project_path,
                      const std::string& backup_dir,
                      std::string* error_out = nullptr);
+
+// Signs release artifacts on a vendor signing machine using private signing keys.
+bool SignRelease(const std::string& project_dir,
+                 const std::string& manifest_privkey_path,
+                 const std::string& license_file_path = "",
+                 std::string* error_out = nullptr);
 
 // Validates an already-protected build artifacts against signed manifests.
 bool ValidateProtectedBuild(const std::string& project_dir,

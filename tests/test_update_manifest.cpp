@@ -170,4 +170,16 @@ MT_TEST(UpdateManifest_PayloadVerification_RejectsPathTraversal) {
   std::filesystem::remove_all(temp_dir);
 }
 
+MT_TEST(UpdateManifest_OversizedInput_FailsSafely) {
+  UpdatePackage pkg;
+  // String length exceeding 65535 bytes
+  pkg.target_product = std::string(70000, 'X');
+  pkg.target_version = "1.0.0";
+  pkg.sequence_number = 1;
+
+  auto bytes = SerializeUpdatePackage(pkg);
+  // Must fail safely by returning empty buffer rather than silently truncating
+  MT_CHECK(bytes.empty());
+}
+
 MT_MAIN()

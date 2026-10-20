@@ -38,7 +38,10 @@ bool CheckRemoteDebugger() {
   }
   return false;
 #else
-  return CheckDebuggerPresent();
+  // Linux does not have a distinct remote debugger API analogous to Win32;
+  // local/remote debugging is surfaced through TracerPid in CheckDebuggerPresent().
+  // Returning false avoids double-counting a single TracerPid signal.
+  return false;
 #endif
 }
 

@@ -1,4 +1,5 @@
 #include "bytecode_vm/builder.h"
+#include "bytecode_vm/serialize.h"
 #include "bytecode_vm/vm.h"
 
 #include "tests/micro_test.h"
@@ -565,6 +566,32 @@ MT_TEST(Vm_Div_ByZero_StillReportsDivisionByZeroNotOverflow) {
   auto program = TwoArgBinaryOpProgram(&ProgramBuilder::Div);
   auto r = Run(program, {10, 0});
   MT_CHECK(r.error == VmError::kDivisionByZero);
+}
+
+MT_TEST(Vm_Deserialize_MalformedInput_HandledSafely) {
+  // 1. Null data with non-zero length
+  MT_CHECK(!Deserialize(nullptr, 16).has_value());
+  MT_CHECK(!Deserialize(nullptr, 0).has_value());
+
+  // 2. Truncated buffer (< 5 bytes)
+  std::uint8_t short_buf[4] = {0, 0, 0, 0};
+  MT_CHECK(!Deserialize(short_buf, sizeof(short_buf)).has_value());
+
+  // 3. Claimed code length exceeds buffer
+  std::uint8_t bad_len[5] = {0, 0xFF, 0xFF, 0, 0};
+  MT_CHECK(!Deserialize(bad_len, sizeof(bad_len)).has_value());
+
+  // 4. Valid serialization round-trips cleanly
+  auto p = TrivialReturn(12345);
+  auto serialized = Serialize(p);
+  auto deserialized = Deserialize(serialized.data(), serialized.size());
+  MT_CHECK(deserialized.has_value());
+  MT_CHECK(deserialized->constants.size() == 1);
+  MT_CHECK(deserialized->constants[0] == 12345);
+
+  // 5. Trailing garbage is rejected
+  serialized.push_back(0x99);
+  MT_CHECK(!Deserialize(serialized.data(), serialized.size()).has_value());
 }
 
 MT_MAIN()

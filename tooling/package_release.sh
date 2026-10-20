@@ -38,11 +38,25 @@ PKG_NAME="rtprotect-${VERSION}-linux-x86_64"
 PKG_DIR="dist/${PKG_NAME}"
 rm -rf "dist/${PKG_NAME}"
 mkdir -p "$PKG_DIR/bin"
+mkdir -p "$PKG_DIR/include"
+mkdir -p "$PKG_DIR/lib"
 
 cp "$BUILD_DIR/tooling/rtprotect-tool" "$PKG_DIR/bin/"
 if [ -f "$BUILD_DIR/bench/rtprotect-bench" ]; then
   cp "$BUILD_DIR/bench/rtprotect-bench" "$PKG_DIR/bin/"
 fi
+
+# Copy SDK headers
+for dir in antitamper bytecode_vm crypto integrity licensing obfuscation tooling; do
+  if [ -d "$dir" ]; then
+    mkdir -p "$PKG_DIR/include/$dir"
+    cp "$dir"/*.h "$PKG_DIR/include/$dir/" 2>/dev/null || true
+  fi
+done
+
+# Copy static libraries
+find "$BUILD_DIR" -maxdepth 3 -name "librtprotect_*.a" -exec cp {} "$PKG_DIR/lib/" \; 2>/dev/null || true
+
 cp README.md "$PKG_DIR/"
 cp -r docs "$PKG_DIR/"
 
