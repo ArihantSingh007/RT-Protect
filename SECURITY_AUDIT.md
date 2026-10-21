@@ -93,12 +93,16 @@ The audit identified and resolved critical architectural vulnerabilities in sign
 | **RTP-SEC-053** | High | Confirmed | `tooling/integration_engine.cpp` (`TransformSourceFile`), `bytecode_vm/vm.cpp` | Missing `MemoryContext` in Virtualized Wrapper and Unhandled VM Execution Faults: Generated function wrappers passed `nullptr` for `MemoryContext`, causing all virtualized functions utilizing memory operations (`load8`/`store8`/`load64`/`store64`) to return 0 with `kMemoryAccessOutOfBounds`. Wrapper discarded `s_res.error`. | Virtualized algorithms utilizing memory buffers fail silently at runtime; execution faults (overflow, budget, invalid opcode) indistinguishable from valid 0 returns. | Calling virtualized routine with memory operations. | Allocated and passed `rtprotect::vm::MemoryContext s_mem_ctx(65536)` in generated wrapper; checked `s_res.error != VmError::kNone`, perturbing `s_tamper_accum` and triggering tamper response on any execution fault. | Verified in `test_integration_engine.cpp` (`TestFunctionVirtualizationExecutionRoundTrip` Case 11 & 12). |
 | **RTP-SEC-054** | Medium | Confirmed | `antitamper/anti_debug.cpp`, `risk_policy.cpp`, `tooling/integration_engine.cpp` | Thread-Spawning Overhead in Hot Paths & Idle Hardware Watchdog: Generated wrappers called `AssessEnvironmentRisk()` per invocation, creating helper threads on Windows for thread-context inspection, while the background watchdog sat idle. | Heavy performance overhead in virtualized function hot paths; watchdog thread unused outside tests. | Invoking virtualized functions in tight loops. | Implemented `AssessFastEnvironmentRisk()` (zero threads, sub-microsecond); launched background watchdog (`StartHardwareBreakpointWatchdog(500)`) at process init in runtime glue; wrappers query cached atomic flags; added Linux multi-layer debugger checks (`TracerPid`, `wchan`, `ptrace(PTRACE_TRACEME)`). | Verified in `test_antitamper.cpp` (`AntiTamper_AssessFastRisk_ExecutesWithoutThreadCreation`, `AntiTamper_Watchdog_StartsAndStopsCleanly`). |
 | **RTP-SEC-055** | High | Confirmed | `licensing/activation_service.*`, `activation_database.*`, `activation_client.*`, `activation_server_http.*`, `tooling/activation_server_main.cpp` | Missing Networked Activation Authority & Cross-Machine Virtualization Key Sequencing Gap: Relying on local-only token generation caused independent machines to generate distinct random `vm_root` values, preventing distributed binaries from executing virtualized bytecode on client devices. | Distributed protected binaries fail closed at runtime on foreign customer devices; licenses could not be remotely validated, renewed, or revoked. | Running protected binary on a secondary machine without pre-shared local cache. | Implemented full networked Activation Authority service with `/activate`, `/renew`, and `/deactivate` endpoints, ACID database persistence (`ActivationDatabase`), ephemeral HKDF transport payload encryption, multi-seat concurrency enforcement, anti-replay nonces, and native HTTP client transport (`WinHttp` + socket fallback), bridging canonical `vm_root` distribution. | Verified in `test_activation_service.cpp` (full lifecycle, concurrency limits, anti-replay, revocation detection, and live HTTP loopback network tests). |
+| **RTP-SEC-056** | High | Confirmed | `licensing/secure_storage.*`, `licensing/activation.*` | Hardware-Derived Key Confidentiality Flaw in Local Token Storage: Stored tokens were encrypted using a key derived from `GetLocalHardwareId()`, which is computable from public binary routines, allowing anyone with local read access to decrypt activation tokens offline. | Attackers copy token files from disk and decrypt them offline to recover `vm_root` or forge tokens. | Reading local token file off disk and deriving key via public hardware info. | Handed local token storage to OS credential vaults (`SecureStorage`): Windows DPAPI (`CryptProtectData`/`CryptUnprotectData` via `crypt32`) binding to user logon credentials, macOS Keychain, and Linux `libsecret` with headless AEAD fallback; added container encapsulation (`RTSS`) and backward compatibility migration. | Verified in `test_activation.cpp` (`SecureStorage_StoreAndLoadRoundTrip`, `SecureStorage_TamperedDataRejection`, `SecureStorage_LegacyAeadFileMigration`). |
+| **RTP-SEC-057** | High | Confirmed | `licensing/trusted_time.*`, `licensing/activation_client.cpp` | Local Clock Rollback Vulnerability: Token expiration could be bypassed by resetting local system calendar backwards, because expiration checks relied solely on unanchored OS system wall clock. | Users roll back machine date/time to freeze license expiration and continue running expired software indefinitely. | Changing OS system clock to a prior date. | Implemented `TrustedTime` engine: anchors verified server timestamps during online token activation/renewal into secure storage; enforces monotonic steady clock progression against wall clock; detects backward clock manipulation across application runs ($$\text{current\_time} + 300\text{s} < \text{last\_known\_server\_time}$$); supports RFC 7231 Date parsing. | Verified in `test_trusted_time.cpp`. |
+| **RTP-SEC-058** | Medium | Confirmed | `antitamper/anti_debug.cpp` | Linux Anti-Tamper & Memory Hooking Gap: `CheckMemoryTampered()` was Windows-only (returning `false` on Linux); Linux anti-debugging only checked `TracerPid`. | Attackers on Linux/Steam Deck use `LD_PRELOAD`, Frida, Substrate, or code caves to detour protection routines undetected. | Injecting shared libraries or hooking functions via `LD_PRELOAD` on Linux. | Added Linux `/proc/self/maps` scanning detecting injected hooking libraries (`frida`, `substrate`, etc.) and rogue read-write-executable (`rwx`) memory allocations; detected `LD_PRELOAD` environment injection; expanded `/proc/self/status` parsing for `State: T` (stopped/traced). | Verified in `test_antitamper.cpp`. |
+| **RTP-SEC-059** | Medium | Confirmed | `fuzz/fuzz_source_scanner.cpp`, `fuzz/CMakeLists.txt`, `fuzz/README.md` | Unfuzzed Source Parser Attack Surface: Lexical scanner in `TransformSourceFile` handled user-provided source files without fuzzing coverage against malformed strings, unmatched braces, or pathological preprocessor inputs. | Malformed or adversarial source code could cause buffer overflows, crashes, or parser desynchronization during build integration. | Supplying syntactically adversarial C++ code to integration scanner. | Implemented libFuzzer harness `fuzz_source_scanner` exercising `TransformSourceFile` with arbitrary byte streams. | Verified via fuzz harness definition and build configuration. |
 
 ---
 
 ## 3. Verification & Quality Assurance Summary
 
-The entire suite of 20 automated unit, component, and integration tests passes with 100% success rate on Windows x64:
+The entire suite of 21 automated unit, component, and integration tests passes with 100% success rate on Windows x64:
 
 ```
 Test project C:/Users/Arihant Singh/Downloads/rtprotect_hardening_WIP/build
@@ -110,20 +114,21 @@ Test project C:/Users/Arihant Singh/Downloads/rtprotect_hardening_WIP/build
       Start  6: test_signing .....................   Passed    0.03 sec
       Start  7: test_bound_key ...................   Passed    0.02 sec
       Start  8: test_file_io .....................   Passed    0.02 sec
-      Start  9: test_checked_arith_fallback ......   Passed    0.14 sec
-      Start 10: test_secure_buffer ...............   Passed    0.02 sec
+      Start  9: test_checked_arith_fallback ......   Passed    0.19 sec
+      Start 10: test_secure_buffer ...............   Passed    0.03 sec
       Start 11: test_obfuscated_string ...........   Passed    0.02 sec
       Start 12: test_checksum_flattened ..........   Passed    0.03 sec
-      Start 13: test_license .....................   Passed    0.03 sec
-      Start 14: test_activation ..................   Passed    0.03 sec
+      Start 13: test_license .....................   Passed    0.13 sec
+      Start 14: test_activation ..................   Passed    0.27 sec
       Start 15: test_activation_service ..........   Passed    0.18 sec
-      Start 16: test_hardware_id .................   Passed    0.02 sec
-      Start 17: test_update_manifest .............   Passed    0.04 sec
-      Start 18: test_antitamper ..................   Passed    0.02 sec
-      Start 19: test_opcode_map ..................   Passed    0.02 sec
-      Start 20: test_integration_engine ..........   Passed    2.84 sec
+      Start 16: test_trusted_time ................   Passed    0.15 sec
+      Start 17: test_hardware_id .................   Passed    0.10 sec
+      Start 18: test_update_manifest .............   Passed    0.08 sec
+      Start 19: test_antitamper ..................   Passed    0.03 sec
+      Start 20: test_opcode_map ..................   Passed    0.04 sec
+      Start 21: test_integration_engine ..........   Passed    3.79 sec
 
-100% tests passed, 0 tests failed out of 20
+100% tests passed, 0 tests failed out of 21
 ```
 
 Packaging execution via `tooling/package_release.ps1` verifies all targets, strips release executables, and produces a complete distribution archive:

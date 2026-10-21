@@ -107,6 +107,18 @@ If an attacker rolls back their OS clock to prevent license expiration, verifica
 ### 4.3 Offline Grace Periods
 For mission-critical enterprise software, licenses can specify a `grace_period_seconds` (e.g. 7 days). If `current_time > expires_at` but within `expires_at + grace_period_seconds`, the application can emit renewal warnings while remaining operational.
 
+### 4.4 Online/Offline Posture & Trusted Time Architecture
+RTProtect operates under a hybrid online/offline model:
+1. **14-Day Online Revalidation Leases:** Upon `/activate` or `/renew`, the vendor activation server issues an installation-bound `ActivationToken` containing the authorized `vm_root`, valid for 14 days (`expires_at = now + 14d`).
+2. **3-Day Offline Grace Window:** If an endpoint is offline (e.g. travelling, field work, network outage), the client continues running for up to 3 days after token expiration (`grace_expires_at = expires_at + 3d`) while warning the user to reconnect.
+3. **Monotonic Server Timestamp Anchoring:** When communicating with the activation authority, the client anchors its local clock state with the server's signed timestamp:
+   - If local system clock is modified to be earlier than the server-anchored timestamp ($$\text{current\_time} + 300\text{s} < \text{last\_known\_server\_time}$$), clock tampering is flagged immediately (`TimeValidationResult::kClockTampered`).
+   - If system wall clock jumps backwards relative to process monotonic runtime (`std::chrono::steady_clock`), tampering is detected.
+4. **OS Secure Storage Vault:** Tokens and time state are persisted using platform-native credential security:
+   - **Windows:** DPAPI (`CryptProtectData` / `CryptUnprotectData`), binding credentials to the Windows user account and login session.
+   - **macOS:** Apple Keychain Services (`SecItemAdd` / `SecItemCopyMatching`).
+   - **Linux:** `libsecret` (GNOME Keyring / KWallet D-Bus backend), with graceful fallback to hardware-bound AES-256-GCM on headless server environments.
+
 ---
 
 ## 5. Server-Side Key Management & CLI Workflows

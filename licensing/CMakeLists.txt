@@ -5,11 +5,15 @@ add_library(rtprotect_licensing STATIC
     update_manifest.cpp
     activation.cpp
     activation_client.cpp
+    secure_storage.cpp
+    trusted_time.cpp
 )
 target_include_directories(rtprotect_licensing PUBLIC ${CMAKE_SOURCE_DIR})
 target_link_libraries(rtprotect_licensing PUBLIC rtprotect_integrity rtprotect_crypto OpenSSL::Crypto)
 if(WIN32)
-    target_link_libraries(rtprotect_licensing PUBLIC winhttp ws2_32)
+    target_link_libraries(rtprotect_licensing PUBLIC winhttp ws2_32 crypt32)
+else()
+    target_link_libraries(rtprotect_licensing PUBLIC ${CMAKE_DL_LIBS})
 endif()
 
 add_library(rtprotect_licensing_buildtools STATIC

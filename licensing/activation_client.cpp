@@ -15,6 +15,7 @@
 #include "crypto/aead.h"
 #include "crypto/kdf.h"
 #include "licensing/hardware_id.h"
+#include "licensing/trusted_time.h"
 
 #if defined(_WIN32)
 #include <winsock2.h>
@@ -409,6 +410,9 @@ std::optional<ActivationToken> RequestOnlineActivation(
     return std::nullopt;
   }
 
+  // Anchor verified server timestamp for monotonic trusted time enforcement
+  TrustedTime::AnchorServerTime(product_id, token.issued_at);
+
   return token;
 }
 
@@ -494,6 +498,9 @@ std::optional<ActivationToken> RequestOnlineRenewal(
     if (error_out) *error_out = "Vendor Ed25519 signature on renewed activation token failed verification";
     return std::nullopt;
   }
+
+  // Anchor renewed server timestamp for monotonic trusted time enforcement
+  TrustedTime::AnchorServerTime(renewed.license_id, renewed.issued_at);
 
   return renewed;
 }

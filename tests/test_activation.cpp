@@ -2,8 +2,11 @@
 
 #include "licensing/activation.h"
 #include "licensing/activation_server.h"
+#include "licensing/secure_storage.h"
+#include "licensing/hardware_id.h"
 #include "integrity/keys.h"
 #include "crypto/aead.h"
+#include "crypto/kdf.h"
 #include "tooling/file_io.h"
 #include "tests/micro_test.h"
 #include <filesystem>
@@ -326,7 +329,7 @@ MT_TEST(ActivationToken_LoadOrCreateDevToken_PersistsAndEncrypts) {
   MT_CHECK(LoadOrCreateDevToken(test_prod, test_lic, &tok1));
   MT_CHECK(std::filesystem::exists(token_path));
 
-  // Verify file is encrypted at rest via AEAD and not plaintext
+  // Verify file is encrypted at rest via SecureStorage (DPAPI on Windows, container format) and not plaintext
   auto file_bytes = rtprotect::tooling::ReadFile(token_path);
   MT_CHECK(file_bytes.has_value());
 
@@ -335,9 +338,10 @@ MT_TEST(ActivationToken_LoadOrCreateDevToken_PersistsAndEncrypts) {
   MT_CHECK(raw_content.find(test_lic) == std::string::npos);
   MT_CHECK(raw_content.find(test_prod) == std::string::npos);
 
-  // Confirm deserializable as AEAD encrypted message
-  auto enc_msg = rtprotect::crypto::EncryptedMessage::Deserialize(file_bytes->data(), file_bytes->size());
-  MT_CHECK(enc_msg.has_value());
+  // Confirm container header is RTSS
+  MT_CHECK(file_bytes->size() >= 12);
+  MT_CHECK((*file_bytes)[0] == 'R' && (*file_bytes)[1] == 'T' &&
+           (*file_bytes)[2] == 'S' && (*file_bytes)[3] == 'S');
 
   // Loading second time must succeed and retrieve identical vm_root
   ActivationToken tok2;
@@ -384,6 +388,91 @@ MT_TEST(ActivationServer_ActivateAndRenew_Stubs) {
   MT_CHECK(renewed.vm_root == token.vm_root);
   MT_CHECK(renewed.license_id == token.license_id);
   MT_CHECK(renewed.expires_at >= token.expires_at);
+}
+
+MT_TEST(SecureStorage_StoreAndLoadRoundTrip) {
+  std::string key = "test_ss_roundtrip_key";
+  SecureStorage::Delete(key);
+
+  std::vector<std::uint8_t> secret_data = {'S', 'e', 'c', 'u', 'r', 'e', 'P', 'a', 'y', 'l', 'o', 'a', 'd', 0x00, 0xFF, 0x42};
+  MT_CHECK(SecureStorage::Store(key, secret_data, "test_description"));
+
+  std::string file_path = SecureStorage::GetStorageFilePath(key);
+  MT_CHECK(std::filesystem::exists(file_path));
+
+  auto loaded = SecureStorage::Load(key);
+  MT_CHECK(loaded.has_value());
+  MT_CHECK(*loaded == secret_data);
+
+#if defined(_WIN32)
+  MT_CHECK(SecureStorage::GetActiveBackend() == SecureStorageBackend::kWindowsDpapi);
+#endif
+
+  MT_CHECK(SecureStorage::Delete(key));
+  MT_CHECK(!SecureStorage::Load(key).has_value());
+}
+
+MT_TEST(SecureStorage_TamperedDataRejection) {
+  std::string key = "test_ss_tamper_key";
+  SecureStorage::Delete(key);
+
+  std::vector<std::uint8_t> secret_data = {1, 2, 3, 4, 5, 6, 7, 8, 9, 10};
+  MT_CHECK(SecureStorage::Store(key, secret_data));
+
+  std::string file_path = SecureStorage::GetStorageFilePath(key);
+  auto raw = rtprotect::tooling::ReadFile(file_path);
+  MT_CHECK(raw.has_value());
+
+  if (raw->size() > 15) {
+    (*raw)[14] ^= 0x55;
+    (*raw)[raw->size() - 1] ^= 0xAA;
+    MT_CHECK(rtprotect::tooling::WriteFile(file_path, raw->data(), raw->size()));
+
+    auto tampered = SecureStorage::Load(key);
+    MT_CHECK(!tampered.has_value());
+  }
+
+  SecureStorage::Delete(key);
+}
+
+MT_TEST(SecureStorage_LegacyAeadFileMigration) {
+  std::string prod = "test_legacy_migration_prod";
+  std::string lic = "lic-legacy-001";
+  std::string file_path = GetActivationTokenPath(prod);
+
+  std::error_code ec;
+  std::filesystem::remove(file_path, ec);
+
+  ActivationToken legacy_tok;
+  legacy_tok.license_id = lic;
+  legacy_tok.device_fingerprint_hash = GetLocalHardwareId();
+  legacy_tok.sequence_number = 42;
+  legacy_tok.vm_root.fill(0x33);
+
+  auto serialized = SerializeActivationToken(legacy_tok);
+  MT_CHECK(!serialized.empty());
+
+  std::string hwid = GetLocalHardwareId();
+  rtprotect::crypto::SecureBuffer sec_hwid(reinterpret_cast<const std::uint8_t*>(hwid.data()), hwid.size());
+  std::vector<std::uint8_t> salt = {'R', 'T', 'P', 'r', 'o', 't', 'e', 'c', 't', 'A', 'c', 't', 'i', 'v', 'a', 't', 'i', 'o', 'n', 'K', 'e', 'y'};
+  auto derived = rtprotect::crypto::Hkdf::DeriveKey(sec_hwid, salt, "rtprotect/activation-token-store/v1", rtprotect::crypto::kAes256KeyLen);
+  MT_CHECK(derived.has_value());
+  auto enc_key = rtprotect::crypto::Aes256Key::FromBytes(derived->data(), derived->size());
+  MT_CHECK(enc_key.has_value());
+
+  auto encrypted = rtprotect::crypto::Encrypt(*enc_key, serialized.data(), serialized.size());
+  MT_CHECK(encrypted.has_value());
+  auto legacy_bytes = encrypted->Serialize();
+
+  MT_CHECK(rtprotect::tooling::WriteFile(file_path, legacy_bytes.data(), legacy_bytes.size()));
+
+  auto migrated_tok = LoadActivationToken(prod);
+  MT_CHECK(migrated_tok.has_value());
+  MT_CHECK(migrated_tok->license_id == lic);
+  MT_CHECK(migrated_tok->sequence_number == 42);
+  MT_CHECK(migrated_tok->vm_root == legacy_tok.vm_root);
+
+  std::filesystem::remove(file_path, ec);
 }
 
 MT_MAIN()

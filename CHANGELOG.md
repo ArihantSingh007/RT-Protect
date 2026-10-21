@@ -60,6 +60,25 @@ This project adheres to Semantic Versioning and structured security reporting.
   - *Remediation:* Replaced local in-memory placeholders with a full networked Activation Authority service. Features `/activate`, `/renew`, and `/deactivate` endpoints, ACID database persistence (`ActivationDatabase`), ephemeral HKDF-derived transport encryption, multi-seat concurrency tracking, anti-replay nonce retirement, and client-side HTTP/HTTPS transport (`WinHttp` with socket fallback). Solves the cross-machine `vm_root` sequencing gap: build tools register the canonical `vm_root` with the authority; client devices activate online to receive their hardware-bound signed `ActivationToken` containing the identical `vm_root`, enabling seamless VM execution on distributed customer machines.
   - *Verification:* Verified in `test_activation_service.cpp` (6 test suites covering database persistence, seat enforcement, anti-replay, renewal, and HTTP loopback network communication).
 
+- **Track D.5 — OS Secure Storage Architecture (Windows DPAPI, macOS Keychain, Linux libsecret) (RTP-SEC-056):**
+  - *Location:* `licensing/secure_storage.*`, `licensing/activation.*`
+  - *Remediation:* Replaced raw hardware-derived file encryption with platform-native OS secure storage (`SecureStorage`). On Windows, utilizes DPAPI (`CryptProtectData`/`CryptUnprotectData` via `crypt32`), cryptographically tying stored credentials and tokens to the user's logon session and Windows user account master key. On macOS, integrates with Keychain Services. On Linux, integrates with `libsecret` (GNOME Keyring/KWallet) via dynamic binding with graceful fallback to hardware-bound AEAD on headless servers. Added transparent migration support for legacy tokens and container encapsulation (`RTSS` header).
+  - *Verification:* Verified in `test_activation.cpp` (`SecureStorage_StoreAndLoadRoundTrip`, `SecureStorage_TamperedDataRejection`, `SecureStorage_LegacyAeadFileMigration`, `ActivationToken_LoadOrCreateDevToken_PersistsAndEncrypts`).
+
+- **Track D.6 — Trusted Time Engine & Anti-Clock-Tampering (RTP-SEC-057):**
+  - *Location:* `licensing/trusted_time.*`, `licensing/activation_client.cpp`
+  - *Remediation:* Implemented `TrustedTime` system anchoring verified server timestamps from `/activate` and `/renew` online leases into secure storage. Defends against clock rollback attacks across application executions ($$\text{current\_time} + 300\text{s} < \text{last\_known\_server\_time}$$) and detects in-process clock jumps against monotonic clocks (`std::chrono::steady_clock`). Provides RFC 7231 HTTP Date parsing and grace period verification.
+  - *Verification:* Verified in `test_trusted_time.cpp` (4 test suites covering HTTP date parsing, server anchoring, clock rollback detection, and grace period evaluation).
+
+- **Track E.4 — Linux Anti-Tamper & Memory Integrity Parity (RTP-SEC-058):**
+  - *Location:* `antitamper/anti_debug.cpp`
+  - *Remediation:* Extended Linux anti-tampering defenses to parity with Windows. In `CheckMemoryTampered()`, added `/proc/self/maps` scanning detecting injected hooking frameworks (`frida`, `substrate`, `substitute`, `cycript`), abnormal read-write-executable (`rwx`) memory segments indicative of hook code caves, and active `LD_PRELOAD` environment variable injection. Extended `CheckDebuggerPresent()` to parse `/proc/self/status` `State:` field for `T` (stopped) and `t` (tracing stop).
+  - *Verification:* Verified in `test_antitamper.cpp`.
+
+- **Track G.1 — Source Scanner Fuzz Harness (RTP-SEC-059):**
+  - *Location:* `fuzz/fuzz_source_scanner.cpp`, `fuzz/CMakeLists.txt`, `fuzz/README.md`
+  - *Remediation:* Created libFuzzer harness targeting `rtprotect::tooling::TransformSourceFile` with arbitrary adversarial input streams to ensure lexical boundaries, raw strings, comments, and preprocessor syntax never trigger buffer overflows, unhandled exceptions, or out-of-bounds reads.
+
 - **Track D.4 — Virtualized Memory Context Allocation & Fault Propagation (RTP-SEC-053):**
   - *Location:* `tooling/integration_engine.cpp`, `bytecode_vm/vm.cpp`
   - *Remediation:* Allocated and passed `rtprotect::vm::MemoryContext s_mem_ctx(65536)` in the generated wrapper, enabling bounds-checked memory operations (`load8`, `store8`, `load64`, `store64`). Added explicit error checking on `s_res.error != VmError::kNone`, perturbing `s_tamper_accum` and triggering tamper response on any execution fault.
