@@ -116,4 +116,9 @@ MT_TEST(AntiTamper_Watchdog_StartsAndStopsCleanly) {
   MT_CHECK(true);
 }
 
+MT_TEST(AntiTamper_AssessFastRisk_ExecutesWithoutThreadCreation) {
+  RiskAssessment r = AssessFastEnvironmentRisk();
+  MT_CHECK(r.risk_score >= 0 && r.risk_score <= 100);
+}
+
 MT_MAIN()

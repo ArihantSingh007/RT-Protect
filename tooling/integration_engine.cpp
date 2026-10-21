@@ -256,7 +256,7 @@ std::string FormatByteArrayLiteral(const std::uint8_t* data, std::size_t len) {
 }  // namespace
 
 std::optional<crypto::Aes256Key> DeriveBuildFunctionMasterKey(
-    const std::array<std::uint8_t, 32>& build_auth_seed,
+    const std::array<std::uint8_t, 32>& manifest_vm_root,
     const integrity::Ed25519PublicKey& manifest_pubkey,
     const std::string& product_id,
     const std::uint8_t* salt,
@@ -266,7 +266,7 @@ std::optional<crypto::Aes256Key> DeriveBuildFunctionMasterKey(
     hkdf_salt.insert(hkdf_salt.end(), salt, salt + salt_len);
   }
   std::string info = std::string("rtprotect/virtualize/") + product_id;
-  crypto::SecureBuffer sec_seed(build_auth_seed.data(), build_auth_seed.size());
+  crypto::SecureBuffer sec_seed(manifest_vm_root.data(), manifest_vm_root.size());
   auto derived = crypto::Hkdf::DeriveKey(sec_seed, hkdf_salt, info, crypto::kAes256KeyLen);
   if (!derived.has_value()) return std::nullopt;
   return crypto::Aes256Key::FromBytes(derived->data(), derived->size());
@@ -275,7 +275,7 @@ std::optional<crypto::Aes256Key> DeriveBuildFunctionMasterKey(
 bool TransformSourceFile(const fs::path& file_path,
                          const ProtectionProfile profile,
                          const std::uint32_t opcode_seed,
-                         const std::array<std::uint8_t, 32>& build_auth_seed,
+                         const std::array<std::uint8_t, 32>& manifest_vm_root,
                          const integrity::Ed25519PublicKey& manifest_pubkey,
                          const std::string& product_id,
                          std::vector<std::string>& out_virtualized,
@@ -401,7 +401,7 @@ bool TransformSourceFile(const fs::path& file_path,
           for (std::size_t k = 0; k < fn_salt.size(); ++k) fn_salt[k] = static_cast<std::uint8_t>(k ^ 0x33);
         }
 
-        auto master_key = DeriveBuildFunctionMasterKey(build_auth_seed, manifest_pubkey, product_id, fn_salt.data(), fn_salt.size());
+        auto master_key = DeriveBuildFunctionMasterKey(manifest_vm_root, manifest_pubkey, product_id, fn_salt.data(), fn_salt.size());
         if (!master_key.has_value()) {
           tag_pos = brace_close + 1;
           continue;
@@ -430,7 +430,7 @@ bool TransformSourceFile(const fs::path& file_path,
                << FormatByteArrayLiteral(fn_salt.data(), fn_salt.size()) << "\n    };\n";
         rep_ss << "    static std::uint64_t s_tamper_accum = 0;\n";
         rep_ss << "    rtprotect::antitamper::ScatterTamperCheck(\"" << fn_name << "_entry\", &s_tamper_accum);\n";
-        rep_ss << "    auto s_risk = rtprotect::antitamper::AssessEnvironmentRisk();\n";
+        rep_ss << "    auto s_risk = rtprotect::antitamper::AssessFastEnvironmentRisk();\n";
         rep_ss << "    if (s_tamper_accum != 0) s_risk.risk_score = 100;\n";
         rep_ss << "    auto s_fn_key = rtprotect_client::GetFunctionMasterKey(s_fn_salt, sizeof(s_fn_salt));\n";
         rep_ss << "    if (!s_fn_key.has_value()) return 0;\n";
@@ -449,7 +449,13 @@ bool TransformSourceFile(const fs::path& file_path,
           rep_ss << "static_cast<std::int64_t>(" << arg_names[k] << ")";
         }
         rep_ss << "};\n";
-        rep_ss << "    auto s_res = rtprotect::vm::Run(*s_prog, s_args, &rtprotect_client::GetBuildOpcodeMap());\n";
+        rep_ss << "    rtprotect::vm::MemoryContext s_mem_ctx(65536);\n";
+        rep_ss << "    auto s_res = rtprotect::vm::Run(*s_prog, s_args, &rtprotect_client::GetBuildOpcodeMap(), &s_mem_ctx);\n";
+        rep_ss << "    if (s_res.error != rtprotect::vm::VmError::kNone) {\n";
+        rep_ss << "        s_tamper_accum ^= (0xDEADBEEF00000000ULL | static_cast<std::uint64_t>(s_res.error));\n";
+        rep_ss << "        rtprotect::antitamper::ScatterTamperCheck(\"" << fn_name << "_fault\", &s_tamper_accum);\n";
+        rep_ss << "        return 0;\n";
+        rep_ss << "    }\n";
         rep_ss << "    return s_res.value;\n";
         rep_ss << "}";
 
@@ -967,25 +973,12 @@ IntegrationReport ExecuteIntegration(const IntegrationOptions& options) {
   }
   report.opcode_seed = opcode_seed;
 
-  std::array<std::uint8_t, 32> build_auth_seed{};
-  if (RAND_bytes(build_auth_seed.data(), static_cast<int>(build_auth_seed.size())) != 1) {
-    for (std::size_t i = 0; i < build_auth_seed.size(); ++i) {
-      build_auth_seed[i] = static_cast<std::uint8_t>((i * 7 + 0x3C) & 0xFF);
+  std::array<std::uint8_t, 32> manifest_vm_root{};
+  if (RAND_bytes(manifest_vm_root.data(), static_cast<int>(manifest_vm_root.size())) != 1) {
+    for (std::size_t i = 0; i < manifest_vm_root.size(); ++i) {
+      manifest_vm_root[i] = static_cast<std::uint8_t>((i * 7 + 0x3C) & 0xFF);
     }
   }
-
-  std::uint64_t raw_w[4];
-  std::memcpy(raw_w, build_auth_seed.data(), 32);
-
-  std::uint64_t mask[4];
-  if (RAND_bytes(reinterpret_cast<unsigned char*>(mask), sizeof(mask)) != 1) {
-    mask[0] = 0xA5A5A5A5A5A5A5A5ULL;
-    mask[1] = 0x5A5A5A5A5A5A5A5AULL;
-    mask[2] = 0xF0F0F0F0F0F0F0F0ULL;
-    mask[3] = 0x0F0F0F0F0F0F0F0FULL;
-  }
-  std::uint64_t shard[4];
-  for (int i = 0; i < 4; ++i) shard[i] = raw_w[i] ^ mask[i];
 
   fs::path config_header_path = proj_path / "rtprotect_config.h";
   {
@@ -1014,15 +1007,6 @@ IntegrationReport ExecuteIntegration(const IntegrationOptions& options) {
     ss << "// Per-build randomized opcode map seed (Phase 3 bytecode VM hardening)\n";
     ss << "inline constexpr std::uint32_t kBuildOpcodeSeed = " << seed_buf << ";\n\n";
 
-    for (int i = 0; i < 4; ++i) {
-      char sbuf[32], mbuf[32];
-      std::snprintf(sbuf, sizeof(sbuf), "0x%016llXULL", static_cast<unsigned long long>(shard[i]));
-      std::snprintf(mbuf, sizeof(mbuf), "0x%016llXULL", static_cast<unsigned long long>(mask[i]));
-      ss << "inline constexpr std::uint64_t kAuthShard" << i << " = " << sbuf << ";\n";
-      ss << "inline constexpr std::uint64_t kAuthMask" << i << " = " << mbuf << ";\n";
-    }
-    ss << "\n";
-
     auto dump_key = [&](const char* name, const integrity::Ed25519PublicKey& k) {
       ss << "// Embedded " << name << " Verification Key\n";
       ss << "inline constexpr std::array<std::uint8_t, 32> " << name << " = {\n  ";
@@ -1040,30 +1024,13 @@ IntegrationReport ExecuteIntegration(const IntegrationOptions& options) {
     dump_key("kLicensePublicKey", license_pubkey);
     dump_key("kPublicKey", manifest_pubkey);
 
-    ss << "inline std::optional<rtprotect::crypto::Aes256Key> GetFunctionMasterKey(const std::uint8_t* salt, std::size_t salt_len) {\n";
-    ss << "  rtprotect::crypto::SecureBuffer raw_seed(32);\n";
-    ss << "  std::uint64_t w0 = kAuthShard0 ^ kAuthMask0;\n";
-    ss << "  std::uint64_t w1 = kAuthShard1 ^ kAuthMask1;\n";
-    ss << "  std::uint64_t w2 = kAuthShard2 ^ kAuthMask2;\n";
-    ss << "  std::uint64_t w3 = kAuthShard3 ^ kAuthMask3;\n";
-    ss << "  std::memcpy(raw_seed.data(), &w0, 8);\n";
-    ss << "  std::memcpy(raw_seed.data() + 8, &w1, 8);\n";
-    ss << "  std::memcpy(raw_seed.data() + 16, &w2, 8);\n";
-    ss << "  std::memcpy(raw_seed.data() + 24, &w3, 8);\n";
-    ss << "  std::vector<std::uint8_t> hkdf_salt(kManifestPublicKey.begin(), kManifestPublicKey.end());\n";
-    ss << "  if (salt && salt_len > 0) {\n";
-    ss << "    hkdf_salt.insert(hkdf_salt.end(), salt, salt + salt_len);\n";
-    ss << "  }\n";
-    ss << "  std::string info = std::string(\"rtprotect/virtualize/\") + kProductId;\n";
-    ss << "  auto derived = rtprotect::crypto::Hkdf::DeriveKey(raw_seed, hkdf_salt, info, rtprotect::crypto::kAes256KeyLen);\n";
-    ss << "  if (!derived.has_value()) return std::nullopt;\n";
-    ss << "  return rtprotect::crypto::Aes256Key::FromBytes(derived->data(), derived->size());\n";
-    ss << "}\n\n";
-
     ss << "bool VerifyClientIntegrityAndLicense();\n";
     ss << "std::string GetLicenseEdition();\n";
     ss << "std::uint64_t GetLicenseCapabilities();\n";
-    ss << "bool HasCapability(std::uint64_t cap);\n\n";
+    ss << "bool HasCapability(std::uint64_t cap);\n";
+    ss << "void SetRuntimeManifestRoot(const std::uint8_t* root_hash, std::size_t len);\n";
+    ss << "std::optional<rtprotect::crypto::Aes256Key> GetFunctionMasterKey(const std::uint8_t* salt, std::size_t salt_len);\n\n";
+
     ss << "}  // namespace rtprotect_client\n\n";
 
     ss << "#include \"bytecode_vm/opcode_map.h\"\n";
@@ -1098,6 +1065,7 @@ IntegrationReport ExecuteIntegration(const IntegrationOptions& options) {
     ss << "#include \"integrity/verifier.h\"\n";
     ss << "#include \"integrity/sha256.h\"\n";
     ss << "#include \"antitamper/risk_policy.h\"\n";
+    ss << "#include \"antitamper/anti_debug.h\"\n";
     ss << "#include \"tooling/file_io.h\"\n\n";
     ss << "#include <ctime>\n";
     ss << "#include <cstdio>\n";
@@ -1118,7 +1086,30 @@ IntegrationReport ExecuteIntegration(const IntegrationOptions& options) {
 
     ss << "namespace rtprotect_client {\n\n";
     ss << "static bool s_license_validated = false;\n";
-    ss << "static rtprotect::licensing::License s_validated_license{};\n\n";
+    ss << "static rtprotect::licensing::License s_validated_license{};\n";
+    ss << "static std::array<std::uint8_t, 32> s_runtime_manifest_vm_root{};\n";
+    ss << "static bool s_runtime_root_initialized = false;\n\n";
+
+    ss << "void SetRuntimeManifestRoot(const std::uint8_t* root_hash, std::size_t len) {\n";
+    ss << "  if (root_hash && len == 32) {\n";
+    ss << "    std::memcpy(s_runtime_manifest_vm_root.data(), root_hash, 32);\n";
+    ss << "    s_runtime_root_initialized = true;\n";
+    ss << "  }\n";
+    ss << "}\n\n";
+
+    ss << "std::optional<rtprotect::crypto::Aes256Key> GetFunctionMasterKey(const std::uint8_t* salt, std::size_t salt_len) {\n";
+    ss << "  if (!s_runtime_root_initialized) return std::nullopt;\n";
+    ss << "  rtprotect::crypto::SecureBuffer raw_seed(32);\n";
+    ss << "  std::memcpy(raw_seed.data(), s_runtime_manifest_vm_root.data(), 32);\n";
+    ss << "  std::vector<std::uint8_t> hkdf_salt(kManifestPublicKey.begin(), kManifestPublicKey.end());\n";
+    ss << "  if (salt && salt_len > 0) {\n";
+    ss << "    hkdf_salt.insert(hkdf_salt.end(), salt, salt + salt_len);\n";
+    ss << "  }\n";
+    ss << "  std::string info = std::string(\"rtprotect/virtualize/\") + kProductId;\n";
+    ss << "  auto derived = rtprotect::crypto::Hkdf::DeriveKey(raw_seed, hkdf_salt, info, rtprotect::crypto::kAes256KeyLen);\n";
+    ss << "  if (!derived.has_value()) return std::nullopt;\n";
+    ss << "  return rtprotect::crypto::Aes256Key::FromBytes(derived->data(), derived->size());\n";
+    ss << "}\n\n";
 
     ss << "namespace {\n\n";
     ss << "std::string GetCurrentExecutablePath() {\n";
@@ -1169,7 +1160,8 @@ IntegrationReport ExecuteIntegration(const IntegrationOptions& options) {
     ss << "}  // namespace\n\n";
 
     ss << "bool VerifyClientIntegrityAndLicense() {\n";
-    ss << "  // 1. Runtime environment risk assessment\n";
+    ss << "  // 1. Runtime environment risk assessment and launch watchdog\n";
+    ss << "  rtprotect::antitamper::StartHardwareBreakpointWatchdog(500);\n";
     ss << "  auto risk = rtprotect::antitamper::AssessEnvironmentRisk();\n";
     if (options.profile == ProtectionProfile::kMaximum) {
       ss << "  if (!rtprotect::antitamper::EnforceRiskPolicy(rtprotect::antitamper::RiskAction::kTerminate, risk)) return false;\n";
@@ -1186,6 +1178,7 @@ IntegrationReport ExecuteIntegration(const IntegrationOptions& options) {
     ss << "  ctx.current_time = static_cast<std::uint64_t>(std::time(nullptr));\n";
     ss << "  ctx.expected_product_id = kProductId;\n";
     ss << "  ctx.current_hardware_id = rtprotect::licensing::GetLocalHardwareId();\n";
+    ss << "  ctx.reject_degraded_hardware = true; // Reject degraded hardware state\n";
     ss << "  rtprotect::licensing::License lic;\n";
     ss << "  auto lic_status = rtprotect::licensing::VerifyLicenseBytes(lic_data->data(), lic_data->size(), kLicensePublicKey, ctx, &lic);\n";
     ss << "  if (lic_status != rtprotect::licensing::LicenseStatus::kValid) return false;\n";
@@ -1202,6 +1195,11 @@ IntegrationReport ExecuteIntegration(const IntegrationOptions& options) {
     ss << "  if (!rtprotect::integrity::VerifyManifestSignature(*man_bytes, sig, kManifestPublicKey)) return false;\n";
     ss << "  auto manifest = rtprotect::integrity::DeserializeManifest(man_bytes->data(), man_bytes->size());\n";
     ss << "  if (!manifest.has_value() || manifest->release_sequence < kMinimumReleaseSequence) return false;\n";
+
+    ss << "\n  // Extract authenticated VM root from verified signed manifest\n";
+    ss << "  auto vm_res = manifest->Find(\"rtprotect_vm_root\");\n";
+    ss << "  if (!vm_res) return false; // Mandatory virtualization root missing in signed manifest -> FAIL\n";
+    ss << "  SetRuntimeManifestRoot(vm_res->sha256.data(), 32);\n";
 
     ss << "\n  // 4. Executable integrity verification (FAIL CLOSED)\n";
     ss << "  std::string exe_path = GetCurrentExecutablePath();\n";
@@ -1262,7 +1260,7 @@ IntegrationReport ExecuteIntegration(const IntegrationOptions& options) {
   // 6b. Transform Client Sources (Function Virtualization, String Obfuscation, Anti-Tamper)
   for (const auto& src_file : plan.detected_sources) {
     if (TransformSourceFile(src_file, options.profile, opcode_seed,
-                            build_auth_seed, manifest_pubkey, options.product_id,
+                            manifest_vm_root, manifest_pubkey, options.product_id,
                             report.virtualized_functions,
                             report.obfuscated_string_count,
                             report.scattered_check_count)) {
@@ -1453,6 +1451,10 @@ IntegrationReport ExecuteIntegration(const IntegrationOptions& options) {
     manifest.release_version = options.release_version;
     manifest.release_sequence = 1;
 
+    integrity::Sha256Digest vm_root_digest{};
+    std::memcpy(vm_root_digest.data(), manifest_vm_root.data(), 32);
+    manifest.AddResourceWithHash("rtprotect_vm_root", vm_root_digest, 32);
+
     std::uint64_t cfg_size = 0;
     auto cfg_hash = integrity::Sha256File(config_header_path.string(), &cfg_size);
     if (cfg_hash.has_value()) {
@@ -1552,6 +1554,10 @@ IntegrationReport ExecuteIntegration(const IntegrationOptions& options) {
     integrity::Manifest manifest;
     manifest.release_version = options.release_version;
     manifest.release_sequence = 1;
+
+    integrity::Sha256Digest vm_root_digest{};
+    std::memcpy(vm_root_digest.data(), manifest_vm_root.data(), 32);
+    manifest.AddResourceWithHash("rtprotect_vm_root", vm_root_digest, 32);
 
     std::uint64_t cfg_size = 0;
     auto cfg_hash = integrity::Sha256File(config_header_path.string(), &cfg_size);
@@ -1815,6 +1821,7 @@ bool SignRelease(const std::string& project_dir,
 
   // Update resource hashes for build output files
   for (auto& res : manifest->resources) {
+    if (res.name == "rtprotect_vm_root") continue;
     fs::path res_path = root / res.name;
     if (!fs::exists(res_path)) {
       std::vector<fs::path> candidate_dirs = {
@@ -1990,6 +1997,7 @@ bool ValidateProtectedBuild(const std::string& project_dir,
 
   fs::path root(project_dir);
   for (const auto& res : manifest->resources) {
+    if (res.name == "rtprotect_vm_root") continue;
     fs::path res_path = root / res.name;
     if (!fs::exists(res_path)) {
       std::vector<fs::path> candidate_dirs = {

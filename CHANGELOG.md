@@ -50,10 +50,20 @@ This project adheres to Semantic Versioning and structured security reporting.
   - *Remediation:* Threaded `const OpcodeMap*` through `ProgramBuilder` and `CompileCSubset`. Added `RemapProgramOpcodes` to translate bytecode between arbitrary mappings. Fixed compiler control flow dead terminal jump emission when `then` branch terminates with `return`.
   - *Verification:* `test_opcode_map.cpp` (`OpcodeMap_RemapProgramOpcodes_TransformsAndExecutes`) and `test_integration_engine.cpp` (`TestFunctionVirtualizationExecutionRoundTrip`).
 
-- **Track D.2 — Plaintext Virtualization Master Key Elimination & Dynamic Derivation (RTP-SEC-047):**
-  - *Location:* `tooling/integration_engine.cpp`, `rtprotect_config.h`
-  - *Remediation:* Eliminated raw 32-byte `master_key` arrays (`s_master[]`) from generated C++ source and `.rodata`. Implemented compile-time XOR sharding (`kAuthShard0..3 ^ kAuthMask0..3`) in `rtprotect_config.h` and per-function HKDF key derivation via `kManifestPublicKey` and `s_fn_salt`.
-  - *Verification:* Added assertion in `test_integration_engine.cpp` ensuring `s_master` is absent from all generated client wrappers.
+- **Track D.2 — Manifest-Bound Virtualization Key Architecture (RTP-SEC-047):**
+  - *Location:* `tooling/integration_engine.cpp`, `rtprotect_config.h`, `rtprotect_runtime_glue.cpp`
+  - *Remediation:* Completely eliminated static master keys, shards (`kAuthShard`), and masks (`kAuthMask`) from `.rodata` and `rtprotect_config.h`. Implemented the Manifest-Bound Key Architecture: the 32-byte virtualization root secret (`rtprotect_vm_root`) is committed solely in `release.manifest` and authenticated by vendor Ed25519 signature `release.sig`. Keys are derived at runtime only upon signature verification.
+  - *Verification:* Verified in `test_integration_engine.cpp` (asserts absence of `kAuthShard`/`kAuthMask` in config and presence of `rtprotect_vm_root` in signed manifest).
+
+- **Track D.4 — Virtualized Memory Context Allocation & Fault Propagation (RTP-SEC-053):**
+  - *Location:* `tooling/integration_engine.cpp`, `bytecode_vm/vm.cpp`
+  - *Remediation:* Allocated and passed `rtprotect::vm::MemoryContext s_mem_ctx(65536)` in the generated wrapper, enabling bounds-checked memory operations (`load8`, `store8`, `load64`, `store64`). Added explicit error checking on `s_res.error != VmError::kNone`, perturbing `s_tamper_accum` and triggering tamper response on any execution fault.
+  - *Verification:* Verified in `test_integration_engine.cpp` (`TestFunctionVirtualizationExecutionRoundTrip` Case 11 & 12).
+
+- **Track E.3 — Zero-Thread Hot Path Assessment & Active Watchdog Integration (RTP-SEC-054):**
+  - *Location:* `antitamper/anti_debug.cpp`, `risk_policy.cpp`, `tooling/integration_engine.cpp`
+  - *Remediation:* Implemented `AssessFastEnvironmentRisk()` (zero threads, sub-microsecond); launched background watchdog (`StartHardwareBreakpointWatchdog(500)`) at process init in runtime glue; wrappers query cached atomic flags; added Linux multi-layer debugger checks (`TracerPid`, `wchan`, `ptrace(PTRACE_TRACEME)`).
+  - *Verification:* Verified in `test_antitamper.cpp` (`AntiTamper_AssessFastRisk_ExecutesWithoutThreadCreation`, `AntiTamper_Watchdog_StartsAndStopsCleanly`).
 
 - **Track E.1 — Multi-Layer Unhookable Anti-Debugging & Direct PEB/Kernel Inspection (RTP-SEC-048):**
   - *Location:* `antitamper/anti_debug.h`, `antitamper/anti_debug.cpp`

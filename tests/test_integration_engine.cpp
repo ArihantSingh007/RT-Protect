@@ -716,8 +716,24 @@ void TestFunctionVirtualization() {
   assert(transformed_main->find("s_master") == std::string::npos); // Plaintext master key eliminated!
   assert(transformed_main->find("GetFunctionMasterKey") != std::string::npos);
   assert(transformed_main->find("ScatterTamperCheck") != std::string::npos);
+  assert(transformed_main->find("AssessFastEnvironmentRisk") != std::string::npos);
   assert(transformed_main->find("DeriveTamperBoundKey") != std::string::npos);
+  assert(transformed_main->find("rtprotect::vm::MemoryContext") != std::string::npos);
   assert(transformed_main->find("rtprotect::vm::Run") != std::string::npos);
+  assert(transformed_main->find("s_res.error != rtprotect::vm::VmError::kNone") != std::string::npos);
+
+  // Assert that rtprotect_config.h contains NO plaintext shards or masks
+  auto cfg = ReadTextFile((test_dir / "rtprotect_config.h").string());
+  assert(cfg.has_value());
+  assert(cfg->find("kAuthShard") == std::string::npos);
+  assert(cfg->find("kAuthMask") == std::string::npos);
+
+  // Assert that release.manifest commits rtprotect_vm_root
+  auto man_bytes = ReadFile((test_dir / "release.manifest").string());
+  assert(man_bytes.has_value());
+  auto man = rtprotect::integrity::DeserializeManifest(man_bytes->data(), man_bytes->size());
+  assert(man.has_value());
+  assert(man->Find("rtprotect_vm_root") != nullptr);
 
   CleanDir(test_dir);
   std::printf("  PASSED: Function virtualization and tamper-bound wrapper generation verified.\n");
@@ -755,9 +771,9 @@ void TestFunctionVirtualizationExecutionRoundTrip() {
   auto serialized = rtprotect::vm::Serialize(*prog);
 
   // 5. Derive build master key and tamper-bound key
-  std::array<std::uint8_t, 32> build_auth_seed{};
-  for (std::size_t i = 0; i < build_auth_seed.size(); ++i) {
-    build_auth_seed[i] = static_cast<std::uint8_t>(i ^ 0x7E);
+  std::array<std::uint8_t, 32> manifest_vm_root{};
+  for (std::size_t i = 0; i < manifest_vm_root.size(); ++i) {
+    manifest_vm_root[i] = static_cast<std::uint8_t>(i ^ 0x7E);
   }
 
   rtprotect::integrity::Ed25519PublicKey manifest_pubkey{};
@@ -769,7 +785,7 @@ void TestFunctionVirtualizationExecutionRoundTrip() {
   }
 
   std::string product_id = "com.vendor.virtapp";
-  auto master_key = DeriveBuildFunctionMasterKey(build_auth_seed, manifest_pubkey, product_id, fn_salt.data(), fn_salt.size());
+  auto master_key = DeriveBuildFunctionMasterKey(manifest_vm_root, manifest_pubkey, product_id, fn_salt.data(), fn_salt.size());
   assert(master_key.has_value());
 
   rtprotect::antitamper::RiskAssessment clean_risk;
@@ -783,7 +799,7 @@ void TestFunctionVirtualizationExecutionRoundTrip() {
   // 7. Execute runtime decryption and execution pipeline (clean environment)
   rtprotect::antitamper::RiskAssessment runtime_risk;
   runtime_risk.risk_score = 0;
-  auto runtime_master_key = DeriveBuildFunctionMasterKey(build_auth_seed, manifest_pubkey, product_id, fn_salt.data(), fn_salt.size());
+  auto runtime_master_key = DeriveBuildFunctionMasterKey(manifest_vm_root, manifest_pubkey, product_id, fn_salt.data(), fn_salt.size());
   assert(runtime_master_key.has_value());
 
   auto runtime_bound_key = rtprotect::antitamper::DeriveTamperBoundKey(*runtime_master_key, runtime_risk, "compute_auth");
@@ -796,18 +812,19 @@ void TestFunctionVirtualizationExecutionRoundTrip() {
   // 8. Assert numeric computation through the VM with the build opcode map
   // Case A: 10 + 20 = 30 (> 20) -> 30 * 2 = 60
   std::vector<std::int64_t> args_a = {10, 20};
-  auto res_a = rtprotect::vm::Run(*runtime_prog, args_a, &opcode_map);
+  rtprotect::vm::MemoryContext mem_ctx(65536);
+  auto res_a = rtprotect::vm::Run(*runtime_prog, args_a, &opcode_map, &mem_ctx);
   assert(res_a.error == rtprotect::vm::VmError::kNone);
   assert(res_a.value == 60);
 
   // Case B: 5 + 10 = 15 (<= 20) -> 15 + 1 = 16
   std::vector<std::int64_t> args_b = {5, 10};
-  auto res_b = rtprotect::vm::Run(*runtime_prog, args_b, &opcode_map);
+  auto res_b = rtprotect::vm::Run(*runtime_prog, args_b, &opcode_map, &mem_ctx);
   assert(res_b.error == rtprotect::vm::VmError::kNone);
   assert(res_b.value == 16);
 
   // 9. Adversarial Case A: Execution without the seeded opcode map MUST fail verification
-  auto bad_map_res = rtprotect::vm::Run(*runtime_prog, args_a, nullptr);
+  auto bad_map_res = rtprotect::vm::Run(*runtime_prog, args_a, nullptr, &mem_ctx);
   assert(bad_map_res.error != rtprotect::vm::VmError::kNone);
 
   // 10. Adversarial Case B: Tampered runtime environment MUST corrupt key and fail decryption
@@ -816,6 +833,27 @@ void TestFunctionVirtualizationExecutionRoundTrip() {
   auto tampered_bound_key = rtprotect::antitamper::DeriveTamperBoundKey(*runtime_master_key, tampered_risk, "compute_auth");
   auto bad_decrypt = rtprotect::crypto::Decrypt(tampered_bound_key, *encrypted, nullptr, 0, nullptr);
   assert(!bad_decrypt.has_value()); // Cryptographic GCM tag failure!
+
+  // 11. Memory Operations Round-Trip Execution:
+  // Function using store8 and load8 running through VM with MemoryContext
+  std::string mem_fn =
+      "int64_t mem_test(int64_t addr, int64_t val) {\n"
+      "    store8(addr, val);\n"
+      "    int64_t retrieved = load8(addr);\n"
+      "    return retrieved + 10;\n"
+      "}\n";
+  auto mem_prog = rtprotect::vm::CompileCSubset(mem_fn, &compile_err, opts);
+  assert(mem_prog.has_value());
+  rtprotect::vm::MemoryContext runtime_mem(4096);
+  std::vector<std::int64_t> mem_args = {100, 42};
+  auto mem_res = rtprotect::vm::Run(*mem_prog, mem_args, &opcode_map, &runtime_mem);
+  assert(mem_res.error == rtprotect::vm::VmError::kNone);
+  assert(mem_res.value == 52);
+  assert(runtime_mem.data[100] == 42);
+
+  // 12. Memory Access Out of Bounds properly reports kMemoryAccessOutOfBounds when mem_ctx is null
+  auto null_mem_res = rtprotect::vm::Run(*mem_prog, mem_args, &opcode_map, nullptr);
+  assert(null_mem_res.error == rtprotect::vm::VmError::kMemoryAccessOutOfBounds);
 
   std::printf("  PASSED: End-to-end opcode permutation, tamper-key derivation, and VM execution verified.\n");
 }

@@ -119,14 +119,29 @@ bool CheckDebuggerPresent() {
   // 3. Standard Win32 API check
   return ::IsDebuggerPresent() != 0;
 #else
+  // Layer 1: Check TracerPid in /proc/self/status
   std::ifstream f("/proc/self/status");
   std::string line;
   while (f && std::getline(f, line)) {
     if (line.rfind("TracerPid:", 0) == 0) {
-      long pid = std::stol(line.substr(10));
-      return pid > 0;
+      try {
+        long pid = std::stol(line.substr(10));
+        if (pid > 0) return true;
+      } catch (...) {}
+      break;
     }
   }
+
+  // Layer 2: Check /proc/self/wchan for ptrace_stop / do_signal_stop
+  std::ifstream wchan("/proc/self/wchan");
+  std::string wchan_str;
+  if (wchan >> wchan_str) {
+    if (wchan_str.find("ptrace") != std::string::npos ||
+        wchan_str.find("signal_stop") != std::string::npos) {
+      return true;
+    }
+  }
+
   return false;
 #endif
 }
@@ -139,9 +154,14 @@ bool CheckRemoteDebugger() {
   }
   return false;
 #else
-  // Linux does not have a distinct remote debugger API analogous to Win32;
-  // local/remote debugging is surfaced through TracerPid in CheckDebuggerPresent().
-  // Returning false avoids double-counting a single TracerPid signal.
+  // Layer 3 (Active ptrace check on Linux):
+  // Attempt PTRACE_TRACEME; if another process (debugger, GDB, LLDB, strace) is attached,
+  // ptrace returns -1 with EPERM.
+  if (ptrace(PTRACE_TRACEME, 0, 1, 0) < 0) {
+    return true; // Debugger attached
+  }
+  // Detach if we successfully attached to ourselves
+  ptrace(PTRACE_DETACH, 0, 1, 0);
   return false;
 #endif
 }

@@ -48,6 +48,11 @@ struct RiskAssessment {
 // Evaluates the current execution environment and compiles a RiskAssessment.
 RiskAssessment AssessEnvironmentRisk();
 
+// Fast, zero-thread environment risk assessment designed for per-invocation checks in hot paths.
+// Evaluates PEB/NtQuery debugger flags, memory tampering, timing anomaly, and cached
+// hardware breakpoint signals without spawning helper threads.
+RiskAssessment AssessFastEnvironmentRisk();
+
 // Applies the configured risk action based on assessment results.
 // If action is kTerminate and risk exceeds threshold, cleanly exits with code 1.
 // Returns true if execution is permitted to proceed, false if restricted.
