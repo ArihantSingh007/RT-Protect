@@ -1,0 +1,126 @@
+name: CI
+
+on:
+  push:
+    branches: [ master, main ]
+  pull_request:
+    branches: [ master, main ]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  linux-build-and-test:
+    name: Linux (${{ matrix.compiler }}, ${{ matrix.build_type }}, Sanitizers=${{ matrix.sanitize }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        compiler: [ gcc, clang ]
+        build_type: [ Release, Debug ]
+        sanitize: [ OFF ]
+        include:
+          - compiler: gcc
+            build_type: Debug
+            sanitize: ON
+          - compiler: clang
+            build_type: Debug
+            sanitize: ON
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y cmake ninja-build libssl-dev
+          if [ "${{ matrix.compiler }}" = "clang" ]; then
+            sudo apt-get install -y clang
+            echo "CC=clang" >> $GITHUB_ENV
+            echo "CXX=clang++" >> $GITHUB_ENV
+          else
+            sudo apt-get install -y g++
+            echo "CC=gcc" >> $GITHUB_ENV
+            echo "CXX=g++" >> $GITHUB_ENV
+          fi
+
+      - name: Configure CMake
+        run: |
+          cmake -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=${{ matrix.build_type }} \
+            -DRTPROTECT_BUILD_TESTS=ON \
+            -DRTPROTECT_SANITIZE=${{ matrix.sanitize }} \
+            -DRTPROTECT_ENABLE_EXPERIMENTAL_RUNTIME_RECONSTRUCTION=ON
+
+      - name: Build all targets
+        run: cmake --build build
+
+      - name: Execute automated test suite
+        run: ctest --test-dir build --output-on-failure --verbose
+
+  windows-build-and-test:
+    name: Windows (${{ matrix.generator }}, ${{ matrix.build_type }})
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        build_type: [ Release, Debug ]
+        generator: [ "Visual Studio 17 2022" ]
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup OpenSSL
+        uses: actions/setup-node@v4  # dummy step or vcpkg / chocolatey for openssl
+        with:
+          node-version: '20'
+
+      - name: Install OpenSSL on Windows
+        shell: powershell
+        run: |
+          choco install openssl -y --no-progress
+          Write-Host "OpenSSL installed"
+
+      - name: Configure CMake (MSVC)
+        shell: powershell
+        run: |
+          cmake -B build -G "${{ matrix.generator }}" -A x64 `
+            -DCMAKE_BUILD_TYPE=${{ matrix.build_type }} `
+            -DRTPROTECT_BUILD_TESTS=ON
+
+      - name: Build all targets
+        shell: powershell
+        run: cmake --build build --config ${{ matrix.build_type }}
+
+      - name: Execute automated test suite
+        shell: powershell
+        run: ctest --test-dir build -C ${{ matrix.build_type }} --output-on-failure
+
+  macos-build-and-test:
+    name: macOS (AppleClang, Release)
+    runs-on: macos-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          brew install openssl@3 cmake ninja
+
+      - name: Configure CMake
+        run: |
+          OPENSSL_ROOT=$(brew --prefix openssl@3)
+          cmake -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DOPENSSL_ROOT_DIR=$OPENSSL_ROOT \
+            -DRTPROTECT_BUILD_TESTS=ON
+
+      - name: Build all targets
+        run: cmake --build build
+
+      - name: Execute automated test suite
+        run: ctest --test-dir build --output-on-failure

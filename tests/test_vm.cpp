@@ -2,6 +2,7 @@
 #include "bytecode_vm/compiler.h"
 #include "bytecode_vm/serialize.h"
 #include "bytecode_vm/vm.h"
+#include "bytecode_vm/program_registry.h"
 
 #include "tests/micro_test.h"
 
@@ -749,6 +750,78 @@ MT_TEST(Vm_Compiler_MemoryOperations) {
   auto r = Run(*prog, {32}, nullptr, &mem);
   MT_CHECK(r.error == VmError::kNone);
   MT_CHECK(r.value == static_cast<std::int64_t>(0x123456789ABCDEF0ULL));
+}
+
+MT_TEST(Vm_FloatingPointOperations) {
+  // Test: compute (12.5 + 7.5) * 2.0 = 40.0, convert to int -> 40
+  ProgramBuilder b(0);
+  b.PushFloat(12.5);
+  b.PushFloat(7.5);
+  b.FAdd();       // 20.0
+  b.PushFloat(2.0);
+  b.FMul();       // 40.0
+  b.FloatToInt(); // 40
+  b.Ret();
+
+  auto r = Run(b.Build(), {});
+  MT_CHECK(r.error == VmError::kNone);
+  MT_CHECK(r.value == 40);
+
+  // Test float comparisons: 3.14 < 6.28 -> 1
+  ProgramBuilder b_cmp(0);
+  b_cmp.PushFloat(3.14);
+  b_cmp.PushFloat(6.28);
+  b_cmp.FCmpLt();
+  b_cmp.Ret();
+
+  auto r_cmp = Run(b_cmp.Build(), {});
+  MT_CHECK(r_cmp.error == VmError::kNone);
+  MT_CHECK(r_cmp.value == 1);
+}
+
+MT_TEST(Vm_CrossProgramCall) {
+  // Subprogram 100: double the argument (x * 2)
+  ProgramBuilder b_sub(1);
+  b_sub.PushLocal(0);
+  b_sub.PushConst(2);
+  b_sub.Mul();
+  b_sub.Ret();
+  ProgramRegistry::Register(100, b_sub.Build());
+
+  // Main program: call subprogram 100 with arg = 21, expect 42
+  ProgramBuilder b_main(0);
+  b_main.PushConst(21);
+  b_main.CallProgram(100);
+  b_main.Ret();
+
+  auto r = Run(b_main.Build(), {});
+  MT_CHECK(r.error == VmError::kNone);
+  MT_CHECK(r.value == 42);
+
+  ProgramRegistry::Clear();
+}
+
+MT_TEST(Vm_RegisterThreadedEngine_Parity) {
+  // Complex calculation: ((x + 5) * 3) ^ 7
+  ProgramBuilder b(1);
+  b.PushLocal(0);
+  b.PushConst(5);
+  b.Add();
+  b.PushConst(3);
+  b.Mul();
+  b.PushConst(7);
+  b.BitXor();
+  b.Ret();
+
+  auto prog = b.Build();
+
+  for (std::int64_t x : {0, 10, -5, 100, 1234}) {
+    auto r_stack = Run(prog, {x}, nullptr, nullptr, VmEngineFlavor::kStackBased);
+    auto r_reg = Run(prog, {x}, nullptr, nullptr, VmEngineFlavor::kRegisterThreaded);
+    MT_CHECK(r_stack.error == VmError::kNone);
+    MT_CHECK(r_reg.error == VmError::kNone);
+    MT_CHECK(r_stack.value == r_reg.value);
+  }
 }
 
 MT_MAIN()

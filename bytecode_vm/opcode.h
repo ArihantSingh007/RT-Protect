@@ -63,9 +63,21 @@ enum class Opcode : std::uint8_t {
   kLoadMem64 = 0x62,  // no operand. Pop addr; push 64-bit int from memory[addr..addr+7].
   kStoreMem64 = 0x63, // no operand. Pop val, pop addr; memory[addr..addr+7] = (uint64_t)val.
 
-  // --- subroutines ---
-  kCall = 0x70,    // operand: u16 absolute byte offset. Push return_pc to call_stack; jump to target.
-  kRetSub = 0x71,  // no operand. Pop return_pc from call_stack; jump to return_pc.
+  // --- subroutines & cross-function calls ---
+  kCall = 0x70,         // operand: u16 absolute byte offset. Push return_pc to call_stack; jump to target.
+  kRetSub = 0x71,       // no operand. Pop return_pc from call_stack; jump to return_pc.
+  kCallProgram = 0x72,  // operand: u16 program ID in ProgramRegistry. Invoke registered Program.
+
+  // --- floating point (IEEE-754 64-bit double precision) ---
+  kFAdd = 0x80,        // pop b, pop a, push (double)a + (double)b
+  kFSub = 0x81,        // pop b, pop a, push (double)a - (double)b
+  kFMul = 0x82,        // pop b, pop a, push (double)a * (double)b
+  kFDiv = 0x83,        // pop b, pop a, push (double)a / (double)b
+  kFCmpEq = 0x84,      // pop b, pop a, push (double)a == (double)b ? 1 : 0
+  kFCmpLt = 0x85,      // pop b, pop a, push (double)a < (double)b ? 1 : 0
+  kFCmpGt = 0x86,      // pop b, pop a, push (double)a > (double)b ? 1 : 0
+  kIntToFloat = 0x87,  // pop int64_t a, push (double)a bitcast
+  kFloatToInt = 0x88,  // pop (double)a bitcast, push (int64_t)a
 };
 
 // Returns the number of operand bytes following the opcode byte (0, 1, or 2).
@@ -78,6 +90,7 @@ inline int OperandBytes(Opcode op) {
     case Opcode::kJz:
     case Opcode::kJnz:
     case Opcode::kCall:
+    case Opcode::kCallProgram:
       return 2;
     case Opcode::kPushLocal:
     case Opcode::kStoreLocal:
@@ -102,6 +115,15 @@ inline int OperandBytes(Opcode op) {
     case Opcode::kLoadMem64:
     case Opcode::kStoreMem64:
     case Opcode::kRetSub:
+    case Opcode::kFAdd:
+    case Opcode::kFSub:
+    case Opcode::kFMul:
+    case Opcode::kFDiv:
+    case Opcode::kFCmpEq:
+    case Opcode::kFCmpLt:
+    case Opcode::kFCmpGt:
+    case Opcode::kIntToFloat:
+    case Opcode::kFloatToInt:
       return 0;
   }
   return -1;
@@ -118,7 +140,10 @@ inline bool IsValidOpcode(std::uint8_t byte) {
     case Opcode::kRet:
     case Opcode::kLoadMem8: case Opcode::kStoreMem8:
     case Opcode::kLoadMem64: case Opcode::kStoreMem64:
-    case Opcode::kCall: case Opcode::kRetSub:
+    case Opcode::kCall: case Opcode::kRetSub: case Opcode::kCallProgram:
+    case Opcode::kFAdd: case Opcode::kFSub: case Opcode::kFMul: case Opcode::kFDiv:
+    case Opcode::kFCmpEq: case Opcode::kFCmpLt: case Opcode::kFCmpGt:
+    case Opcode::kIntToFloat: case Opcode::kFloatToInt:
       return true;
   }
   return false;

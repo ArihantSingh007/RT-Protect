@@ -1,5 +1,7 @@
 add_library(rtprotect_antitamper STATIC
     anti_debug.cpp
+    anti_dump.cpp
+    dynamic_import.cpp
     env_detect.cpp
     risk_policy.cpp
 )

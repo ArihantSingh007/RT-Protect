@@ -74,11 +74,22 @@ struct RunResult {
 // hard instruction-count budget is the runtime backstop against an
 // accidentally or deliberately non-terminating program denying service to
 // whatever embeds this VM. kMaxExecutedInstructions is generous for the
+enum class VmEngineFlavor {
+  kStackBased = 0,
+  kRegisterThreaded = 1
+};
+
 class OpcodeMap;
 
 RunResult Run(const Program& program,
               const std::vector<std::int64_t>& args,
               const OpcodeMap* opcode_map = nullptr,
-              MemoryContext* mem_ctx = nullptr);
+              MemoryContext* mem_ctx = nullptr,
+              VmEngineFlavor flavor = VmEngineFlavor::kStackBased);
+
+RunResult RunRegisterThreaded(const Program& program,
+                              const std::vector<std::int64_t>& args,
+                              const OpcodeMap* opcode_map = nullptr,
+                              MemoryContext* mem_ctx = nullptr);
 
 }  // namespace rtprotect::vm

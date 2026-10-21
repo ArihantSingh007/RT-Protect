@@ -16,6 +16,7 @@
 #pragma once
 
 #include <cstdint>
+#include <cstring>
 #include <stdexcept>
 #include <unordered_map>
 #include <vector>
@@ -78,6 +79,24 @@ class ProgramBuilder {
   void StoreMem64() { EmitNoOperand(Opcode::kStoreMem64); }
   void Call(Label l) { EmitJumpPlaceholder(Opcode::kCall, l); }
   void RetSub() { EmitNoOperand(Opcode::kRetSub); }
+
+  void FAdd() { EmitNoOperand(Opcode::kFAdd); }
+  void FSub() { EmitNoOperand(Opcode::kFSub); }
+  void FMul() { EmitNoOperand(Opcode::kFMul); }
+  void FDiv() { EmitNoOperand(Opcode::kFDiv); }
+  void FCmpEq() { EmitNoOperand(Opcode::kFCmpEq); }
+  void FCmpLt() { EmitNoOperand(Opcode::kFCmpLt); }
+  void FCmpGt() { EmitNoOperand(Opcode::kFCmpGt); }
+  void IntToFloat() { EmitNoOperand(Opcode::kIntToFloat); }
+  void FloatToInt() { EmitNoOperand(Opcode::kFloatToInt); }
+  void PushFloat(double d) {
+    std::uint64_t bits = 0;
+    std::memcpy(&bits, &d, sizeof(bits));
+    PushConst(static_cast<std::int64_t>(bits));
+  }
+  void CallProgram(std::uint16_t program_id) {
+    EmitU16(Opcode::kCallProgram, program_id);
+  }
 
   Program Build() {
     // Patch every jump placeholder now that all labels are bound.

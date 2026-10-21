@@ -1,6 +1,7 @@
 // antitamper/anti_debug.cpp
 
 #include "antitamper/anti_debug.h"
+#include "antitamper/dynamic_import.h"
 
 #include <atomic>
 #include <chrono>
@@ -82,11 +83,7 @@ bool CheckDirectPebDebugFlags() {
 bool CheckNtQueryProcessDebug() {
   typedef LONG (NTAPI *pfnNtQueryInformationProcess)(
       HANDLE, ULONG, PVOID, ULONG, PULONG);
-  HMODULE hNtdll = ::GetModuleHandleA("ntdll.dll");
-  if (!hNtdll) return false;
-
-  auto pNtQIP = reinterpret_cast<pfnNtQueryInformationProcess>(
-      reinterpret_cast<void*>(::GetProcAddress(hNtdll, "NtQueryInformationProcess")));
+  auto pNtQIP = ResolveApi<pfnNtQueryInformationProcess>(kHashNtdll, kHashNtQueryInformationProcess);
   if (!pNtQIP) return false;
 
   // Class 7 = ProcessDebugPort
@@ -116,8 +113,16 @@ bool CheckDebuggerPresent() {
   // 2. Direct NT kernel query via NtQueryInformationProcess
   if (CheckNtQueryProcessDebug()) return true;
 
-  // 3. Standard Win32 API check
-  return ::IsDebuggerPresent() != 0;
+  // 3. Dynamic hashed API check (eliminates static IAT entry)
+  typedef BOOL (WINAPI *pfnIsDebuggerPresent)();
+  auto fnIsDebuggerPresent = ResolveApi<pfnIsDebuggerPresent>(kHashKernel32, kHashIsDebuggerPresent);
+  if (!fnIsDebuggerPresent) {
+    fnIsDebuggerPresent = ResolveApi<pfnIsDebuggerPresent>(kHashKernelBase, kHashIsDebuggerPresent);
+  }
+  if (fnIsDebuggerPresent && fnIsDebuggerPresent() != 0) {
+    return true;
+  }
+  return false;
 #else
   // Layer 1: Check TracerPid and State in /proc/self/status
   std::ifstream f("/proc/self/status");
@@ -154,9 +159,18 @@ bool CheckDebuggerPresent() {
 
 bool CheckRemoteDebugger() {
 #if defined(_WIN32)
-  BOOL is_debugger = FALSE;
-  if (::CheckRemoteDebuggerPresent(::GetCurrentProcess(), &is_debugger)) {
-    return is_debugger != 0;
+  typedef BOOL (WINAPI *pfnCheckRemoteDebuggerPresent)(HANDLE, PBOOL);
+  auto fnCheckRemoteDebugger = ResolveApi<pfnCheckRemoteDebuggerPresent>(
+      kHashKernel32, kHashCheckRemoteDebuggerPresent);
+  if (!fnCheckRemoteDebugger) {
+    fnCheckRemoteDebugger = ResolveApi<pfnCheckRemoteDebuggerPresent>(
+        kHashKernelBase, kHashCheckRemoteDebuggerPresent);
+  }
+  if (fnCheckRemoteDebugger) {
+    BOOL is_debugger = FALSE;
+    if (fnCheckRemoteDebugger(::GetCurrentProcess(), &is_debugger)) {
+      return is_debugger != 0;
+    }
   }
   return false;
 #else
@@ -315,21 +329,21 @@ bool CheckExecutionTimingAnomaly() {
 
 bool CheckMemoryTampered() {
 #if defined(_WIN32)
-  const char* apis[] = {
-      "IsDebuggerPresent",
-      "CheckRemoteDebuggerPresent",
-      "VirtualProtect",
-      "GetProcAddress"
+  static const std::uint32_t kCheckedApiHashes[] = {
+      kHashIsDebuggerPresent,
+      kHashCheckRemoteDebuggerPresent,
+      kHashVirtualProtect,
+      kHashGetProcAddress
   };
-  HMODULE hKernel32 = ::GetModuleHandleA("kernel32.dll");
-  HMODULE hKernelBase = ::GetModuleHandleA("kernelbase.dll");
-  for (const char* api_name : apis) {
+  void* hKernel32 = GetLoadedModuleBaseByHash(kHashKernel32);
+  void* hKernelBase = GetLoadedModuleBaseByHash(kHashKernelBase);
+  for (std::uint32_t api_hash : kCheckedApiHashes) {
     const unsigned char* p = nullptr;
     if (hKernelBase) {
-      p = reinterpret_cast<const unsigned char*>(::GetProcAddress(hKernelBase, api_name));
+      p = reinterpret_cast<const unsigned char*>(ResolveExportByHash(hKernelBase, api_hash));
     }
     if (!p && hKernel32) {
-      p = reinterpret_cast<const unsigned char*>(::GetProcAddress(hKernel32, api_name));
+      p = reinterpret_cast<const unsigned char*>(ResolveExportByHash(hKernel32, api_hash));
     }
     if (p) {
       // 0xCC: Software breakpoint (INT 3)

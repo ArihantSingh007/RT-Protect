@@ -938,6 +938,69 @@ void TestDetailedJsonReporting() {
   std::printf("  PASSED: Detailed JSON execution reporting verified.\n");
 }
 
+void TestAstScannerRawStringsAndTranslationUnitObfuscation() {
+  std::printf("Running TestAstScannerRawStringsAndTranslationUnitObfuscation...\n");
+
+  fs::path test_dir = "temp_test_ast_raw_strings";
+  CleanDir(test_dir);
+  fs::create_directories(test_dir);
+
+  // File contains raw string literals with unmatched braces in a prior helper function
+  std::string main_cpp =
+      "#include <cstdint>\n"
+      "#include <string>\n"
+      "const char* g_global_banner = \"Welcome to Protected Application\";\n"
+      "const char* get_schema() {\n"
+      "    return R\"delim({ \"unmatched_brace\": { { \"nested\": [1, 2, 3] )delim\";\n"
+      "}\n"
+      "RTPROTECT_VIRTUALIZE\n"
+      "int64_t compute_raw(int64_t a) {\n"
+      "    int64_t res = a * 10;\n"
+      "    return res + 2;\n"
+      "}\n"
+      "int main() {\n"
+      "    const char* secret_status = \"System Operational\";\n"
+      "    return compute_raw(5);\n"
+      "}\n";
+
+  fs::path file_path = test_dir / "main.cpp";
+  WriteTextFile(file_path.string(), main_cpp);
+
+  std::array<std::uint8_t, 32> vm_root{};
+  vm_root.fill(0x77);
+  auto kp = rtprotect::integrity::GenerateEd25519KeyPair();
+  assert(kp.has_value());
+
+  std::vector<std::string> virtualized;
+  std::size_t obf_count = 0;
+  std::size_t scatt_count = 0;
+
+  bool ok = TransformSourceFile(
+      file_path,
+      ProtectionProfile::kMaximum,
+      1337,
+      vm_root,
+      kp->public_key,
+      "test_ast_prod",
+      virtualized,
+      obf_count,
+      scatt_count);
+
+  assert(ok);
+  assert(!virtualized.empty());
+  assert(virtualized[0] == "compute_raw");
+  assert(obf_count > 0);
+
+  auto transformed = ReadTextFile(file_path.string());
+  assert(transformed.has_value());
+  assert(transformed->find("[RTProtect Bytecode-Virtualized Function: compute_raw]") != std::string::npos);
+  assert(transformed->find("OBFUSCATED_STRING") != std::string::npos);
+  assert(transformed->find("obfuscation/obfuscated_string.h") != std::string::npos);
+
+  CleanDir(test_dir);
+  std::printf("  PASSED: AST scanner raw string parsing and translation unit string obfuscation verified.\n");
+}
+
 }  // namespace
 
 int main() {
@@ -960,6 +1023,7 @@ int main() {
   TestFunctionVirtualizationExecutionRoundTrip();
   TestFunctionExtractionHandlesCommentsAndStrings();
   TestDetailedJsonReporting();
+  TestAstScannerRawStringsAndTranslationUnitObfuscation();
   std::printf("ALL INTEGRATION ENGINE TESTS PASSED.\n");
   return 0;
 }
