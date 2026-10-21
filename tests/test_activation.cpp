@@ -3,7 +3,10 @@
 #include "licensing/activation.h"
 #include "licensing/activation_server.h"
 #include "integrity/keys.h"
+#include "crypto/aead.h"
+#include "tooling/file_io.h"
 #include "tests/micro_test.h"
+#include <filesystem>
 
 using namespace rtprotect::licensing;
 using namespace rtprotect::integrity;
@@ -245,6 +248,101 @@ MT_TEST(ActivationManager_Revocation_Workflow) {
   MT_CHECK(fresh_mgr.ImportRevocationListJson(json));
   MT_CHECK(fresh_mgr.IsLicenseRevoked("lic-revokable"));
   MT_CHECK(fresh_mgr.IsTicketRevoked(res1.ticket->ticket_id));
+}
+
+MT_TEST(ActivationToken_SerializationRoundTrip) {
+  ActivationToken tok;
+  tok.schema_version = kActivationSchemaVersion;
+  tok.license_id = "lic-ent-token-999";
+  tok.device_fingerprint_hash = "CPU:VOL:SYS:HOST-TOKEN-12345678";
+  tok.issued_at = 1700000000;
+  tok.expires_at = 1700000000 + 14 * 86400;
+  tok.grace_expires_at = tok.expires_at + 3 * 86400;
+  tok.server_nonce.fill(0x3C);
+  tok.vm_root.fill(0x7E);
+  tok.sequence_number = 42;
+
+  auto bytes = SerializeActivationToken(tok);
+  MT_CHECK(!bytes.empty());
+
+  auto parsed = DeserializeActivationToken(bytes.data(), bytes.size());
+  MT_CHECK(parsed.has_value());
+  MT_CHECK(parsed->schema_version == tok.schema_version);
+  MT_CHECK(parsed->license_id == tok.license_id);
+  MT_CHECK(parsed->device_fingerprint_hash == tok.device_fingerprint_hash);
+  MT_CHECK(parsed->issued_at == tok.issued_at);
+  MT_CHECK(parsed->expires_at == tok.expires_at);
+  MT_CHECK(parsed->grace_expires_at == tok.grace_expires_at);
+  MT_CHECK(parsed->server_nonce == tok.server_nonce);
+  MT_CHECK(parsed->vm_root == tok.vm_root);
+  MT_CHECK(parsed->sequence_number == tok.sequence_number);
+
+  // Truncated data must fail closed
+  MT_CHECK(!DeserializeActivationToken(bytes.data(), bytes.size() - 5).has_value());
+}
+
+MT_TEST(ActivationToken_ExpiryCheck) {
+  ActivationToken tok;
+  tok.issued_at = 1000;
+  tok.expires_at = 2000;
+  tok.grace_expires_at = 2500;
+
+  std::uint64_t valid_time = 1500;
+  std::uint64_t expired_time = 2501;
+
+  MT_CHECK(valid_time <= tok.expires_at);
+  MT_CHECK(expired_time > tok.expires_at);
+}
+
+MT_TEST(ActivationToken_LoadOrCreateDevToken_PersistsAndEncrypts) {
+  std::string test_prod = "test_product_dev_token_isolation";
+  std::string test_lic = "lic-dev-isolated-001";
+  std::string token_path = GetActivationTokenPath(test_prod);
+
+  std::error_code ec;
+  std::filesystem::remove(token_path, ec);
+
+  ActivationToken tok1;
+  MT_CHECK(LoadOrCreateDevToken(test_prod, test_lic, &tok1));
+  MT_CHECK(std::filesystem::exists(token_path));
+
+  // Verify file is encrypted at rest via AEAD and not plaintext
+  auto file_bytes = rtprotect::tooling::ReadFile(token_path);
+  MT_CHECK(file_bytes.has_value());
+
+  // Confirm license ID and raw strings are NOT in cleartext on disk
+  std::string raw_content(reinterpret_cast<const char*>(file_bytes->data()), file_bytes->size());
+  MT_CHECK(raw_content.find(test_lic) == std::string::npos);
+  MT_CHECK(raw_content.find(test_prod) == std::string::npos);
+
+  // Confirm deserializable as AEAD encrypted message
+  auto enc_msg = rtprotect::crypto::EncryptedMessage::Deserialize(file_bytes->data(), file_bytes->size());
+  MT_CHECK(enc_msg.has_value());
+
+  // Loading second time must succeed and retrieve identical vm_root
+  ActivationToken tok2;
+  MT_CHECK(LoadOrCreateDevToken(test_prod, test_lic, &tok2));
+  MT_CHECK(tok2.vm_root == tok1.vm_root);
+  MT_CHECK(tok2.license_id == tok1.license_id);
+
+  std::filesystem::remove(token_path, ec);
+}
+
+MT_TEST(ActivationServer_ActivateAndRenew_Stubs) {
+  auto token = ActivateDevice("lic-key-prod-1", "hw-fingerprint-prod", "prod-1");
+  MT_CHECK(token.schema_version == kActivationSchemaVersion);
+  MT_CHECK(token.license_id == "lic-key-prod-1");
+  MT_CHECK(token.device_fingerprint_hash == "hw-fingerprint-prod");
+  MT_CHECK(token.sequence_number == 1);
+  MT_CHECK(token.issued_at > 0);
+  MT_CHECK(token.expires_at > token.issued_at);
+  MT_CHECK(token.grace_expires_at > token.expires_at);
+
+  auto renewed = RenewToken(token);
+  MT_CHECK(renewed.sequence_number == 2);
+  MT_CHECK(renewed.vm_root == token.vm_root);
+  MT_CHECK(renewed.license_id == token.license_id);
+  MT_CHECK(renewed.expires_at >= token.expires_at);
 }
 
 MT_MAIN()

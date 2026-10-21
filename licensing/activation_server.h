@@ -78,4 +78,12 @@ class ActivationManager {
 // Signs an activation ticket with the vendor Ed25519 private key
 bool SignActivationTicket(ActivationTicket& ticket, const integrity::Ed25519PrivateKey& privkey);
 
+// Stand-alone activation authority stubs for device activation and token renewal.
+// Decoupled from networking, sockets, and curl.
+ActivationToken ActivateDevice(const std::string& license_key,
+                               const std::string& hardware_id,
+                               const std::string& product_id);
+
+ActivationToken RenewToken(const ActivationToken& current_token);
+
 }  // namespace rtprotect::licensing

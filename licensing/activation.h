@@ -22,6 +22,7 @@ namespace rtprotect::licensing {
 
 inline constexpr std::uint32_t kActivationRequestMagic = 0x52545051;  // 'RTPQ'
 inline constexpr std::uint32_t kActivationTicketMagic  = 0x52545054;  // 'RTPT'
+inline constexpr std::uint32_t kActivationTokenMagic   = 0x5254504B;  // 'RTPK'
 inline constexpr std::uint32_t kActivationSchemaVersion = 1;
 inline constexpr std::size_t kMaxActivationFieldLen = 512;
 inline constexpr std::size_t kActivationNonceLen = 32;
@@ -95,5 +96,29 @@ ActivationStatus VerifyActivationTicket(const ActivationTicket& ticket,
                                         std::uint64_t current_time,
                                         double min_hw_match_score = 0.75,
                                         const HardwareSimilarityWeights* hw_weights = nullptr);
+
+// Local installation-bound activation token containing vm_root.
+// Kept in encrypted local token storage, never exposed in cleartext manifests or .rodata.
+struct ActivationToken {
+  std::uint32_t schema_version = kActivationSchemaVersion;
+  std::string license_id;
+  std::string device_fingerprint_hash;
+  std::uint64_t issued_at = 0;
+  std::uint64_t expires_at = 0;
+  std::uint64_t grace_expires_at = 0;
+  std::array<std::uint8_t, 32> server_nonce{};
+  std::array<std::uint8_t, 32> vm_root{};
+  std::uint64_t sequence_number = 1;
+};
+
+// Activation token wire serialization / deserialization
+std::vector<std::uint8_t> SerializeActivationToken(const ActivationToken& token);
+std::optional<ActivationToken> DeserializeActivationToken(const std::uint8_t* data, std::size_t len);
+
+// Local activation token store path resolution and dev token loader/creator
+std::string GetActivationTokenPath(const std::string& product_id);
+bool LoadOrCreateDevToken(const std::string& product_id,
+                          const std::string& license_id,
+                          ActivationToken* out_token);
 
 }  // namespace rtprotect::licensing

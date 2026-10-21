@@ -6,12 +6,18 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <iomanip>
 #include <sstream>
+#include <system_error>
 
 #include <openssl/rand.h>
 
+#include "crypto/aead.h"
+#include "crypto/kdf.h"
 #include "integrity/verifier.h"
+#include "licensing/hardware_id.h"
+#include "tooling/file_io.h"
 
 namespace rtprotect::licensing {
 
@@ -370,6 +376,183 @@ ActivationStatus VerifyActivationTicket(const ActivationTicket& ticket,
   }
 
   return ActivationStatus::kValid;
+}
+
+std::vector<std::uint8_t> SerializeActivationToken(const ActivationToken& token) {
+  if (token.license_id.size() > kMaxActivationFieldLen ||
+      token.device_fingerprint_hash.size() > kMaxActivationFieldLen) {
+    return {};
+  }
+  std::vector<std::uint8_t> buf;
+  buf.reserve(256);
+
+  WriteU32(buf, kActivationTokenMagic);
+  WriteU32(buf, token.schema_version);
+  if (!WriteString(buf, token.license_id)) return {};
+  if (!WriteString(buf, token.device_fingerprint_hash)) return {};
+  WriteU64(buf, token.issued_at);
+  WriteU64(buf, token.expires_at);
+  WriteU64(buf, token.grace_expires_at);
+  buf.insert(buf.end(), token.server_nonce.begin(), token.server_nonce.end());
+  buf.insert(buf.end(), token.vm_root.begin(), token.vm_root.end());
+  WriteU64(buf, token.sequence_number);
+
+  return buf;
+}
+
+std::optional<ActivationToken> DeserializeActivationToken(const std::uint8_t* data, std::size_t len) {
+  if (!data || len < 4 + 4 + 2 + 2 + 8 + 8 + 8 + 32 + 32 + 8) return std::nullopt;
+  const std::uint8_t* p = data;
+  const std::uint8_t* end = data + len;
+
+  std::uint32_t magic = 0;
+  if (!ReadU32(p, end, magic) || magic != kActivationTokenMagic) return std::nullopt;
+
+  ActivationToken token;
+  if (!ReadU32(p, end, token.schema_version) || token.schema_version != kActivationSchemaVersion) {
+    return std::nullopt;
+  }
+  if (!ReadString(p, end, token.license_id)) return std::nullopt;
+  if (!ReadString(p, end, token.device_fingerprint_hash)) return std::nullopt;
+  if (!ReadU64(p, end, token.issued_at)) return std::nullopt;
+  if (!ReadU64(p, end, token.expires_at)) return std::nullopt;
+  if (!ReadU64(p, end, token.grace_expires_at)) return std::nullopt;
+
+  if (static_cast<std::size_t>(end - p) < token.server_nonce.size()) return std::nullopt;
+  std::memcpy(token.server_nonce.data(), p, token.server_nonce.size());
+  p += token.server_nonce.size();
+
+  if (static_cast<std::size_t>(end - p) < token.vm_root.size()) return std::nullopt;
+  std::memcpy(token.vm_root.data(), p, token.vm_root.size());
+  p += token.vm_root.size();
+
+  if (!ReadU64(p, end, token.sequence_number)) return std::nullopt;
+
+  return token;
+}
+
+std::string GetActivationTokenPath(const std::string& product_id) {
+  std::string sanitized_product = product_id.empty() ? "default" : product_id;
+  for (char& c : sanitized_product) {
+    if (!std::isalnum(static_cast<unsigned char>(c)) && c != '-' && c != '_') {
+      c = '_';
+    }
+  }
+
+  std::filesystem::path base_dir;
+  const char* override_dir = std::getenv("RTPROTECT_ACTIVATION_DIR");
+  if (override_dir && override_dir[0] != '\0') {
+    base_dir = std::filesystem::path(override_dir);
+  } else {
+#if defined(_WIN32)
+    const char* local_app_data = std::getenv("LOCALAPPDATA");
+    if (local_app_data && local_app_data[0] != '\0') {
+      base_dir = std::filesystem::path(local_app_data) / "RTProtect";
+    } else {
+      const char* user_prof = std::getenv("USERPROFILE");
+      if (user_prof && user_prof[0] != '\0') {
+        base_dir = std::filesystem::path(user_prof) / "AppData" / "Local" / "RTProtect";
+      } else {
+        base_dir = std::filesystem::path(".rtprotect_activation");
+      }
+    }
+#else
+    const char* xdg_config = std::getenv("XDG_CONFIG_HOME");
+    if (xdg_config && xdg_config[0] != '\0') {
+      base_dir = std::filesystem::path(xdg_config) / "rtprotect";
+    } else {
+      const char* home = std::getenv("HOME");
+      if (home && home[0] != '\0') {
+        base_dir = std::filesystem::path(home) / ".config" / "rtprotect";
+      } else {
+        base_dir = std::filesystem::path(".rtprotect_activation");
+      }
+    }
+#endif
+  }
+
+  std::error_code ec;
+  std::filesystem::create_directories(base_dir, ec);
+  return (base_dir / ("activation_" + sanitized_product + ".dat")).string();
+}
+
+bool LoadOrCreateDevToken(const std::string& product_id,
+                          const std::string& license_id,
+                          ActivationToken* out_token) {
+  if (!out_token) return false;
+
+  std::string token_path = GetActivationTokenPath(product_id);
+
+  // Derive storage encryption key bound to device hardware ID
+  std::string hwid = GetLocalHardwareId();
+  crypto::SecureBuffer sec_hwid(reinterpret_cast<const std::uint8_t*>(hwid.data()), hwid.size());
+  std::vector<std::uint8_t> salt = {'R', 'T', 'P', 'r', 'o', 't', 'e', 'c', 't', 'A', 'c', 't', 'i', 'v', 'a', 't', 'i', 'o', 'n', 'K', 'e', 'y'};
+  std::string info = "rtprotect/activation-token-store/v1";
+  auto derived = crypto::Hkdf::DeriveKey(sec_hwid, salt, info, crypto::kAes256KeyLen);
+  if (!derived.has_value()) return false;
+  auto enc_key = crypto::Aes256Key::FromBytes(derived->data(), derived->size());
+  if (!enc_key.has_value()) return false;
+
+  // Check if token already exists in local store
+  if (std::filesystem::exists(token_path)) {
+    auto file_bytes = tooling::ReadFile(token_path);
+    if (file_bytes.has_value()) {
+      auto msg = crypto::EncryptedMessage::Deserialize(file_bytes->data(), file_bytes->size());
+      if (msg.has_value()) {
+        crypto::AeadError err = crypto::AeadError::kNone;
+        auto plaintext = crypto::Decrypt(*enc_key, *msg, nullptr, 0, &err);
+        if (plaintext.has_value()) {
+          auto token_opt = DeserializeActivationToken(plaintext->data(), plaintext->size());
+          if (token_opt.has_value()) {
+            bool lic_match = license_id.empty() ||
+                             token_opt->license_id.empty() ||
+                             token_opt->license_id == license_id ||
+                             token_opt->license_id == "dev-license" ||
+                             (license_id.rfind("lic-dev-", 0) == 0 && token_opt->license_id.rfind("lic-dev-", 0) == 0);
+            if (lic_match) {
+              *out_token = *token_opt;
+              return true;
+            }
+          }
+        }
+      }
+    }
+  }
+
+  // TODO(activation-server): replace with real /activate and /renew HTTP calls
+  ActivationToken dev_token;
+  dev_token.schema_version = kActivationSchemaVersion;
+  dev_token.license_id = license_id.empty() ? "dev-license" : license_id;
+  dev_token.device_fingerprint_hash = hwid;
+
+  auto now = std::chrono::system_clock::now().time_since_epoch();
+  std::uint64_t current_time = static_cast<std::uint64_t>(
+      std::chrono::duration_cast<std::chrono::seconds>(now).count());
+  dev_token.issued_at = current_time;
+  dev_token.expires_at = current_time + 14 * 86400;              // 14 days
+  dev_token.grace_expires_at = dev_token.expires_at + 3 * 86400; // 3 days grace
+  dev_token.sequence_number = 1;
+
+  if (RAND_bytes(dev_token.server_nonce.data(), static_cast<int>(dev_token.server_nonce.size())) != 1) {
+    return false;
+  }
+  if (RAND_bytes(dev_token.vm_root.data(), static_cast<int>(dev_token.vm_root.size())) != 1) {
+    return false;
+  }
+
+  auto serialized = SerializeActivationToken(dev_token);
+  if (serialized.empty()) return false;
+
+  auto encrypted = crypto::Encrypt(*enc_key, serialized.data(), serialized.size());
+  if (!encrypted.has_value()) return false;
+
+  auto wire_bytes = encrypted->Serialize();
+  if (!tooling::WriteFile(token_path, wire_bytes.data(), wire_bytes.size())) {
+    return false;
+  }
+
+  *out_token = dev_token;
+  return true;
 }
 
 }  // namespace rtprotect::licensing

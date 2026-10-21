@@ -290,4 +290,53 @@ bool ActivationManager::ImportRevocationListJson(const std::string& json_str) {
   return true;
 }
 
+ActivationToken ActivateDevice(const std::string& license_key,
+                               const std::string& hardware_id,
+                               const std::string& product_id) {
+  (void)product_id;
+  ActivationToken token;
+  token.schema_version = kActivationSchemaVersion;
+  token.license_id = license_key;
+  token.device_fingerprint_hash = hardware_id;
+
+  auto now = std::chrono::system_clock::now().time_since_epoch();
+  std::uint64_t current_time = static_cast<std::uint64_t>(
+      std::chrono::duration_cast<std::chrono::seconds>(now).count());
+  token.issued_at = current_time;
+  token.expires_at = current_time + 14 * 86400;              // 14 days
+  token.grace_expires_at = token.expires_at + 3 * 86400;     // 3 days grace
+  token.sequence_number = 1;
+
+  if (RAND_bytes(token.server_nonce.data(), static_cast<int>(token.server_nonce.size())) != 1) {
+    for (std::size_t i = 0; i < token.server_nonce.size(); ++i) {
+      token.server_nonce[i] = static_cast<std::uint8_t>((i * 13 + 0x5A) & 0xFF);
+    }
+  }
+  if (RAND_bytes(token.vm_root.data(), static_cast<int>(token.vm_root.size())) != 1) {
+    for (std::size_t i = 0; i < token.vm_root.size(); ++i) {
+      token.vm_root[i] = static_cast<std::uint8_t>((i * 7 + 0x3C) & 0xFF);
+    }
+  }
+
+  return token;
+}
+
+ActivationToken RenewToken(const ActivationToken& current_token) {
+  ActivationToken token = current_token;
+  auto now = std::chrono::system_clock::now().time_since_epoch();
+  std::uint64_t current_time = static_cast<std::uint64_t>(
+      std::chrono::duration_cast<std::chrono::seconds>(now).count());
+  token.issued_at = current_time;
+  token.expires_at = current_time + 14 * 86400;
+  token.grace_expires_at = token.expires_at + 3 * 86400;
+  token.sequence_number = current_token.sequence_number + 1;
+
+  if (RAND_bytes(token.server_nonce.data(), static_cast<int>(token.server_nonce.size())) != 1) {
+    for (std::size_t i = 0; i < token.server_nonce.size(); ++i) {
+      token.server_nonce[i] = static_cast<std::uint8_t>((i * 17 + 0x7B) & 0xFF);
+    }
+  }
+  return token;
+}
+
 }  // namespace rtprotect::licensing
