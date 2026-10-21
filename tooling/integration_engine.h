@@ -127,10 +127,10 @@ bool ValidateProtectedBuild(const std::string& project_dir,
                             const std::string& signature_path,
                             std::string* error_out = nullptr);
 
-// Derives function master key dynamically using HKDF from build authority seed,
+// Derives function master key dynamically using HKDF from manifest VM root,
 // manifest public key, product ID, and function-specific salt.
 std::optional<crypto::Aes256Key> DeriveBuildFunctionMasterKey(
-    const std::array<std::uint8_t, 32>& build_auth_seed,
+    const std::array<std::uint8_t, 32>& manifest_vm_root,
     const integrity::Ed25519PublicKey& manifest_pubkey,
     const std::string& product_id,
     const std::uint8_t* salt,
@@ -141,7 +141,7 @@ std::optional<crypto::Aes256Key> DeriveBuildFunctionMasterKey(
 bool TransformSourceFile(const std::filesystem::path& file_path,
                          const ProtectionProfile profile,
                          const std::uint32_t opcode_seed,
-                         const std::array<std::uint8_t, 32>& build_auth_seed,
+                         const std::array<std::uint8_t, 32>& manifest_vm_root,
                          const integrity::Ed25519PublicKey& manifest_pubkey,
                          const std::string& product_id,
                          std::vector<std::string>& out_virtualized,

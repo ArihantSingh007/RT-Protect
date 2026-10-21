@@ -43,6 +43,35 @@ RiskAssessment AssessEnvironmentRisk() {
   return r;
 }
 
+RiskAssessment AssessFastEnvironmentRisk() {
+  RiskAssessment r;
+  r.debugger_present = CheckDebuggerPresent();
+  r.remote_debugger_present = CheckRemoteDebugger();
+  r.hardware_breakpoints_detected = IsHardwareBreakpointDetected();
+  r.timing_anomaly_detected = CheckExecutionTimingAnomaly();
+  r.hypervisor_detected = CheckHypervisorPresent();
+  r.memory_tampered = CheckMemoryTampered();
+  if (r.hypervisor_detected) {
+    r.hypervisor_vendor = GetHypervisorVendor();
+  }
+
+  int score = 0;
+  if (r.debugger_present || r.remote_debugger_present) {
+    score += 40;
+    if (r.debugger_present && r.remote_debugger_present) {
+      score += 10;
+    }
+  }
+  if (r.hardware_breakpoints_detected) score += 50;
+  if (r.timing_anomaly_detected) score += 30;
+  if (r.memory_tampered) score += 40;
+  if (r.hypervisor_detected) score += 15;
+
+  if (score > 100) score = 100;
+  r.risk_score = score;
+  return r;
+}
+
 bool EnforceRiskPolicy(RiskAction action, const RiskAssessment& assessment) {
   switch (action) {
     case RiskAction::kReportOnly:
