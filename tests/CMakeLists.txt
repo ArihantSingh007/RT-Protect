@@ -89,6 +89,11 @@ endif()
 target_include_directories(test_activation_service PRIVATE ${CMAKE_SOURCE_DIR})
 add_test(NAME test_activation_service COMMAND test_activation_service)
 
+add_executable(test_trusted_time test_trusted_time.cpp)
+target_link_libraries(test_trusted_time PRIVATE rtprotect_licensing)
+target_include_directories(test_trusted_time PRIVATE ${CMAKE_SOURCE_DIR})
+add_test(NAME test_trusted_time COMMAND test_trusted_time)
+
 add_executable(test_hardware_id test_hardware_id.cpp)
 target_link_libraries(test_hardware_id PRIVATE rtprotect_licensing)
 target_include_directories(test_hardware_id PRIVATE ${CMAKE_SOURCE_DIR})

@@ -8,6 +8,7 @@ hardening review specifically asked for:
 | `fuzz_manifest_deserialize` | `integrity::DeserializeManifest()` |
 | `fuzz_vm_deserialize_and_verify` | `bytecode_vm::Deserialize()` + `bytecode_vm::VerifyProgram()` together |
 | `fuzz_encrypted_message_deserialize` | `crypto::EncryptedMessage::Deserialize()` |
+| `fuzz_source_scanner` | `tooling::TransformSourceFile()` AST/lexical parser and virtualizer |
 
 ## Status: written, not executed
 
@@ -30,12 +31,13 @@ project can currently back up with real output.
 mkdir build-fuzz && cd build-fuzz
 CC=clang CXX=clang++ cmake .. -DRTPROTECT_BUILD_FUZZERS=ON -DCMAKE_BUILD_TYPE=Debug
 cmake --build . --target fuzz_manifest_deserialize fuzz_vm_deserialize_and_verify \
-                          fuzz_encrypted_message_deserialize
+                          fuzz_encrypted_message_deserialize fuzz_source_scanner
 
 # Run each for a bounded time (adjust -max_total_time, in seconds):
 ./fuzz_manifest_deserialize -max_total_time=300 corpus/manifest/
 ./fuzz_vm_deserialize_and_verify -max_total_time=300 corpus/vm/
 ./fuzz_encrypted_message_deserialize -max_total_time=300 corpus/aead/
+./fuzz_source_scanner -max_total_time=300 corpus/source/
 ```
 
 Create the `corpus/*` directories first (even empty) -- libFuzzer uses

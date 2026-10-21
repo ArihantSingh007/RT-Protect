@@ -1,6 +1,7 @@
 // licensing/activation.cpp
 
 #include "licensing/activation.h"
+#include "licensing/secure_storage.h"
 
 #include <chrono>
 #include <cstdio>
@@ -459,42 +460,43 @@ std::string GetActivationTokenPath(const std::string& product_id) {
       c = '_';
     }
   }
+  return SecureStorage::GetStorageFilePath("activation_" + sanitized_product);
+}
 
-  std::filesystem::path base_dir;
-  const char* override_dir = std::getenv("RTPROTECT_ACTIVATION_DIR");
-  if (override_dir && override_dir[0] != '\0') {
-    base_dir = std::filesystem::path(override_dir);
-  } else {
-#if defined(_WIN32)
-    const char* local_app_data = std::getenv("LOCALAPPDATA");
-    if (local_app_data && local_app_data[0] != '\0') {
-      base_dir = std::filesystem::path(local_app_data) / "RTProtect";
-    } else {
-      const char* user_prof = std::getenv("USERPROFILE");
-      if (user_prof && user_prof[0] != '\0') {
-        base_dir = std::filesystem::path(user_prof) / "AppData" / "Local" / "RTProtect";
-      } else {
-        base_dir = std::filesystem::path(".rtprotect_activation");
-      }
+bool SaveActivationToken(const std::string& product_id, const ActivationToken& token) {
+  std::string sanitized_product = product_id.empty() ? "default" : product_id;
+  for (char& c : sanitized_product) {
+    if (!std::isalnum(static_cast<unsigned char>(c)) && c != '-' && c != '_') {
+      c = '_';
     }
-#else
-    const char* xdg_config = std::getenv("XDG_CONFIG_HOME");
-    if (xdg_config && xdg_config[0] != '\0') {
-      base_dir = std::filesystem::path(xdg_config) / "rtprotect";
-    } else {
-      const char* home = std::getenv("HOME");
-      if (home && home[0] != '\0') {
-        base_dir = std::filesystem::path(home) / ".config" / "rtprotect";
-      } else {
-        base_dir = std::filesystem::path(".rtprotect_activation");
-      }
-    }
-#endif
   }
+  auto serialized = SerializeActivationToken(token);
+  if (serialized.empty()) return false;
+  return SecureStorage::Store("activation_" + sanitized_product, serialized, "rtprotect_activation_token");
+}
 
-  std::error_code ec;
-  std::filesystem::create_directories(base_dir, ec);
-  return (base_dir / ("activation_" + sanitized_product + ".dat")).string();
+std::optional<ActivationToken> LoadActivationToken(const std::string& product_id) {
+  std::string sanitized_product = product_id.empty() ? "default" : product_id;
+  for (char& c : sanitized_product) {
+    if (!std::isalnum(static_cast<unsigned char>(c)) && c != '-' && c != '_') {
+      c = '_';
+    }
+  }
+  auto loaded_bytes = SecureStorage::Load("activation_" + sanitized_product);
+  if (!loaded_bytes.has_value() || loaded_bytes->empty()) {
+    return std::nullopt;
+  }
+  return DeserializeActivationToken(loaded_bytes->data(), loaded_bytes->size());
+}
+
+bool DeleteActivationToken(const std::string& product_id) {
+  std::string sanitized_product = product_id.empty() ? "default" : product_id;
+  for (char& c : sanitized_product) {
+    if (!std::isalnum(static_cast<unsigned char>(c)) && c != '-' && c != '_') {
+      c = '_';
+    }
+  }
+  return SecureStorage::Delete("activation_" + sanitized_product);
 }
 
 bool LoadOrCreateDevToken(const std::string& product_id,
@@ -502,54 +504,29 @@ bool LoadOrCreateDevToken(const std::string& product_id,
                           ActivationToken* out_token) {
   if (!out_token) return false;
 
-  std::string token_path = GetActivationTokenPath(product_id);
-
-  // Derive storage encryption key bound to device hardware ID
-  std::string hwid = GetLocalHardwareId();
-  crypto::SecureBuffer sec_hwid(reinterpret_cast<const std::uint8_t*>(hwid.data()), hwid.size());
-  std::vector<std::uint8_t> salt = {'R', 'T', 'P', 'r', 'o', 't', 'e', 'c', 't', 'A', 'c', 't', 'i', 'v', 'a', 't', 'i', 'o', 'n', 'K', 'e', 'y'};
-  std::string info = "rtprotect/activation-token-store/v1";
-  auto derived = crypto::Hkdf::DeriveKey(sec_hwid, salt, info, crypto::kAes256KeyLen);
-  if (!derived.has_value()) return false;
-  auto enc_key = crypto::Aes256Key::FromBytes(derived->data(), derived->size());
-  if (!enc_key.has_value()) return false;
-
-  // Check if token already exists in local store
-  if (std::filesystem::exists(token_path)) {
-    auto file_bytes = tooling::ReadFile(token_path);
-    if (file_bytes.has_value()) {
-      auto msg = crypto::EncryptedMessage::Deserialize(file_bytes->data(), file_bytes->size());
-      if (msg.has_value()) {
-        crypto::AeadError err = crypto::AeadError::kNone;
-        auto plaintext = crypto::Decrypt(*enc_key, *msg, nullptr, 0, &err);
-        if (plaintext.has_value()) {
-          auto token_opt = DeserializeActivationToken(plaintext->data(), plaintext->size());
-          if (token_opt.has_value()) {
-            bool lic_match = false;
-            if (license_id.empty() || token_opt->license_id == license_id) {
-              lic_match = true;
-            }
+  auto existing = LoadActivationToken(product_id);
+  if (existing.has_value()) {
+    bool lic_match = false;
+    if (license_id.empty() || existing->license_id == license_id) {
+      lic_match = true;
+    }
 #if defined(RTPROTECT_DEV_BUILD) || !defined(NDEBUG)
-            else if ((license_id == "dev-license" || license_id.rfind("lic-dev-", 0) == 0) &&
-                     (token_opt->license_id == "dev-license" || token_opt->license_id.rfind("lic-dev-", 0) == 0)) {
-              lic_match = true;
-            }
+    else if ((license_id == "dev-license" || license_id.rfind("lic-dev-", 0) == 0) &&
+             (existing->license_id == "dev-license" || existing->license_id.rfind("lic-dev-", 0) == 0)) {
+      lic_match = true;
+    }
 #endif
-            if (lic_match) {
-              *out_token = *token_opt;
-              return true;
-            }
-          }
-        }
-      }
+    if (lic_match) {
+      *out_token = *existing;
+      return true;
     }
   }
 
-  // TODO(activation-server): replace with real /activate and /renew HTTP calls
+  // Generate a fresh development activation token bound to hardware ID
   ActivationToken dev_token;
   dev_token.schema_version = kActivationSchemaVersion;
   dev_token.license_id = license_id.empty() ? "dev-license" : license_id;
-  dev_token.device_fingerprint_hash = hwid;
+  dev_token.device_fingerprint_hash = GetLocalHardwareId();
 
   auto now = std::chrono::system_clock::now().time_since_epoch();
   std::uint64_t current_time = static_cast<std::uint64_t>(
@@ -566,14 +543,7 @@ bool LoadOrCreateDevToken(const std::string& product_id,
     return false;
   }
 
-  auto serialized = SerializeActivationToken(dev_token);
-  if (serialized.empty()) return false;
-
-  auto encrypted = crypto::Encrypt(*enc_key, serialized.data(), serialized.size());
-  if (!encrypted.has_value()) return false;
-
-  auto wire_bytes = encrypted->Serialize();
-  if (!tooling::WriteFile(token_path, wire_bytes.data(), wire_bytes.size())) {
+  if (!SaveActivationToken(product_id, dev_token)) {
     return false;
   }
 

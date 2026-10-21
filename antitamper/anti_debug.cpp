@@ -119,7 +119,7 @@ bool CheckDebuggerPresent() {
   // 3. Standard Win32 API check
   return ::IsDebuggerPresent() != 0;
 #else
-  // Layer 1: Check TracerPid in /proc/self/status
+  // Layer 1: Check TracerPid and State in /proc/self/status
   std::ifstream f("/proc/self/status");
   std::string line;
   while (f && std::getline(f, line)) {
@@ -128,7 +128,13 @@ bool CheckDebuggerPresent() {
         long pid = std::stol(line.substr(10));
         if (pid > 0) return true;
       } catch (...) {}
-      break;
+    } else if (line.rfind("State:", 0) == 0) {
+      // Check for 'T' (stopped) or 't' (tracing stop)
+      if (line.find("(tracing stop)") != std::string::npos ||
+          line.find(" T ") != std::string::npos ||
+          line.find(" t ") != std::string::npos) {
+        return true;
+      }
     }
   }
 
@@ -333,6 +339,41 @@ bool CheckMemoryTampered() {
       // 0xFF 0x25: 64-bit indirect jump [rip + disp32] (MinHook / Detours)
       if (p[0] == 0xFF && p[1] == 0x25) return true;
     }
+  }
+#else
+  // Linux: Scan /proc/self/maps for injected hooking frameworks or abnormal RWX memory segments
+  std::ifstream maps("/proc/self/maps");
+  std::string line;
+  while (maps && std::getline(maps, line)) {
+    // 1. Detect suspicious injected hooking frameworks (Frida, Substrate, Cydia, etc.)
+    static const char* const kSuspiciousLibs[] = {
+        "frida", "gadget", "substrate", "substitute", "cycript", "xposed"
+    };
+    for (const char* susp : kSuspiciousLibs) {
+      if (line.find(susp) != std::string::npos) {
+        return true;
+      }
+    }
+
+    // 2. Detect abnormal RWX (read-write-executable) memory segments indicative of hook stubs
+    if (line.size() > 20) {
+      auto perm_start = line.find(' ');
+      if (perm_start != std::string::npos && perm_start + 4 < line.size()) {
+        std::string perms = line.substr(perm_start + 1, 4);
+        if (perms.size() >= 3 && perms[0] == 'r' && perms[1] == 'w' && perms[2] == 'x') {
+          // Exclude stack / vsyscall if present
+          if (line.find("[stack") == std::string::npos) {
+            return true;
+          }
+        }
+      }
+    }
+  }
+
+  // 3. Detect active LD_PRELOAD injection
+  const char* ld_preload = std::getenv("LD_PRELOAD");
+  if (ld_preload && ld_preload[0] != '\0') {
+    return true;
   }
 #endif
   return false;

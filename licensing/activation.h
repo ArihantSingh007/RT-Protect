@@ -121,6 +121,9 @@ bool VerifyActivationTokenSignature(const ActivationToken& token, const integrit
 
 // Local activation token store path resolution and dev token loader/creator
 std::string GetActivationTokenPath(const std::string& product_id);
+bool SaveActivationToken(const std::string& product_id, const ActivationToken& token);
+std::optional<ActivationToken> LoadActivationToken(const std::string& product_id);
+bool DeleteActivationToken(const std::string& product_id);
 bool LoadOrCreateDevToken(const std::string& product_id,
                           const std::string& license_id,
                           ActivationToken* out_token);
