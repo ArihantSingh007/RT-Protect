@@ -31,6 +31,7 @@
 #include "licensing/license.h"
 #include "licensing/license_signer.h"
 #include "licensing/license_verifier.h"
+#include "licensing/activation.h"
 #include "licensing/hardware_id.h"
 #include "integrity/manifest.h"
 #include "integrity/signer.h"
@@ -728,12 +729,12 @@ void TestFunctionVirtualization() {
   assert(cfg->find("kAuthShard") == std::string::npos);
   assert(cfg->find("kAuthMask") == std::string::npos);
 
-  // Assert that release.manifest commits rtprotect_vm_root
+  // Assert that release.manifest does NOT commit rtprotect_vm_root (master secrets are not shipped in manifests)
   auto man_bytes = ReadFile((test_dir / "release.manifest").string());
   assert(man_bytes.has_value());
   auto man = rtprotect::integrity::DeserializeManifest(man_bytes->data(), man_bytes->size());
   assert(man.has_value());
-  assert(man->Find("rtprotect_vm_root") != nullptr);
+  assert(man->Find("rtprotect_vm_root") == nullptr);
 
   CleanDir(test_dir);
   std::printf("  PASSED: Function virtualization and tamper-bound wrapper generation verified.\n");
@@ -770,11 +771,12 @@ void TestFunctionVirtualizationExecutionRoundTrip() {
   // 4. Serialize compiled bytecode
   auto serialized = rtprotect::vm::Serialize(*prog);
 
-  // 5. Derive build master key and tamper-bound key
-  std::array<std::uint8_t, 32> manifest_vm_root{};
-  for (std::size_t i = 0; i < manifest_vm_root.size(); ++i) {
-    manifest_vm_root[i] = static_cast<std::uint8_t>(i ^ 0x7E);
-  }
+  // 5. Derive build master key from activation token vm_root and tamper-bound key
+  std::string product_id = "com.vendor.virtapp";
+  rtprotect::licensing::ActivationToken dev_token;
+  bool token_loaded = rtprotect::licensing::LoadOrCreateDevToken(product_id, "lic-virt-roundtrip", &dev_token);
+  assert(token_loaded);
+  auto vm_root = dev_token.vm_root;
 
   rtprotect::integrity::Ed25519PublicKey manifest_pubkey{};
   manifest_pubkey.fill(0x42);
@@ -784,8 +786,7 @@ void TestFunctionVirtualizationExecutionRoundTrip() {
     fn_salt[i] = static_cast<std::uint8_t>(i ^ 0xAA);
   }
 
-  std::string product_id = "com.vendor.virtapp";
-  auto master_key = DeriveBuildFunctionMasterKey(manifest_vm_root, manifest_pubkey, product_id, fn_salt.data(), fn_salt.size());
+  auto master_key = DeriveBuildFunctionMasterKey(vm_root, manifest_pubkey, product_id, fn_salt.data(), fn_salt.size());
   assert(master_key.has_value());
 
   rtprotect::antitamper::RiskAssessment clean_risk;
@@ -799,7 +800,7 @@ void TestFunctionVirtualizationExecutionRoundTrip() {
   // 7. Execute runtime decryption and execution pipeline (clean environment)
   rtprotect::antitamper::RiskAssessment runtime_risk;
   runtime_risk.risk_score = 0;
-  auto runtime_master_key = DeriveBuildFunctionMasterKey(manifest_vm_root, manifest_pubkey, product_id, fn_salt.data(), fn_salt.size());
+  auto runtime_master_key = DeriveBuildFunctionMasterKey(vm_root, manifest_pubkey, product_id, fn_salt.data(), fn_salt.size());
   assert(runtime_master_key.has_value());
 
   auto runtime_bound_key = rtprotect::antitamper::DeriveTamperBoundKey(*runtime_master_key, runtime_risk, "compute_auth");

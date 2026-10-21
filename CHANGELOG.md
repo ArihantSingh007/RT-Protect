@@ -50,10 +50,10 @@ This project adheres to Semantic Versioning and structured security reporting.
   - *Remediation:* Threaded `const OpcodeMap*` through `ProgramBuilder` and `CompileCSubset`. Added `RemapProgramOpcodes` to translate bytecode between arbitrary mappings. Fixed compiler control flow dead terminal jump emission when `then` branch terminates with `return`.
   - *Verification:* `test_opcode_map.cpp` (`OpcodeMap_RemapProgramOpcodes_TransformsAndExecutes`) and `test_integration_engine.cpp` (`TestFunctionVirtualizationExecutionRoundTrip`).
 
-- **Track D.2 — Manifest-Bound Virtualization Key Architecture (RTP-SEC-047):**
-  - *Location:* `tooling/integration_engine.cpp`, `rtprotect_config.h`, `rtprotect_runtime_glue.cpp`
-  - *Remediation:* Completely eliminated static master keys, shards (`kAuthShard`), and masks (`kAuthMask`) from `.rodata` and `rtprotect_config.h`. Implemented the Manifest-Bound Key Architecture: the 32-byte virtualization root secret (`rtprotect_vm_root`) is committed solely in `release.manifest` and authenticated by vendor Ed25519 signature `release.sig`. Keys are derived at runtime only upon signature verification.
-  - *Verification:* Verified in `test_integration_engine.cpp` (asserts absence of `kAuthShard`/`kAuthMask` in config and presence of `rtprotect_vm_root` in signed manifest).
+- **Track D.2 — Installation-Bound Activation Token Architecture (RTP-SEC-047):**
+  - *Location:* `licensing/activation.h`, `licensing/activation.cpp`, `licensing/activation_server.h`, `licensing/activation_server.cpp`, `tooling/integration_engine.cpp`, `rtprotect_runtime_glue.cpp`
+  - *Remediation:* Completely eliminated static master keys, shards (`kAuthShard`), and masks (`kAuthMask`) from `.rodata` and `rtprotect_config.h`, and eliminated `rtprotect_vm_root` from `release.manifest`. Implemented the Installation-Bound Activation Token Architecture: the 32-byte virtualization root secret (`vm_root`) is encapsulated within an `ActivationToken`, encrypted at rest using AES-256-GCM (`crypto::aead`) in local storage (`%LOCALAPPDATA%\RTProtect\` / `~/.config/rtprotect/`), and keyed from the local hardware ID via HKDF. Runtime verifies token existence and enforces temporal expiration (`token.expires_at < current_time`).
+  - *Verification:* Verified in `test_activation.cpp` (`ActivationToken_SerializationRoundTrip`, `ActivationToken_ExpiryCheck`, `ActivationToken_LoadOrCreateDevToken_PersistsAndEncrypts`) and `test_integration_engine.cpp` (asserts absence of `rtprotect_vm_root` in signed manifest and verifies VM execution round-trip).
 
 - **Track D.4 — Virtualized Memory Context Allocation & Fault Propagation (RTP-SEC-053):**
   - *Location:* `tooling/integration_engine.cpp`, `bytecode_vm/vm.cpp`
