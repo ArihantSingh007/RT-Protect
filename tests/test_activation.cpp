@@ -261,6 +261,7 @@ MT_TEST(ActivationToken_SerializationRoundTrip) {
   tok.server_nonce.fill(0x3C);
   tok.vm_root.fill(0x7E);
   tok.sequence_number = 42;
+  tok.signature.fill(0x55);
 
   auto bytes = SerializeActivationToken(tok);
   MT_CHECK(!bytes.empty());
@@ -276,9 +277,28 @@ MT_TEST(ActivationToken_SerializationRoundTrip) {
   MT_CHECK(parsed->server_nonce == tok.server_nonce);
   MT_CHECK(parsed->vm_root == tok.vm_root);
   MT_CHECK(parsed->sequence_number == tok.sequence_number);
+  MT_CHECK(parsed->signature == tok.signature);
 
   // Truncated data must fail closed
   MT_CHECK(!DeserializeActivationToken(bytes.data(), bytes.size() - 5).has_value());
+}
+
+MT_TEST(ActivationToken_SignAndVerify_Success) {
+  auto kp = MakeKeyPair();
+  ActivationToken tok;
+  tok.license_id = "lic-token-sign-test";
+  tok.device_fingerprint_hash = "HWID-SIGN-1234";
+  tok.issued_at = 1700000000;
+  tok.expires_at = 1700000000 + 14 * 86400;
+  tok.server_nonce.fill(0x11);
+  tok.vm_root.fill(0x22);
+
+  MT_CHECK(SignActivationToken(tok, kp.private_key));
+  MT_CHECK(VerifyActivationTokenSignature(tok, kp.public_key));
+
+  // Tampered signature must fail verification
+  tok.signature[0] ^= 0xFF;
+  MT_CHECK(!VerifyActivationTokenSignature(tok, kp.public_key));
 }
 
 MT_TEST(ActivationToken_ExpiryCheck) {

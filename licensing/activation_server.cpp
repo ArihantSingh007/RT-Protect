@@ -36,6 +36,15 @@ bool SignActivationTicket(ActivationTicket& ticket, const integrity::Ed25519Priv
   return true;
 }
 
+bool SignActivationToken(ActivationToken& token, const integrity::Ed25519PrivateKey& privkey) {
+  auto bytes_to_sign = SerializeActivationTokenForSigning(token);
+  if (bytes_to_sign.empty()) return false;
+  auto sig = integrity::SignManifestBytes(bytes_to_sign, privkey);
+  if (!sig.has_value()) return false;
+  token.signature = *sig;
+  return true;
+}
+
 void ActivationManager::RegisterLicense(const std::string& license_id, std::uint32_t max_concurrency) {
   std::lock_guard<std::mutex> lock(mutex_);
   licenses_[license_id] = RegisteredLicensePolicy{license_id, max_concurrency};

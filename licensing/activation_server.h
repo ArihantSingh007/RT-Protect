@@ -78,6 +78,9 @@ class ActivationManager {
 // Signs an activation ticket with the vendor Ed25519 private key
 bool SignActivationTicket(ActivationTicket& ticket, const integrity::Ed25519PrivateKey& privkey);
 
+// Signs an activation token with the vendor Ed25519 private key
+bool SignActivationToken(ActivationToken& token, const integrity::Ed25519PrivateKey& privkey);
+
 // Stand-alone activation authority stubs for device activation and token renewal.
 // Decoupled from networking, sockets, and curl.
 ActivationToken ActivateDevice(const std::string& license_key,

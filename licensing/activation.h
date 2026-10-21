@@ -109,11 +109,15 @@ struct ActivationToken {
   std::array<std::uint8_t, 32> server_nonce{};
   std::array<std::uint8_t, 32> vm_root{};
   std::uint64_t sequence_number = 1;
+  integrity::Ed25519Signature signature{};
 };
 
-// Activation token wire serialization / deserialization
+// Activation token wire serialization / deserialization / cryptographic verification
+std::vector<std::uint8_t> SerializeActivationTokenForSigning(const ActivationToken& token);
 std::vector<std::uint8_t> SerializeActivationToken(const ActivationToken& token);
 std::optional<ActivationToken> DeserializeActivationToken(const std::uint8_t* data, std::size_t len);
+
+bool VerifyActivationTokenSignature(const ActivationToken& token, const integrity::Ed25519PublicKey& pubkey);
 
 // Local activation token store path resolution and dev token loader/creator
 std::string GetActivationTokenPath(const std::string& product_id);

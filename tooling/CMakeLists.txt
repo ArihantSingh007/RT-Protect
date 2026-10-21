@@ -20,6 +20,14 @@ target_link_libraries(rtprotect-tool PRIVATE
 )
 rtprotect_strip_in_release(rtprotect-tool)
 
+add_executable(rtprotect-activation-server activation_server_main.cpp)
+target_include_directories(rtprotect-activation-server PRIVATE ${CMAKE_SOURCE_DIR})
+target_link_libraries(rtprotect-activation-server PRIVATE
+    rtprotect_tooling
+    rtprotect_licensing_buildtools
+)
+rtprotect_strip_in_release(rtprotect-activation-server)
+
 if(WIN32 AND EXISTS "${CMAKE_SOURCE_DIR}/third_party/openssl/bin")
   file(COPY "${CMAKE_SOURCE_DIR}/third_party/openssl/bin/libcrypto-3-x64.dll"
        DESTINATION "${CMAKE_CURRENT_BINARY_DIR}")
