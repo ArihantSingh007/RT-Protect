@@ -14,6 +14,7 @@
 #include <vector>
 
 #include "bytecode_vm/opcode.h"
+#include "bytecode_vm/program.h"
 
 namespace rtprotect::vm {
 
@@ -41,5 +42,11 @@ class OpcodeMap {
   std::array<std::uint8_t, 256> opcode_to_byte_{};
   std::array<std::int16_t, 256> byte_to_opcode_{};  // -1 if unmapped
 };
+
+// Remaps physical opcode bytes in program.code from src_map to dst_map.
+// Operands and constants are preserved unmodified. Returns nullopt if any byte is invalid.
+std::optional<Program> RemapProgramOpcodes(const Program& prog,
+                                           const OpcodeMap& src_map,
+                                           const OpcodeMap& dst_map);
 
 }  // namespace rtprotect::vm

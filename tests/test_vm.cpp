@@ -1,4 +1,5 @@
 #include "bytecode_vm/builder.h"
+#include "bytecode_vm/compiler.h"
 #include "bytecode_vm/serialize.h"
 #include "bytecode_vm/vm.h"
 
@@ -592,6 +593,162 @@ MT_TEST(Vm_Deserialize_MalformedInput_HandledSafely) {
   // 5. Trailing garbage is rejected
   serialized.push_back(0x99);
   MT_CHECK(!Deserialize(serialized.data(), serialized.size()).has_value());
+}
+
+// ---------------------------------------------------------------------
+// Memory operations & Subroutines (Track C VM Expansion)
+// ---------------------------------------------------------------------
+
+MT_TEST(Vm_Memory_LoadAndStore8) {
+  ProgramBuilder b(0);
+  // store8(addr=16, val=0xAB)
+  b.PushConst(16);
+  b.PushConst(0xAB);
+  b.StoreMem8();
+  // load8(addr=16)
+  b.PushConst(16);
+  b.LoadMem8();
+  b.Ret();
+
+  MemoryContext mem(256);
+  auto r = Run(b.Build(), {}, nullptr, &mem);
+  MT_CHECK(r.error == VmError::kNone);
+  MT_CHECK(r.value == 0xAB);
+  MT_CHECK(mem.data[16] == 0xAB);
+}
+
+MT_TEST(Vm_Memory_LoadAndStore64) {
+  ProgramBuilder b(0);
+  // store64(addr=32, val=0x1122334455667788LL)
+  b.PushConst(32);
+  b.PushConst(0x1122334455667788LL);
+  b.StoreMem64();
+  // load64(addr=32)
+  b.PushConst(32);
+  b.LoadMem64();
+  b.Ret();
+
+  MemoryContext mem(256);
+  auto r = Run(b.Build(), {}, nullptr, &mem);
+  MT_CHECK(r.error == VmError::kNone);
+  MT_CHECK(r.value == 0x1122334455667788LL);
+}
+
+MT_TEST(Vm_Memory_OutOfBounds_FaultsSafely) {
+  ProgramBuilder b(0);
+  b.PushConst(300); // Beyond 256 bytes
+  b.LoadMem8();
+  b.Ret();
+
+  MemoryContext mem(256);
+  auto r = Run(b.Build(), {}, nullptr, &mem);
+  MT_CHECK(r.error == VmError::kMemoryAccessOutOfBounds);
+}
+
+MT_TEST(Vm_Subroutine_CallAndRetSub) {
+  ProgramBuilder b(1); // 1 local
+  auto sub_lbl = b.NewLabel();
+
+  b.PushConst(10);
+  b.Call(sub_lbl);     // sub adds 5 to top of stack
+  b.StoreLocal(0);     // store 15 in local 0
+  b.PushLocal(0);
+  b.Ret();             // return 15
+
+  // Subroutine:
+  b.Mark(sub_lbl);
+  b.PushConst(5);
+  b.Add();
+  b.RetSub();
+
+  auto r = Run(b.Build(), {});
+  MT_CHECK(r.error == VmError::kNone);
+  MT_CHECK(r.value == 15);
+}
+
+// ---------------------------------------------------------------------
+// C-Subset Compiler
+// ---------------------------------------------------------------------
+
+MT_TEST(Vm_Compiler_BasicArithmetic) {
+  const std::string src =
+      "int64_t compute(int64_t a, int64_t b) {\n"
+      "    int64_t sum = a + b;\n"
+      "    return sum * 3;\n"
+      "}\n";
+
+  std::string err;
+  auto prog = CompileCSubset(src, &err);
+  MT_CHECK(prog.has_value());
+
+  auto r = Run(*prog, {4, 6});
+  MT_CHECK(r.error == VmError::kNone);
+  MT_CHECK(r.value == 30);
+}
+
+MT_TEST(Vm_Compiler_WhileLoop_Factorial) {
+  const std::string src =
+      "int64_t fact(int64_t n) {\n"
+      "    int64_t res = 1;\n"
+      "    while (n > 1) {\n"
+      "        res = res * n;\n"
+      "        n = n - 1;\n"
+      "    }\n"
+      "    return res;\n"
+      "}\n";
+
+  std::string err;
+  auto prog = CompileCSubset(src, &err);
+  MT_CHECK(prog.has_value());
+
+  auto r = Run(*prog, {5});
+  MT_CHECK(r.error == VmError::kNone);
+  MT_CHECK(r.value == 120); // 5! = 120
+}
+
+MT_TEST(Vm_Compiler_IfElse_Branches) {
+  const std::string src =
+      "int64_t clamp(int64_t x) {\n"
+      "    if (x < 0) {\n"
+      "        return 0;\n"
+      "    } else {\n"
+      "        if (x > 100) {\n"
+      "            return 100;\n"
+      "        }\n"
+      "    }\n"
+      "    return x;\n"
+      "}\n";
+
+  std::string err;
+  auto prog = CompileCSubset(src, &err);
+  MT_CHECK(prog.has_value());
+
+  MT_CHECK(Run(*prog, {-15}).value == 0);
+  MT_CHECK(Run(*prog, {55}).value == 55);
+  MT_CHECK(Run(*prog, {250}).value == 100);
+}
+
+MT_TEST(Vm_Compiler_MemoryOperations) {
+  const std::string src =
+      "int64_t test_mem(int64_t base) {\n"
+      "    store8(base, 0xFE);\n"
+      "    store64(base + 8, 0x123456789ABCDEF0);\n"
+      "    int64_t v8 = load8(base);\n"
+      "    int64_t v64 = load64(base + 8);\n"
+      "    if (v8 == 0xFE) {\n"
+      "        return v64;\n"
+      "    }\n"
+      "    return 0;\n"
+      "}\n";
+
+  std::string err;
+  auto prog = CompileCSubset(src, &err);
+  MT_CHECK(prog.has_value());
+
+  MemoryContext mem(512);
+  auto r = Run(*prog, {32}, nullptr, &mem);
+  MT_CHECK(r.error == VmError::kNone);
+  MT_CHECK(r.value == static_cast<std::int64_t>(0x123456789ABCDEF0ULL));
 }
 
 MT_MAIN()

@@ -5,6 +5,83 @@ This project adheres to Semantic Versioning and structured security reporting.
 
 ---
 
+## [2.3.0-hardened] - 2026-10-21
+
+### Security & Hardening Expansion (Comprehensive Audit Completion)
+
+- **Track A.1 — Hardware Fingerprint Hardening & Fallback Collision Elimination (RTP-SEC-041):**
+  - *Location:* `licensing/hardware_id.h`, `licensing/hardware_id.cpp`
+  - *Remediation:* Eliminated public deterministic fallback strings ("DefaultVolume", "Windows-Fallback-System-ID", "Linux-Fallback-Machine-ID", "DefaultHostname", "Generic-CPU-Architecture") that previously allowed sandboxed/container attackers to force identical hardware IDs across disparate machines.
+  - *Entropy Binding:* Implemented `GetOrCreateDeviceSeed()` generating a cryptographically secure 32-byte secret machine seed persisted in protected OS storage (`%LOCALAPPDATA%\RTProtect\device.seed` / `~/.config/rtprotect/device.seed`). Probing fallbacks now derive unique non-deterministic fallback entropy via `GenerateProbeFallbackEntropy()`.
+  - *Configurable Weights & Degraded Tracking:* Added `HardwareSimilarityWeights` (allowing custom CPU, storage, system GUID, and hostname weightings) and probe status tracking in `HardwareFingerprint` (`cpu_probed_successfully`, etc.).
+  - *Documentation:* Added comprehensive analysis of VM cloning and snapshot replication boundaries in `docs/LICENSING.md` §7.
+
+- **Track A.2 — Online Activation Ticket & Revocation Subsystem (RTP-SEC-042):**
+  - *Location:* `licensing/activation.h`, `licensing/activation.cpp`, `licensing/activation_server.h`, `licensing/activation_server.cpp`
+  - *Remediation:* Implemented a complete Denuvo-class online ticket subsystem enabling dynamic seat concurrency caps and instant server-side revocation.
+  - *Cryptographic Protocol:* Client generates `ActivationRequest` with a cryptographically random challenge nonce and hardware fingerprint. Vendor activation authority (`ActivationManager`) verifies revocation status and concurrency caps, generates a 32-byte session key, and issues a short-lived, Ed25519-signed `ActivationTicket`.
+  - *CLI Commands:* Added `rtprotect-tool activate-issue`, `activate-verify`, and `activate-revoke` to `tooling/main.cpp`.
+  - *Verification:* `test_activation.cpp` with 10 unit tests covering wire round-trip, signature validation, nonce replay protection, temporal expiration, dynamic seat enforcement, and JSON revocation export/import.
+
+- **Track B — De-Centralized Tamper Response & Cryptographic Key Poisoning (RTP-SEC-043):**
+  - *Location:* `antitamper/risk_policy.h`, `antitamper/risk_policy.cpp`
+  - *Remediation:* Eliminated the classic "single patchable boolean gate" vulnerability where `EnforceRiskPolicy()` relied on a centralized `std::exit(1)` easily NOPed by reverse engineers.
+  - *Tamper-Poisoned Key Derivation:* Implemented `DeriveRiskSalt()` and `DeriveTamperBoundKey(master, assessment, context)`. In a clean environment, HKDF derives the authentic key. If any debugging, hardware breakpoints (`DR0-DR3`), timing anomalies, or memory modifications are present, HKDF derives a poisoned key, causing subsequent AEAD authentication to fail or bytecode execution to desynchronize silently without any central branch to patch.
+  - *State Perturbation:* Implemented `DeriveTamperPerturbation()` and `ScatterTamperCheck()` for distributed state-accumulator poisoning.
+  - *Documentation Alignment:* Rewrote `docs/SECURITY_FIXES.md` §4 and §5 to eliminate contradictions and accurately reflect active anti-debugging and opcode map implementations.
+
+- **Track C — Bytecode VM Memory Opcodes, Subroutines & C-Subset Compiler (RTP-SEC-044):**
+  - *Location:* `bytecode_vm/opcode.h`, `bytecode_vm/verifier.cpp`, `bytecode_vm/vm.h`, `bytecode_vm/vm.cpp`, `bytecode_vm/builder.h`, `bytecode_vm/compiler.h`, `bytecode_vm/compiler.cpp`
+  - *Remediation:* Expanded the VM instruction set with memory-indexed operations (`kLoadMem8`, `kStoreMem8`, `kLoadMem64`, `kStoreMem64`) and subroutine control flow (`kCall`, `kRetSub`).
+  - *Memory Context:* Added `MemoryContext` to `vm::Run()` supporting isolated heap/scratch buffer execution with boundary checking (`kMemoryAccessOutOfBounds`).
+  - *C-Subset Compiler:* Implemented a recursive-descent C-subset compiler translating C functions with arithmetic, bitwise operators, local variables, memory indexing (`load8`, `store8`, `load64`, `store64`), conditionals (`if/else`), and loops (`while`) directly into verified `Program` instances.
+  - *Verification:* Expanded `tests/test_vm.cpp` with comprehensive test coverage for memory load/store 8/64, call/return subroutines, while loops, branching, and arithmetic expressions.
+
+- **Track D — Intelligent Integration Engine & Function Virtualization (RTP-SEC-045):**
+  - *Location:* `tooling/integration_engine.h`, `tooling/integration_engine.cpp`
+  - *Per-Build Opcode Permutation:* Build integration generates a random 32-bit seed (`kBuildOpcodeSeed`) embedded in `rtprotect_config.h`, activating `OpcodeMap::FromSeed()` for every protected binary.
+  - *Automated Function Virtualization:* During project integration, candidate functions tagged with `RTPROTECT_VIRTUALIZE` are automatically compiled via `CompileCSubset`, encrypted under a tamper-bound key (`DeriveTamperBoundKey`), and wrapped in a C++ runner executing through the build's permuted VM mapping.
+  - *String Obfuscation & Scattered Checks:* Added automated transformation for `OBFUSCATED_STRING` and injected scattered anti-tamper checkpoints.
+  - *Execution Reporting:* Extended `IntegrationReport::ToJson()` with `virtualized_functions`, `obfuscated_string_count`, `scattered_check_count`, and `opcode_seed`.
+  - *Verification:* Added `TestPerBuildOpcodeSeeding`, `TestFunctionVirtualization`, and `TestDetailedJsonReporting` in `tests/test_integration_engine.cpp`.
+
+- **Track D.1 — Opcode Map Permutation Virtualization Synchronization (RTP-SEC-046):**
+  - *Location:* `bytecode_vm/builder.h`, `bytecode_vm/compiler.cpp`, `bytecode_vm/compiler.h`, `bytecode_vm/opcode_map.h`, `tooling/integration_engine.cpp`
+  - *Remediation:* Threaded `const OpcodeMap*` through `ProgramBuilder` and `CompileCSubset`. Added `RemapProgramOpcodes` to translate bytecode between arbitrary mappings. Fixed compiler control flow dead terminal jump emission when `then` branch terminates with `return`.
+  - *Verification:* `test_opcode_map.cpp` (`OpcodeMap_RemapProgramOpcodes_TransformsAndExecutes`) and `test_integration_engine.cpp` (`TestFunctionVirtualizationExecutionRoundTrip`).
+
+- **Track D.2 — Plaintext Virtualization Master Key Elimination & Dynamic Derivation (RTP-SEC-047):**
+  - *Location:* `tooling/integration_engine.cpp`, `rtprotect_config.h`
+  - *Remediation:* Eliminated raw 32-byte `master_key` arrays (`s_master[]`) from generated C++ source and `.rodata`. Implemented compile-time XOR sharding (`kAuthShard0..3 ^ kAuthMask0..3`) in `rtprotect_config.h` and per-function HKDF key derivation via `kManifestPublicKey` and `s_fn_salt`.
+  - *Verification:* Added assertion in `test_integration_engine.cpp` ensuring `s_master` is absent from all generated client wrappers.
+
+- **Track E.1 — Multi-Layer Unhookable Anti-Debugging & Direct PEB/Kernel Inspection (RTP-SEC-048):**
+  - *Location:* `antitamper/anti_debug.h`, `antitamper/anti_debug.cpp`
+  - *Remediation:* Implemented direct inline assembly inspection (`gs:0x60` / `fs:0x30`) checking `BeingDebugged` and `NtGlobalFlag` (`0x70`), bypassing Win32 user-mode hooks on `IsDebuggerPresent`. Added dynamic kernel querying via `NtQueryInformationProcess` checking `ProcessDebugPort` (7) and `ProcessDebugObjectHandle` (30).
+  - *Verification:* `test_antitamper.cpp`.
+
+- **Track E.2 — Memory Tamper & Inline Hook Detection with Background Watchdog (RTP-SEC-049):**
+  - *Location:* `antitamper/anti_debug.h`, `antitamper/anti_debug.cpp`, `antitamper/risk_policy.cpp`
+  - *Remediation:* Implemented `CheckMemoryTampered()` inspecting entry-point bytes of critical Win32 security APIs for software breakpoints (`0xCC` INT 3) and trampoline hooks (`0xE9`, `0xFF 0x25`). Added background hardware breakpoint watchdog (`StartHardwareBreakpointWatchdog` / `StopHardwareBreakpointWatchdog`) with process-wide thread snapshot scanning (`ScanProcessThreadsForHardwareBreakpoints`).
+  - *Verification:* `test_antitamper.cpp` (`AntiTamper_MemoryTamperCheck_CleanBinary_DoesNotTrigger`, `AntiTamper_Watchdog_StartsAndStopsCleanly`, `AntiTamper_ScatterTamperCheck_CleanState_PreservesAccumulator`).
+
+- **Track F.1 — Degraded Hardware License Enforcement (RTP-SEC-050):**
+  - *Location:* `licensing/license_verifier.h`, `licensing/license_verifier.cpp`
+  - *Remediation:* Added `reject_degraded_hardware` option and `kHardwareDegraded` status in `LicenseVerifier` to evaluate `HardwareFingerprint::is_degraded()` and reject licenses when operating in degraded fallback mode.
+  - *Verification:* `test_license.cpp`.
+
+- **Track F.2 — Non-Volatile Hardware Seed Concurrency Resilience (RTP-SEC-051):**
+  - *Location:* `licensing/hardware_id.cpp`
+  - *Remediation:* Added re-read fallback on write collisions in `GetOrCreateDeviceSeed()` to resolve concurrent initialization races. Added non-volatile hardware attribute hashing for read-only filesystem environments.
+  - *Verification:* `test_hardware_id.cpp`.
+
+- **Track D.3 — Comment/String-Aware Lexical Extraction for Source Virtualizer (RTP-SEC-052):**
+  - *Location:* `tooling/integration_engine.cpp`
+  - *Remediation:* Implemented a lexical scanner state machine ignoring `{` and `}` braces within single-line comments (`//`), block comments (`/* ... */`), double-quoted strings, and character literals during function boundary discovery.
+  - *Verification:* `test_integration_engine.cpp` (`TestFunctionExtractionHandlesCommentsAndStrings`).
+
+---
+
 ## [2.2.0-hardened] - 2026-10-20
 
 ### Security & Hardening Remediations (Audit WIP 3)

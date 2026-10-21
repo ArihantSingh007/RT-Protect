@@ -3,6 +3,7 @@ add_library(rtprotect_vm STATIC
     vm.cpp
     serialize.cpp
     opcode_map.cpp
+    compiler.cpp
 )
 
 target_include_directories(rtprotect_vm PUBLIC

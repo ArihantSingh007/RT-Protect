@@ -16,6 +16,9 @@ const char* ToString(VmError error) {
     case VmError::kArithmeticOverflow: return "arithmetic operation would overflow int64_t";
     case VmError::kInstructionBudgetExceeded: return "instruction budget exceeded (possible infinite loop)";
     case VmError::kWrongNumberOfArgs: return "argument count exceeds declared locals";
+    case VmError::kMemoryAccessOutOfBounds: return "memory access out of bounds";
+    case VmError::kCallStackOverflow: return "subroutine call stack overflow";
+    case VmError::kCallStackUnderflow: return "return from subroutine without call frame";
   }
   return "unknown VmError";
 }
@@ -30,7 +33,8 @@ std::uint16_t ReadU16(const std::uint8_t* p) {
 
 RunResult Run(const Program& program,
               const std::vector<std::int64_t>& args,
-              const OpcodeMap* opcode_map) {
+              const OpcodeMap* opcode_map,
+              MemoryContext* mem_ctx) {
   RunResult result;
 
   VerifyError verr = VerifyError::kNone;
@@ -73,6 +77,7 @@ RunResult Run(const Program& program,
   const auto& code = program.code;
   std::size_t pc = 0;
   std::uint64_t executed = 0;
+  std::vector<std::size_t> call_stack;
 
   while (true) {
     if (executed >= kMaxExecutedInstructions) {
@@ -301,6 +306,103 @@ RunResult Run(const Program& program,
         result.value = a;
         result.instructions_executed = executed;
         return result;
+      }
+      case Opcode::kLoadMem8: {
+        if (!pop(&a)) {
+          result.error = VmError::kStackUnderflow;
+          result.instructions_executed = executed;
+          return result;
+        }
+        if (!mem_ctx || a < 0 || static_cast<std::size_t>(a) >= mem_ctx->data.size()) {
+          result.error = VmError::kMemoryAccessOutOfBounds;
+          result.instructions_executed = executed;
+          return result;
+        }
+        std::uint8_t byte_val = mem_ctx->data[static_cast<std::size_t>(a)];
+        if (!push(static_cast<std::int64_t>(byte_val))) {
+          result.error = VmError::kStackOverflow;
+          result.instructions_executed = executed;
+          return result;
+        }
+        break;
+      }
+      case Opcode::kStoreMem8: {
+        if (!pop(&b) || !pop(&a)) {
+          result.error = VmError::kStackUnderflow;
+          result.instructions_executed = executed;
+          return result;
+        }
+        // b = val, a = addr
+        if (!mem_ctx || a < 0 || static_cast<std::size_t>(a) >= mem_ctx->data.size()) {
+          result.error = VmError::kMemoryAccessOutOfBounds;
+          result.instructions_executed = executed;
+          return result;
+        }
+        mem_ctx->data[static_cast<std::size_t>(a)] = static_cast<std::uint8_t>(b & 0xFF);
+        break;
+      }
+      case Opcode::kLoadMem64: {
+        if (!pop(&a)) {
+          result.error = VmError::kStackUnderflow;
+          result.instructions_executed = executed;
+          return result;
+        }
+        if (!mem_ctx || a < 0 || static_cast<std::size_t>(a) + 8 > mem_ctx->data.size()) {
+          result.error = VmError::kMemoryAccessOutOfBounds;
+          result.instructions_executed = executed;
+          return result;
+        }
+        std::uint64_t uval = 0;
+        const std::uint8_t* p = &mem_ctx->data[static_cast<std::size_t>(a)];
+        for (int k = 0; k < 8; ++k) {
+          uval |= (static_cast<std::uint64_t>(p[k]) << (k * 8));
+        }
+        std::int64_t val = static_cast<std::int64_t>(uval);
+        if (!push(val)) {
+          result.error = VmError::kStackOverflow;
+          result.instructions_executed = executed;
+          return result;
+        }
+        break;
+      }
+      case Opcode::kStoreMem64: {
+        if (!pop(&b) || !pop(&a)) {
+          result.error = VmError::kStackUnderflow;
+          result.instructions_executed = executed;
+          return result;
+        }
+        // b = val, a = addr
+        if (!mem_ctx || a < 0 || static_cast<std::size_t>(a) + 8 > mem_ctx->data.size()) {
+          result.error = VmError::kMemoryAccessOutOfBounds;
+          result.instructions_executed = executed;
+          return result;
+        }
+        std::uint64_t uval = static_cast<std::uint64_t>(b);
+        std::uint8_t* p = &mem_ctx->data[static_cast<std::size_t>(a)];
+        for (int k = 0; k < 8; ++k) {
+          p[k] = static_cast<std::uint8_t>((uval >> (k * 8)) & 0xFF);
+        }
+        break;
+      }
+      case Opcode::kCall: {
+        if (call_stack.size() >= 64) {
+          result.error = VmError::kCallStackOverflow;
+          result.instructions_executed = executed;
+          return result;
+        }
+        call_stack.push_back(next_pc);
+        next_pc = ReadU16(operand);
+        break;
+      }
+      case Opcode::kRetSub: {
+        if (call_stack.empty()) {
+          result.error = VmError::kCallStackUnderflow;
+          result.instructions_executed = executed;
+          return result;
+        }
+        next_pc = call_stack.back();
+        call_stack.pop_back();
+        break;
       }
     }
 

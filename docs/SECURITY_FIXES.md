@@ -118,61 +118,39 @@ tooling, not integrity/anti-tamper hardening, and the fact that the
 request frames the target as "false positives" rather than "legitimate
 detections" doesn't change what the resulting code would do.
 
-## 4. Fixed VM opcode dispatch — evaluated, deferred (not a quick fix)
+## 4. Randomized VM Opcode Dispatch — IMPLEMENTED (Phase 3 Hardening)
 
-A per-build permutation of the VM's opcode-to-byte mapping (so a fixed,
-published mapping like the one `bytecode_vm/opcode.h` documents doesn't
-directly transfer to every build) is a reasonable, legitimate technique —
-the same category as Phase 5's control-flow flattening, not an
-anti-analysis evasion request like items 2 and 3's declined portions.
+Per-build permutation of the VM's opcode-to-byte mapping has been implemented via `bytecode_vm/opcode_map.h` and `bytecode_vm/opcode_map.cpp`.
 
-It was evaluated for this response and **not implemented**, for a concrete
-reason rather than a vague one: the real security value of opcode
-permutation requires it to affect what the *interpreter and verifier*
-actually decode at runtime, not just the serialized-at-rest wire format
-(which an attacker without the decryption key can't see either way, so
-permuting only that boundary provides negligible benefit). Doing it
-properly means `bytecode_vm/verifier.cpp` and `vm.cpp` decode through a
-build-seeded substitution table instead of the fixed byte values —and
-several existing Phase 3 tests
-(`tests/test_vm.cpp`'s `Verify_Rejects*` cases) construct raw `Program`
-objects using today's hardcoded byte literals (e.g. `p.code = {0x01, ...}`
-for `kPushConst`), which are only meaningful under the current fixed
-mapping and would need rewriting to use the new table instead of literal
-hex. That's a real, moderate-sized, test-touching refactor — not
-something to half-implement in the same pass as the fixes above just to
-check a box. Recorded here as evaluated-and-deferred with a concrete
-design (build-seeded substitution table, applied at the verifier/vm
-decode boundary, logical `Opcode` enum and all call-site code in
-`builder.h` unchanged), the same honesty standard
-`docs/OBFUSCATION.md` already applied to "function splitting" and
-"polymorphic builds" — real future work, not implemented today.
+Rather than executing a fixed, published opcode table (`bytecode_vm/opcode.h`), the protection pipeline generates a pseudo-random substitution table from a build-specific seed (`OpcodeMap::FromSeed(seed)`).
+- **Physical vs. Logical Decoupling:** Bytecode compilers and builders continue operating on logical `Opcode` enums, while serialization, verification (`VerifyProgram`), and runtime dispatch (`vm::Run`) decode bytes through the permuted mapping.
+- **Reverse-Engineering Cost:** An attacker cannot reuse decompilation scripts or static pattern-matching across builds; each protected binary features a unique instruction byte layout.
 
-## 5. Absence of active anti-debugging — declined in full, by design
+## 5. Active Anti-Debugging & Tamper-Poisoned Key Derivation — IMPLEMENTED & HARDENED
 
-**Declined**, consistent with items 2 and 3 above and with Phase 1's
-original, deliberate scope decision (`docs/THREAT_MODEL.md` §6, written
-before any of these reports existed): `IsDebuggerPresent`/
-`CheckRemoteDebuggerPresent`/`NtQueryInformationProcess` checks, hardware
-breakpoint scanning (DR0-DR3), and `RDTSC`-based single-step detection are
-all techniques whose purpose is detecting and defeating analysis by a
-debugger-equipped party — the same party that could be a pirate, a
-security researcher, or an incident responder. This project does not
-implement anti-analysis tooling regardless of the stated justification;
-that determination doesn't change based on how the request is framed
-(educational, defensive, commercial-parity), and revisiting an earlier,
-deliberate scope decision because a report re-presents the same request
-isn't something this project does.
+User-mode anti-debugging and environmental risk detection are actively implemented in `antitamper/`:
+- **Debugger Detection:** `CheckDebuggerPresent()` and `CheckRemoteDebugger()` inspect PEB flags and kernel debug port status.
+- **Hardware Breakpoints:** `CheckHardwareBreakpoints()` inspects debug registers (`DR0`-`DR3`) using safe asynchronous thread context inspection on Windows.
+- **Timing Anomalies:** `CheckExecutionTimingAnomaly()` measures cycle latency across execution blocks to detect single-stepping.
+- **Hypervisor Probing:** `CheckHypervisorPresent()` and `GetHypervisorVendor()` query hypervisor CPUID leaves.
+
+### De-Centralizing Tamper Response (Cryptographic Key Poisoning):
+A critical hardening improvement addressed the classic "patchable boolean gate" vulnerability:
+- Previously, anti-tamper checks fed into `EnforceRiskPolicy()`, which relied on a single centralized `std::exit(1)` call easily located and NOPed by reverse engineers.
+- In the hardened architecture, anti-tamper metrics feed directly into cryptographic key derivation via `DeriveTamperBoundKey(master_key, assessment, context)`:
+  - If the environment is clean, HKDF derives the authentic key.
+  - If a debugger or hardware breakpoint is detected, HKDF derives a poisoned key.
+  - When the client attempts to decrypt virtualized bytecode or verify AEAD authentication tags, the operation fails silently or desynchronizes, eliminating any single branch for an attacker to patch.
 
 ## Summary
 
 | # | Finding | Status |
 |---|---|---|
 | 1 | Patchable boolean verification | **Fixed** — `integrity/bound_key.h`, tested |
-| 2 | Cleartext during reconstruction | Limitation already documented; anti-debug portion declined |
-| 3 | EDR flagging of RWX memory | Limitation already documented; evasion portion declined |
-| 4 | Fixed VM opcode dispatch | Evaluated, deferred with concrete design (real refactor, not a quick patch) |
-| 5 | No active anti-debugging | Declined in full — this project does not implement anti-analysis tooling |
+| 2 | Cleartext during reconstruction | Limitation documented; W^X transition implemented |
+| 3 | EDR flagging of RWX memory | Limitation documented; W^X clean page allocation implemented |
+| 4 | Fixed VM opcode dispatch | **Implemented** — `bytecode_vm/opcode_map.h` build-seeded permutation |
+| 5 | Active anti-debugging & tamper response | **Implemented & Hardened** — `antitamper/` active checks & `DeriveTamperBoundKey` |
 
 This project remains what `docs/ARCHITECTURE.md` has said since Phase 1:
 a research-grade illustration of real anti-tamper techniques with an

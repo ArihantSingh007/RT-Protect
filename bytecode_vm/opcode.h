@@ -56,6 +56,16 @@ enum class Opcode : std::uint8_t {
 
   // --- termination ---
   kRet = 0x50,  // no operand. Pop a, halt execution, a is the function's result.
+
+  // --- memory operations ---
+  kLoadMem8 = 0x60,   // no operand. Pop addr; push (uint64_t)memory[addr].
+  kStoreMem8 = 0x61,  // no operand. Pop val, pop addr; memory[addr] = (uint8_t)val.
+  kLoadMem64 = 0x62,  // no operand. Pop addr; push 64-bit int from memory[addr..addr+7].
+  kStoreMem64 = 0x63, // no operand. Pop val, pop addr; memory[addr..addr+7] = (uint64_t)val.
+
+  // --- subroutines ---
+  kCall = 0x70,    // operand: u16 absolute byte offset. Push return_pc to call_stack; jump to target.
+  kRetSub = 0x71,  // no operand. Pop return_pc from call_stack; jump to return_pc.
 };
 
 // Returns the number of operand bytes following the opcode byte (0, 1, or 2).
@@ -67,6 +77,7 @@ inline int OperandBytes(Opcode op) {
     case Opcode::kJmp:
     case Opcode::kJz:
     case Opcode::kJnz:
+    case Opcode::kCall:
       return 2;
     case Opcode::kPushLocal:
     case Opcode::kStoreLocal:
@@ -86,6 +97,11 @@ inline int OperandBytes(Opcode op) {
     case Opcode::kCmpLt:
     case Opcode::kCmpGt:
     case Opcode::kRet:
+    case Opcode::kLoadMem8:
+    case Opcode::kStoreMem8:
+    case Opcode::kLoadMem64:
+    case Opcode::kStoreMem64:
+    case Opcode::kRetSub:
       return 0;
   }
   return -1;
@@ -100,6 +116,9 @@ inline bool IsValidOpcode(std::uint8_t byte) {
     case Opcode::kCmpEq: case Opcode::kCmpLt: case Opcode::kCmpGt:
     case Opcode::kJmp: case Opcode::kJz: case Opcode::kJnz:
     case Opcode::kRet:
+    case Opcode::kLoadMem8: case Opcode::kStoreMem8:
+    case Opcode::kLoadMem64: case Opcode::kStoreMem64:
+    case Opcode::kCall: case Opcode::kRetSub:
       return true;
   }
   return false;

@@ -46,4 +46,21 @@ MT_TEST(HardwareId_ComputeHardwareSimilarity_MultipleComponentsChanged_FailsThre
   MT_CHECK(!VerifyHardwareMatch(id_a, id_b, 0.75));
 }
 
+MT_TEST(HardwareId_ConfigurableWeights_AdjustsProportionally) {
+  std::string id_a = "CPU1:STOR1:SYS1:HOST1-COMPO";
+  std::string id_b = "CPU1:STOR2:SYS2:HOST2-COMPO";
+
+  HardwareSimilarityWeights custom;
+  custom.cpu_weight = 0.80;
+  custom.storage_weight = 0.10;
+  custom.system_weight = 0.05;
+  custom.host_weight = 0.05;
+  custom.min_match_score = 0.70;
+
+  double score = ComputeHardwareSimilarity(id_a, id_b, &custom);
+  // CPU (0.80) matches out of total 1.0 = 0.80
+  MT_CHECK(score >= 0.79 && score <= 0.81);
+  MT_CHECK(VerifyHardwareMatch(id_a, id_b, 0.70, &custom));
+}
+
 MT_MAIN()

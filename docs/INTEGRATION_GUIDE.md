@@ -168,3 +168,54 @@ rtprotect-tool.exe license-generate `
     --expires-in-days 365
 ```
 Deliver `enterprise.license` to the client. The client binary verifies the edition and capabilities against the vendor's embedded public key.
+
+---
+
+## 8. Function Virtualization & Clang LibTooling Migration Roadmap
+
+### 8.1 Current Automated Virtualization Architecture
+RTProtect includes an integrated C-subset compiler (`bytecode_vm/compiler.h`) and source transformation pipeline (`tooling/integration_engine.cpp`) that automatically converts annotated functions into encrypted VM bytecode:
+
+1. **Tagging:** Functions marked with `RTPROTECT_VIRTUALIZE` (or `int fn(params) /* RTPROTECT_VIRTUALIZE */`) are extracted during the `integrate` workflow.
+2. **Lexical State Machine:** Source scanning uses a comment- and string-aware state machine to accurately extract function signatures and bodies without being fooled by braces `{}` inside string literals or comments.
+3. **Bytecode Compilation:** The body is parsed by a recursive-descent compiler supporting arithmetic, bitwise operators, local variables, conditional branching (`if/else`), iterative loops (`while`), subroutines (`call/ret`), and direct memory indexing (`load8`, `store8`, `load64`, `store64`).
+4. **Opcode Permutation:** Bytecode instructions are emitted using per-build randomized opcode maps (`OpcodeMap::FromSeed(kBuildOpcodeSeed)`), rendering universal bytecode decompilers ineffective across different builds.
+5. **Tamper-Bound Encryption:** The compiled bytecode is encrypted with AES-256-GCM using keys derived from HKDF-HMAC-SHA256 (`DeriveTamperBoundKey`). If debuggers, hooks, or timing anomalies are detected, the derived key is poisoned, producing silent execution failure.
+6. **Master Key Protection:** Sharded compile-time XOR secrets (`kAuthShard0..3 ^ kAuthMask0..3`) and per-function salts ensure zero plaintext master keys reside in `.rodata`.
+
+### 8.2 Migration Path to Clang LibTooling for Enterprise Deployments
+For large enterprise codebases with extensive C++20 features, complex macro expansions, templates, and classes, RTProtect provides an architectural roadmap to migrate from the current source-level regex/lexical extractor to a dedicated Clang LibTooling frontend:
+
+```mermaid
+flowchart LR
+    A["CMake Build Database<br/>(compile_commands.json)"] --> B["Clang Tooling Runner<br/>(clang::tooling::ClangTool)"]
+    B --> C["AST Matcher<br/>(functionDecl with attribute)"]
+    C --> D["AST Semantic Visitor<br/>(clang::RecursiveASTVisitor)"]
+    D --> E["IR Generator<br/>(rtprotect::vm::ProgramBuilder)"]
+    E --> F["Source Rewriter<br/>(clang::Rewriter)"]
+```
+
+#### Step 1: Compilation Database Integration
+Enterprise builds generate `compile_commands.json` by adding `set(CMAKE_EXPORT_COMPILE_COMMANDS ON)` in CMake. The Clang tool consumes this database to parse translation units with exact include paths, preprocessor definitions, and compiler flags identical to the production build.
+
+#### Step 2: C++ AST Matchers
+Replace regex markers with standard C++ attributes or annotations:
+```cpp
+[[clang::annotate("rtprotect_virtualize")]]
+int CalculateSecretAlgorithm(int a, int b) { ... }
+```
+A Clang AST Matcher locates targeted declarations reliably across complex header inclusion hierarchies:
+```cpp
+auto matcher = functionDecl(hasAttr(attr::AnnotateAttr), hasName("rtprotect_virtualize")).bind("virt_fn");
+```
+
+#### Step 3: Semantic AST Lowering to VM IR
+Rather than compiling from text, a custom `clang::RecursiveASTVisitor` traverses the resolved Clang `Stmt` and `Expr` AST nodes:
+- `BinaryOperator` (`+`, `-`, `*`, `/`, `^`, `&`, `|`) maps directly to `ProgramBuilder::EmitAdd()`, `EmitSub()`, etc.
+- `DeclRefExpr` and `VarDecl` resolve typed stack offsets without variable name collisions.
+- `IfStmt` and `WhileStmt` translate control flow into label jumps (`EmitJz`, `EmitJmp`) with guaranteed type checking and constant propagation.
+- Pointer dereferences (`*ptr`, `ptr[idx]`) map directly to `EmitLoadMem8` / `EmitStoreMem64` with compiler-verified bounds checks.
+
+#### Step 4: Automated Code Replacement via `clang::Rewriter`
+`clang::Rewriter` replaces the original function body with the encrypted bytecode blob and client VM runner (`rtprotect::vm::Run`), leaving outer function prototypes, calling conventions, and ABI linkages completely intact.
+

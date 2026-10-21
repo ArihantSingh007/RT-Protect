@@ -21,13 +21,15 @@
 #include <vector>
 
 #include "bytecode_vm/opcode.h"
+#include "bytecode_vm/opcode_map.h"
 #include "bytecode_vm/program.h"
 
 namespace rtprotect::vm {
 
 class ProgramBuilder {
  public:
-  explicit ProgramBuilder(std::uint8_t num_locals) : num_locals_(num_locals) {}
+  explicit ProgramBuilder(std::uint8_t num_locals, const OpcodeMap* opcode_map = nullptr)
+      : num_locals_(num_locals), opcode_map_(opcode_map) {}
 
   using Label = int;
 
@@ -70,6 +72,13 @@ class ProgramBuilder {
   void Jnz(Label l) { EmitJumpPlaceholder(Opcode::kJnz, l); }
   void Ret() { EmitNoOperand(Opcode::kRet); }
 
+  void LoadMem8() { EmitNoOperand(Opcode::kLoadMem8); }
+  void StoreMem8() { EmitNoOperand(Opcode::kStoreMem8); }
+  void LoadMem64() { EmitNoOperand(Opcode::kLoadMem64); }
+  void StoreMem64() { EmitNoOperand(Opcode::kStoreMem64); }
+  void Call(Label l) { EmitJumpPlaceholder(Opcode::kCall, l); }
+  void RetSub() { EmitNoOperand(Opcode::kRetSub); }
+
   Program Build() {
     // Patch every jump placeholder now that all labels are bound.
     for (const auto& [code_offset, label] : jump_fixups_) {
@@ -90,27 +99,32 @@ class ProgramBuilder {
  private:
   struct Position { static constexpr std::size_t kUnbound = SIZE_MAX; };
 
-  void EmitNoOperand(Opcode op) { code_.push_back(static_cast<std::uint8_t>(op)); }
+  std::uint8_t EncodeOp(Opcode op) const {
+    return opcode_map_ ? opcode_map_->Encode(op) : static_cast<std::uint8_t>(op);
+  }
+
+  void EmitNoOperand(Opcode op) { code_.push_back(EncodeOp(op)); }
 
   void EmitU8(Opcode op, std::uint8_t operand) {
-    code_.push_back(static_cast<std::uint8_t>(op));
+    code_.push_back(EncodeOp(op));
     code_.push_back(operand);
   }
 
   void EmitU16(Opcode op, std::uint16_t operand) {
-    code_.push_back(static_cast<std::uint8_t>(op));
+    code_.push_back(EncodeOp(op));
     code_.push_back(static_cast<std::uint8_t>(operand & 0xFF));
     code_.push_back(static_cast<std::uint8_t>((operand >> 8) & 0xFF));
   }
 
   void EmitJumpPlaceholder(Opcode op, Label l) {
-    code_.push_back(static_cast<std::uint8_t>(op));
+    code_.push_back(EncodeOp(op));
     jump_fixups_.push_back({code_.size(), l});
     code_.push_back(0);  // patched in Build()
     code_.push_back(0);
   }
 
   std::uint8_t num_locals_;
+  const OpcodeMap* opcode_map_ = nullptr;
   std::vector<std::uint8_t> code_;
   std::vector<std::int64_t> constants_;
   std::vector<std::size_t> labels_;  // label -> bound position, or kUnbound

@@ -41,6 +41,7 @@ enum class LicenseStatus {
   kExpired,
   kNotYetValid,             // System time earlier than issued_at
   kHardwareMismatch,
+  kHardwareDegraded,        // Hardware probe failed under strict policy
   kProductMismatch,
   kEditionMismatch,
   kClockRollbackDetected,

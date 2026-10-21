@@ -9,6 +9,8 @@ target_link_libraries(rtprotect_tooling PUBLIC
     rtprotect_licensing
     rtprotect_licensing_buildtools
     rtprotect_antitamper
+    rtprotect_vm
+    rtprotect_obfuscation
 )
 
 add_executable(rtprotect-tool main.cpp)

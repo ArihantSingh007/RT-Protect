@@ -59,6 +59,12 @@ LicenseStatus VerifyLicense(const License& lic,
     if (ctx.current_hardware_id.empty()) {
       return LicenseStatus::kHardwareMismatch;
     }
+    if (ctx.reject_degraded_hardware) {
+      auto current_fp = GetLocalHardwareFingerprint();
+      if (current_fp.is_degraded()) {
+        return LicenseStatus::kHardwareDegraded;
+      }
+    }
     if (!VerifyHardwareMatch(lic.hardware_id, ctx.current_hardware_id, ctx.min_hw_match_score)) {
       return LicenseStatus::kHardwareMismatch;
     }

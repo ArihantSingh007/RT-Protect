@@ -54,4 +54,66 @@ MT_TEST(AntiTamper_EnforcePolicy_Restrict_BlocksOnHighRisk) {
   MT_CHECK(!EnforceRiskPolicy(RiskAction::kRestrict, high_risk));
 }
 
+MT_TEST(AntiTamper_DeriveRiskSalt_DistinguishesCleanAndPoisoned) {
+  RiskAssessment clean;
+  clean.risk_score = 0;
+
+  RiskAssessment poisoned;
+  poisoned.debugger_present = true;
+  poisoned.risk_score = 40;
+
+  auto salt_clean = DeriveRiskSalt(clean);
+  auto salt_poisoned = DeriveRiskSalt(poisoned);
+
+  MT_CHECK(salt_clean.size() == 32);
+  MT_CHECK(salt_poisoned.size() == 32);
+  MT_CHECK(salt_clean != salt_poisoned);
+}
+
+MT_TEST(AntiTamper_DeriveTamperBoundKey_PerturbsKeyUnderTampering) {
+  auto master = rtprotect::crypto::Aes256Key::Generate();
+
+  RiskAssessment clean;
+  clean.risk_score = 0;
+
+  RiskAssessment tampered;
+  tampered.hardware_breakpoints_detected = true;
+  tampered.risk_score = 50;
+
+  auto key_clean = DeriveTamperBoundKey(master, clean, "virtualized-routine-1");
+  auto key_tampered = DeriveTamperBoundKey(master, tampered, "virtualized-routine-1");
+
+  // The keys must diverge: tamper poisons the derived key
+  MT_CHECK(std::memcmp(key_clean.bytes().data(), key_tampered.bytes().data(), 32) != 0);
+}
+
+MT_TEST(AntiTamper_DeriveTamperPerturbation_CleanIsZero) {
+  RiskAssessment clean;
+  clean.risk_score = 0;
+  MT_CHECK(DeriveTamperPerturbation(clean) == 0);
+
+  RiskAssessment tampered;
+  tampered.debugger_present = true;
+  tampered.risk_score = 40;
+  MT_CHECK(DeriveTamperPerturbation(tampered) != 0);
+}
+
+MT_TEST(AntiTamper_MemoryTamperCheck_CleanBinary_DoesNotTrigger) {
+  bool tampered = CheckMemoryTampered();
+  MT_CHECK(!tampered);
+}
+
+MT_TEST(AntiTamper_ScatterTamperCheck_CleanState_PreservesAccumulator) {
+  std::uint64_t acc = 0x1234567890ABCDEFULL;
+  ScatterTamperCheck("unit_test_checkpoint", &acc);
+  MT_CHECK(acc == 0x1234567890ABCDEFULL);
+}
+
+MT_TEST(AntiTamper_Watchdog_StartsAndStopsCleanly) {
+  StartHardwareBreakpointWatchdog(20);
+  MT_CHECK(!IsHardwareBreakpointDetected());
+  StopHardwareBreakpointWatchdog();
+  MT_CHECK(true);
+}
+
 MT_MAIN()

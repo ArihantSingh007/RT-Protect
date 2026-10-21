@@ -37,6 +37,13 @@
 #include "integrity/verifier.h"
 #include "tooling/file_io.h"
 #include "tooling/integration_engine.h"
+#include "bytecode_vm/compiler.h"
+#include "bytecode_vm/opcode_map.h"
+#include "bytecode_vm/serialize.h"
+#include "bytecode_vm/vm.h"
+#include "crypto/aead.h"
+#include "crypto/kdf.h"
+#include "antitamper/risk_policy.h"
 
 namespace fs = std::filesystem;
 using namespace rtprotect;
@@ -640,6 +647,258 @@ void TestValidateProtectedBuildEnforcesLicenseIntegrity() {
   std::printf("  PASSED: Finding 4 ValidateProtectedBuild strictly enforces license integrity.\n");
 }
 
+void TestPerBuildOpcodeSeeding() {
+  std::printf("Running TestPerBuildOpcodeSeeding...\n");
+
+  fs::path test_dir = "temp_test_opcode_proj";
+  CleanDir(test_dir);
+  fs::create_directories(test_dir);
+
+  std::string cmake_text = "cmake_minimum_required(VERSION 3.20)\nproject(App)\nadd_executable(app main.cpp)\n";
+  WriteTextFile((test_dir / "CMakeLists.txt").string(), cmake_text);
+  WriteTextFile((test_dir / "main.cpp").string(), "int main() { return 0; }\n");
+
+  IntegrationOptions opts;
+  opts.target_project_path = test_dir.string();
+  opts.use_dev_keys = true;
+  opts.run_build = false;
+
+  auto rep1 = ExecuteIntegration(opts);
+  assert(rep1.success);
+  assert(rep1.opcode_seed != 0);
+
+  auto cfg1 = ReadTextFile((test_dir / "rtprotect_config.h").string());
+  assert(cfg1.has_value());
+  assert(cfg1->find("kBuildOpcodeSeed") != std::string::npos);
+  assert(cfg1->find("GetBuildOpcodeMap()") != std::string::npos);
+
+  CleanDir(test_dir);
+  std::printf("  PASSED: Per-build randomized opcode map seeding verified.\n");
+}
+
+void TestFunctionVirtualization() {
+  std::printf("Running TestFunctionVirtualization...\n");
+
+  fs::path test_dir = "temp_test_virt_proj";
+  CleanDir(test_dir);
+  fs::create_directories(test_dir);
+
+  std::string cmake_text = "cmake_minimum_required(VERSION 3.20)\nproject(VirtApp)\nadd_executable(virtapp main.cpp)\n";
+  WriteTextFile((test_dir / "CMakeLists.txt").string(), cmake_text);
+
+  std::string main_cpp =
+      "#include <cstdint>\n"
+      "RTPROTECT_VIRTUALIZE\n"
+      "int64_t compute_auth(int64_t a, int64_t b) {\n"
+      "    int64_t sum = a + b;\n"
+      "    return sum * 2;\n"
+      "}\n"
+      "int main() {\n"
+      "    return compute_auth(10, 20);\n"
+      "}\n";
+  WriteTextFile((test_dir / "main.cpp").string(), main_cpp);
+
+  IntegrationOptions opts;
+  opts.target_project_path = test_dir.string();
+  opts.use_dev_keys = true;
+  opts.run_build = false;
+
+  auto rep = ExecuteIntegration(opts);
+  assert(rep.success);
+  assert(!rep.virtualized_functions.empty());
+  assert(rep.virtualized_functions[0] == "compute_auth");
+
+  auto transformed_main = ReadTextFile((test_dir / "main.cpp").string());
+  assert(transformed_main.has_value());
+  assert(transformed_main->find("[RTProtect Bytecode-Virtualized Function: compute_auth]") != std::string::npos);
+  assert(transformed_main->find("s_enc_code") != std::string::npos);
+  assert(transformed_main->find("s_fn_salt") != std::string::npos);
+  assert(transformed_main->find("s_master") == std::string::npos); // Plaintext master key eliminated!
+  assert(transformed_main->find("GetFunctionMasterKey") != std::string::npos);
+  assert(transformed_main->find("ScatterTamperCheck") != std::string::npos);
+  assert(transformed_main->find("DeriveTamperBoundKey") != std::string::npos);
+  assert(transformed_main->find("rtprotect::vm::Run") != std::string::npos);
+
+  CleanDir(test_dir);
+  std::printf("  PASSED: Function virtualization and tamper-bound wrapper generation verified.\n");
+}
+
+void TestFunctionVirtualizationExecutionRoundTrip() {
+  std::printf("Running TestFunctionVirtualizationExecutionRoundTrip...\n");
+
+  // 1. Target function with arithmetic and if/else branching
+  std::string source_fn =
+      "int64_t compute_auth(int64_t a, int64_t b) {\n"
+      "    int64_t sum = a + b;\n"
+      "    if (sum > 20) {\n"
+      "        return sum * 2;\n"
+      "    } else {\n"
+      "        return sum + 1;\n"
+      "    }\n"
+      "}\n";
+
+  // 2. Build-specific permutation seed
+  const std::uint32_t opcode_seed = 0xA7B8C9D0u;
+  auto opcode_map = rtprotect::vm::OpcodeMap::FromSeed(opcode_seed);
+
+  // 3. Compile function with seeded opcode map
+  std::string compile_err;
+  rtprotect::vm::CompilerOptions opts;
+  opts.opcode_map = &opcode_map;
+  auto prog = rtprotect::vm::CompileCSubset(source_fn, &compile_err, opts);
+  if (!prog.has_value()) {
+    std::fprintf(stderr, "Compile error: %s\n", compile_err.c_str());
+  }
+  assert(prog.has_value());
+
+  // 4. Serialize compiled bytecode
+  auto serialized = rtprotect::vm::Serialize(*prog);
+
+  // 5. Derive build master key and tamper-bound key
+  std::array<std::uint8_t, 32> build_auth_seed{};
+  for (std::size_t i = 0; i < build_auth_seed.size(); ++i) {
+    build_auth_seed[i] = static_cast<std::uint8_t>(i ^ 0x7E);
+  }
+
+  rtprotect::integrity::Ed25519PublicKey manifest_pubkey{};
+  manifest_pubkey.fill(0x42);
+
+  std::array<std::uint8_t, 16> fn_salt{};
+  for (std::size_t i = 0; i < fn_salt.size(); ++i) {
+    fn_salt[i] = static_cast<std::uint8_t>(i ^ 0xAA);
+  }
+
+  std::string product_id = "com.vendor.virtapp";
+  auto master_key = DeriveBuildFunctionMasterKey(build_auth_seed, manifest_pubkey, product_id, fn_salt.data(), fn_salt.size());
+  assert(master_key.has_value());
+
+  rtprotect::antitamper::RiskAssessment clean_risk;
+  clean_risk.risk_score = 0;
+  auto bound_key = rtprotect::antitamper::DeriveTamperBoundKey(*master_key, clean_risk, "compute_auth");
+
+  // 6. Encrypt bytecode with tamper-bound key
+  auto encrypted = rtprotect::crypto::Encrypt(bound_key, serialized.data(), serialized.size());
+  assert(encrypted.has_value());
+
+  // 7. Execute runtime decryption and execution pipeline (clean environment)
+  rtprotect::antitamper::RiskAssessment runtime_risk;
+  runtime_risk.risk_score = 0;
+  auto runtime_master_key = DeriveBuildFunctionMasterKey(build_auth_seed, manifest_pubkey, product_id, fn_salt.data(), fn_salt.size());
+  assert(runtime_master_key.has_value());
+
+  auto runtime_bound_key = rtprotect::antitamper::DeriveTamperBoundKey(*runtime_master_key, runtime_risk, "compute_auth");
+  auto plain = rtprotect::crypto::Decrypt(runtime_bound_key, *encrypted, nullptr, 0, nullptr);
+  assert(plain.has_value());
+
+  auto runtime_prog = rtprotect::vm::Deserialize(plain->data(), plain->size());
+  assert(runtime_prog.has_value());
+
+  // 8. Assert numeric computation through the VM with the build opcode map
+  // Case A: 10 + 20 = 30 (> 20) -> 30 * 2 = 60
+  std::vector<std::int64_t> args_a = {10, 20};
+  auto res_a = rtprotect::vm::Run(*runtime_prog, args_a, &opcode_map);
+  assert(res_a.error == rtprotect::vm::VmError::kNone);
+  assert(res_a.value == 60);
+
+  // Case B: 5 + 10 = 15 (<= 20) -> 15 + 1 = 16
+  std::vector<std::int64_t> args_b = {5, 10};
+  auto res_b = rtprotect::vm::Run(*runtime_prog, args_b, &opcode_map);
+  assert(res_b.error == rtprotect::vm::VmError::kNone);
+  assert(res_b.value == 16);
+
+  // 9. Adversarial Case A: Execution without the seeded opcode map MUST fail verification
+  auto bad_map_res = rtprotect::vm::Run(*runtime_prog, args_a, nullptr);
+  assert(bad_map_res.error != rtprotect::vm::VmError::kNone);
+
+  // 10. Adversarial Case B: Tampered runtime environment MUST corrupt key and fail decryption
+  rtprotect::antitamper::RiskAssessment tampered_risk;
+  tampered_risk.risk_score = 50; // Debugger / patch detected
+  auto tampered_bound_key = rtprotect::antitamper::DeriveTamperBoundKey(*runtime_master_key, tampered_risk, "compute_auth");
+  auto bad_decrypt = rtprotect::crypto::Decrypt(tampered_bound_key, *encrypted, nullptr, 0, nullptr);
+  assert(!bad_decrypt.has_value()); // Cryptographic GCM tag failure!
+
+  std::printf("  PASSED: End-to-end opcode permutation, tamper-key derivation, and VM execution verified.\n");
+}
+
+void TestFunctionExtractionHandlesCommentsAndStrings() {
+  std::printf("Running TestFunctionExtractionHandlesCommentsAndStrings...\n");
+
+  fs::path test_dir = "temp_test_brace_proj";
+  CleanDir(test_dir);
+  fs::create_directories(test_dir);
+
+  std::string cmake_text = "cmake_minimum_required(VERSION 3.20)\nproject(BraceApp)\nadd_executable(braceapp main.cpp)\n";
+  WriteTextFile((test_dir / "CMakeLists.txt").string(), cmake_text);
+
+  std::string complex_cpp =
+      "#include <cstdint>\n"
+      "const char* dummy_header() { return \"header with { and } braces\"; }\n"
+      "RTPROTECT_VIRTUALIZE\n"
+      "int64_t complex_calc(int64_t x) {\n"
+      "    // Comment with { and }\n"
+      "    /* Multi-line block comment with { \n"
+      "       and unclosed { \n"
+      "    */\n"
+      "    int64_t res = x * 3;\n"
+      "    return res;\n"
+      "}\n"
+      "int main() {\n"
+      "    return complex_calc(7);\n"
+      "}\n";
+  WriteTextFile((test_dir / "main.cpp").string(), complex_cpp);
+
+  IntegrationOptions opts;
+  opts.target_project_path = test_dir.string();
+  opts.use_dev_keys = true;
+  opts.run_build = false;
+
+  auto rep = ExecuteIntegration(opts);
+  assert(rep.success);
+  assert(!rep.virtualized_functions.empty());
+  assert(rep.virtualized_functions[0] == "complex_calc");
+
+  auto transformed = ReadTextFile((test_dir / "main.cpp").string());
+  assert(transformed.has_value());
+  assert(transformed->find("[RTProtect Bytecode-Virtualized Function: complex_calc]") != std::string::npos);
+  assert(transformed->find("s_master") == std::string::npos); // NO raw master key!
+  assert(transformed->find("s_fn_salt") != std::string::npos);
+  assert(transformed->find("GetFunctionMasterKey") != std::string::npos);
+  assert(transformed->find("ScatterTamperCheck") != std::string::npos);
+
+  CleanDir(test_dir);
+  std::printf("  PASSED: Comment- and string-literal-aware brace extraction verified.\n");
+}
+
+void TestDetailedJsonReporting() {
+  std::printf("Running TestDetailedJsonReporting...\n");
+
+  fs::path test_dir = "temp_test_json_proj";
+  CleanDir(test_dir);
+  fs::create_directories(test_dir);
+
+  std::string cmake_text = "cmake_minimum_required(VERSION 3.20)\nproject(JsonApp)\nadd_executable(jsonapp main.cpp)\n";
+  WriteTextFile((test_dir / "CMakeLists.txt").string(), cmake_text);
+  WriteTextFile((test_dir / "main.cpp").string(), "int main() { return 0; }\n");
+
+  IntegrationOptions opts;
+  opts.target_project_path = test_dir.string();
+  opts.use_dev_keys = true;
+  opts.run_build = false;
+  opts.report_json_path = (test_dir / "report.json").string();
+
+  auto rep = ExecuteIntegration(opts);
+  assert(rep.success);
+
+  std::string json = rep.ToJson();
+  assert(json.find("\"virtualized_functions\"") != std::string::npos);
+  assert(json.find("\"obfuscated_string_count\"") != std::string::npos);
+  assert(json.find("\"scattered_check_count\"") != std::string::npos);
+  assert(json.find("\"opcode_seed\"") != std::string::npos);
+
+  CleanDir(test_dir);
+  std::printf("  PASSED: Detailed JSON execution reporting verified.\n");
+}
+
 }  // namespace
 
 int main() {
@@ -657,6 +916,11 @@ int main() {
   TestNoBuildReportsIntegratedState();
   TestProductionLicenseSigningWorkflow();
   TestValidateProtectedBuildEnforcesLicenseIntegrity();
+  TestPerBuildOpcodeSeeding();
+  TestFunctionVirtualization();
+  TestFunctionVirtualizationExecutionRoundTrip();
+  TestFunctionExtractionHandlesCommentsAndStrings();
+  TestDetailedJsonReporting();
   std::printf("ALL INTEGRATION ENGINE TESTS PASSED.\n");
   return 0;
 }

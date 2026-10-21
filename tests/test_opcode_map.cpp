@@ -94,4 +94,28 @@ MT_TEST(OpcodeMap_Execution_WithPermutedOpcodes_Succeeds) {
   MT_CHECK(res_wrong_map.error == VmError::kVerificationFailed);
 }
 
+MT_TEST(OpcodeMap_RemapProgramOpcodes_TransformsAndExecutes) {
+  OpcodeMap default_map;
+  OpcodeMap seeded_map = OpcodeMap::FromSeed(98765);
+
+  Program p;
+  p.constants = {100, 25};
+  p.num_locals = 0;
+  p.code.push_back(default_map.Encode(Opcode::kPushConst));
+  p.code.push_back(0);
+  p.code.push_back(0);
+  p.code.push_back(default_map.Encode(Opcode::kPushConst));
+  p.code.push_back(1);
+  p.code.push_back(0);
+  p.code.push_back(default_map.Encode(Opcode::kSub));
+  p.code.push_back(default_map.Encode(Opcode::kRet));
+
+  auto remapped = RemapProgramOpcodes(p, default_map, seeded_map);
+  MT_CHECK(remapped.has_value());
+
+  RunResult res = Run(*remapped, {}, &seeded_map);
+  MT_CHECK(res.error == VmError::kNone);
+  MT_CHECK(res.value == 75);
+}
+
 MT_MAIN()

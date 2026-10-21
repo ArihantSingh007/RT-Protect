@@ -4,3 +4,4 @@ add_library(rtprotect_antitamper STATIC
     risk_policy.cpp
 )
 target_include_directories(rtprotect_antitamper PUBLIC ${CMAKE_SOURCE_DIR})
+target_link_libraries(rtprotect_antitamper PUBLIC rtprotect_crypto rtprotect_integrity)

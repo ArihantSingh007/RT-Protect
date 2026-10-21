@@ -31,7 +31,13 @@ const std::vector<Opcode>& AllOpcodes() {
     Opcode::kJmp,
     Opcode::kJz,
     Opcode::kJnz,
-    Opcode::kRet
+    Opcode::kRet,
+    Opcode::kLoadMem8,
+    Opcode::kStoreMem8,
+    Opcode::kLoadMem64,
+    Opcode::kStoreMem64,
+    Opcode::kCall,
+    Opcode::kRetSub
   };
   return opcodes;
 }
@@ -100,6 +106,29 @@ int OpcodeMap::OperandBytes(std::uint8_t byte) const {
   auto op = Decode(byte);
   if (!op.has_value()) return -1;
   return rtprotect::vm::OperandBytes(*op);
+}
+
+std::optional<Program> RemapProgramOpcodes(const Program& prog,
+                                           const OpcodeMap& src_map,
+                                           const OpcodeMap& dst_map) {
+  Program out = prog;
+  out.code.clear();
+  std::size_t pc = 0;
+  while (pc < prog.code.size()) {
+    std::uint8_t src_byte = prog.code[pc];
+    auto op = src_map.Decode(src_byte);
+    if (!op.has_value()) return std::nullopt;
+    out.code.push_back(dst_map.Encode(*op));
+    int operand_len = src_map.OperandBytes(src_byte);
+    if (operand_len < 0 || pc + 1 + static_cast<std::size_t>(operand_len) > prog.code.size()) {
+      return std::nullopt;
+    }
+    for (int i = 0; i < operand_len; ++i) {
+      out.code.push_back(prog.code[pc + 1 + i]);
+    }
+    pc += 1 + operand_len;
+  }
+  return out;
 }
 
 }  // namespace rtprotect::vm
