@@ -504,11 +504,16 @@ bool LoadOrCreateDevToken(const std::string& product_id,
         if (plaintext.has_value()) {
           auto token_opt = DeserializeActivationToken(plaintext->data(), plaintext->size());
           if (token_opt.has_value()) {
-            bool lic_match = license_id.empty() ||
-                             token_opt->license_id.empty() ||
-                             token_opt->license_id == license_id ||
-                             token_opt->license_id == "dev-license" ||
-                             (license_id.rfind("lic-dev-", 0) == 0 && token_opt->license_id.rfind("lic-dev-", 0) == 0);
+            bool lic_match = false;
+            if (license_id.empty() || token_opt->license_id == license_id) {
+              lic_match = true;
+            }
+#if defined(RTPROTECT_DEV_BUILD) || !defined(NDEBUG)
+            else if ((license_id == "dev-license" || license_id.rfind("lic-dev-", 0) == 0) &&
+                     (token_opt->license_id == "dev-license" || token_opt->license_id.rfind("lic-dev-", 0) == 0)) {
+              lic_match = true;
+            }
+#endif
             if (lic_match) {
               *out_token = *token_opt;
               return true;

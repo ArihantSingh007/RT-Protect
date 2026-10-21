@@ -328,6 +328,27 @@ MT_TEST(ActivationToken_LoadOrCreateDevToken_PersistsAndEncrypts) {
   std::filesystem::remove(token_path, ec);
 }
 
+MT_TEST(ActivationToken_RejectsDevLicenseForProductionLicense) {
+  std::string test_prod = "test_product_license_bypass_check";
+  std::string token_path = GetActivationTokenPath(test_prod);
+
+  std::error_code ec;
+  std::filesystem::remove(token_path, ec);
+
+  // 1. Create a dev token stored with "dev-license"
+  ActivationToken dev_tok;
+  MT_CHECK(LoadOrCreateDevToken(test_prod, "dev-license", &dev_tok));
+  MT_CHECK(dev_tok.license_id == "dev-license");
+
+  // 2. Querying with a production license ID must NOT reuse the dev token
+  ActivationToken prod_tok;
+  MT_CHECK(LoadOrCreateDevToken(test_prod, "lic-prod-enterprise-9999", &prod_tok));
+  MT_CHECK(prod_tok.license_id == "lic-prod-enterprise-9999");
+  MT_CHECK(prod_tok.license_id != dev_tok.license_id);
+
+  std::filesystem::remove(token_path, ec);
+}
+
 MT_TEST(ActivationServer_ActivateAndRenew_Stubs) {
   auto token = ActivateDevice("lic-key-prod-1", "hw-fingerprint-prod", "prod-1");
   MT_CHECK(token.schema_version == kActivationSchemaVersion);
