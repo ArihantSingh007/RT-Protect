@@ -974,8 +974,21 @@ IntegrationReport ExecuteIntegration(const IntegrationOptions& options) {
   }
   report.opcode_seed = opcode_seed;
 
+  std::string dev_lic_id = "dev-license";
+  if (options.use_dev_keys) {
+    dev_lic_id = "lic-dev-" + std::to_string(timestamp);
+  } else if (!options.license_file_path.empty()) {
+    auto lic_data = ReadFile(options.license_file_path);
+    if (lic_data.has_value()) {
+      auto lic_opt = licensing::DeserializeLicense(lic_data->data(), lic_data->size());
+      if (lic_opt.has_value() && !lic_opt->license_id.empty()) {
+        dev_lic_id = lic_opt->license_id;
+      }
+    }
+  }
+
   rtprotect::licensing::ActivationToken dev_token;
-  if (!rtprotect::licensing::LoadOrCreateDevToken(options.product_id, "dev-license", &dev_token)) {
+  if (!rtprotect::licensing::LoadOrCreateDevToken(options.product_id, dev_lic_id, &dev_token)) {
     if (RAND_bytes(dev_token.vm_root.data(), static_cast<int>(dev_token.vm_root.size())) != 1) {
       for (std::size_t i = 0; i < dev_token.vm_root.size(); ++i) {
         dev_token.vm_root[i] = static_cast<std::uint8_t>((i * 7 + 0x3C) & 0xFF);
