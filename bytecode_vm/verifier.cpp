@@ -72,8 +72,17 @@ StackEffect GetStackEffect(Opcode op) {
     case Opcode::kCmpEq:
     case Opcode::kCmpLt:
     case Opcode::kCmpGt:
+    case Opcode::kFAdd:
+    case Opcode::kFSub:
+    case Opcode::kFMul:
+    case Opcode::kFDiv:
+    case Opcode::kFCmpEq:
+    case Opcode::kFCmpLt:
+    case Opcode::kFCmpGt:
       return {2, -1};
     case Opcode::kNot:
+    case Opcode::kIntToFloat:
+    case Opcode::kFloatToInt:
       return {1, 0};
     case Opcode::kJmp:
       return {0, 0};
@@ -90,6 +99,7 @@ StackEffect GetStackEffect(Opcode op) {
       return {2, -2};
     case Opcode::kCall:
     case Opcode::kRetSub:
+    case Opcode::kCallProgram:
       return {0, 0};
   }
   return {0, 0};  // unreachable: every Opcode value is handled above, and

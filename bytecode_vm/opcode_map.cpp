@@ -37,7 +37,17 @@ const std::vector<Opcode>& AllOpcodes() {
     Opcode::kLoadMem64,
     Opcode::kStoreMem64,
     Opcode::kCall,
-    Opcode::kRetSub
+    Opcode::kRetSub,
+    Opcode::kCallProgram,
+    Opcode::kFAdd,
+    Opcode::kFSub,
+    Opcode::kFMul,
+    Opcode::kFDiv,
+    Opcode::kFCmpEq,
+    Opcode::kFCmpLt,
+    Opcode::kFCmpGt,
+    Opcode::kIntToFloat,
+    Opcode::kFloatToInt
   };
   return opcodes;
 }

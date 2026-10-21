@@ -1,8 +1,10 @@
 #include "bytecode_vm/vm.h"
 
+#include <cstring>
 #include "bytecode_vm/checked_arith.h"
 #include "bytecode_vm/opcode.h"
 #include "bytecode_vm/opcode_map.h"
+#include "bytecode_vm/program_registry.h"
 
 namespace rtprotect::vm {
 
@@ -29,12 +31,29 @@ std::uint16_t ReadU16(const std::uint8_t* p) {
   return static_cast<std::uint16_t>(p[0]) | (static_cast<std::uint16_t>(p[1]) << 8);
 }
 
+inline std::uint64_t DoubleToBits(double d) {
+  std::uint64_t bits = 0;
+  std::memcpy(&bits, &d, sizeof(bits));
+  return bits;
+}
+
+inline double BitsToDouble(std::uint64_t bits) {
+  double d = 0.0;
+  std::memcpy(&d, &bits, sizeof(d));
+  return d;
+}
+
 }  // namespace
 
 RunResult Run(const Program& program,
               const std::vector<std::int64_t>& args,
               const OpcodeMap* opcode_map,
-              MemoryContext* mem_ctx) {
+              MemoryContext* mem_ctx,
+              VmEngineFlavor flavor) {
+  if (flavor == VmEngineFlavor::kRegisterThreaded) {
+    return RunRegisterThreaded(program, args, opcode_map, mem_ctx);
+  }
+
   RunResult result;
 
   VerifyError verr = VerifyError::kNone;
@@ -404,13 +423,590 @@ RunResult Run(const Program& program,
         call_stack.pop_back();
         break;
       }
+      case Opcode::kCallProgram: {
+        std::uint16_t prog_id = ReadU16(operand);
+        const Program* callee = ProgramRegistry::Get(prog_id);
+        if (!callee) {
+          result.error = VmError::kVerificationFailed;
+          result.instructions_executed = executed;
+          return result;
+        }
+        std::vector<std::int64_t> callee_args(callee->num_locals, 0);
+        for (int k = static_cast<int>(callee->num_locals) - 1; k >= 0; --k) {
+          std::int64_t arg_val = 0;
+          if (pop(&arg_val)) {
+            callee_args[k] = arg_val;
+          }
+        }
+        auto sub_res = Run(*callee, callee_args, opcode_map, mem_ctx, flavor);
+        if (sub_res.error != VmError::kNone) {
+          result.error = sub_res.error;
+          result.instructions_executed = executed + sub_res.instructions_executed;
+          return result;
+        }
+        executed += sub_res.instructions_executed;
+        if (!push(sub_res.value)) {
+          result.error = VmError::kStackOverflow;
+          result.instructions_executed = executed;
+          return result;
+        }
+        break;
+      }
+      case Opcode::kFAdd: {
+        if (!pop(&b) || !pop(&a)) {
+          result.error = VmError::kStackUnderflow;
+          result.instructions_executed = executed;
+          return result;
+        }
+        double da = BitsToDouble(static_cast<std::uint64_t>(a));
+        double db = BitsToDouble(static_cast<std::uint64_t>(b));
+        double res = da + db;
+        if (!push(static_cast<std::int64_t>(DoubleToBits(res)))) {
+          result.error = VmError::kStackOverflow;
+          result.instructions_executed = executed;
+          return result;
+        }
+        break;
+      }
+      case Opcode::kFSub: {
+        if (!pop(&b) || !pop(&a)) {
+          result.error = VmError::kStackUnderflow;
+          result.instructions_executed = executed;
+          return result;
+        }
+        double da = BitsToDouble(static_cast<std::uint64_t>(a));
+        double db = BitsToDouble(static_cast<std::uint64_t>(b));
+        double res = da - db;
+        if (!push(static_cast<std::int64_t>(DoubleToBits(res)))) {
+          result.error = VmError::kStackOverflow;
+          result.instructions_executed = executed;
+          return result;
+        }
+        break;
+      }
+      case Opcode::kFMul: {
+        if (!pop(&b) || !pop(&a)) {
+          result.error = VmError::kStackUnderflow;
+          result.instructions_executed = executed;
+          return result;
+        }
+        double da = BitsToDouble(static_cast<std::uint64_t>(a));
+        double db = BitsToDouble(static_cast<std::uint64_t>(b));
+        double res = da * db;
+        if (!push(static_cast<std::int64_t>(DoubleToBits(res)))) {
+          result.error = VmError::kStackOverflow;
+          result.instructions_executed = executed;
+          return result;
+        }
+        break;
+      }
+      case Opcode::kFDiv: {
+        if (!pop(&b) || !pop(&a)) {
+          result.error = VmError::kStackUnderflow;
+          result.instructions_executed = executed;
+          return result;
+        }
+        double da = BitsToDouble(static_cast<std::uint64_t>(a));
+        double db = BitsToDouble(static_cast<std::uint64_t>(b));
+        if (db == 0.0) {
+          result.error = VmError::kDivisionByZero;
+          result.instructions_executed = executed;
+          return result;
+        }
+        double res = da / db;
+        if (!push(static_cast<std::int64_t>(DoubleToBits(res)))) {
+          result.error = VmError::kStackOverflow;
+          result.instructions_executed = executed;
+          return result;
+        }
+        break;
+      }
+      case Opcode::kFCmpEq: {
+        if (!pop(&b) || !pop(&a)) {
+          result.error = VmError::kStackUnderflow;
+          result.instructions_executed = executed;
+          return result;
+        }
+        double da = BitsToDouble(static_cast<std::uint64_t>(a));
+        double db = BitsToDouble(static_cast<std::uint64_t>(b));
+        if (!push(da == db ? 1 : 0)) {
+          result.error = VmError::kStackOverflow;
+          result.instructions_executed = executed;
+          return result;
+        }
+        break;
+      }
+      case Opcode::kFCmpLt: {
+        if (!pop(&b) || !pop(&a)) {
+          result.error = VmError::kStackUnderflow;
+          result.instructions_executed = executed;
+          return result;
+        }
+        double da = BitsToDouble(static_cast<std::uint64_t>(a));
+        double db = BitsToDouble(static_cast<std::uint64_t>(b));
+        if (!push(da < db ? 1 : 0)) {
+          result.error = VmError::kStackOverflow;
+          result.instructions_executed = executed;
+          return result;
+        }
+        break;
+      }
+      case Opcode::kFCmpGt: {
+        if (!pop(&b) || !pop(&a)) {
+          result.error = VmError::kStackUnderflow;
+          result.instructions_executed = executed;
+          return result;
+        }
+        double da = BitsToDouble(static_cast<std::uint64_t>(a));
+        double db = BitsToDouble(static_cast<std::uint64_t>(b));
+        if (!push(da > db ? 1 : 0)) {
+          result.error = VmError::kStackOverflow;
+          result.instructions_executed = executed;
+          return result;
+        }
+        break;
+      }
+      case Opcode::kIntToFloat: {
+        if (!pop(&a)) {
+          result.error = VmError::kStackUnderflow;
+          result.instructions_executed = executed;
+          return result;
+        }
+        double da = static_cast<double>(a);
+        if (!push(static_cast<std::int64_t>(DoubleToBits(da)))) {
+          result.error = VmError::kStackOverflow;
+          result.instructions_executed = executed;
+          return result;
+        }
+        break;
+      }
+      case Opcode::kFloatToInt: {
+        if (!pop(&a)) {
+          result.error = VmError::kStackUnderflow;
+          result.instructions_executed = executed;
+          return result;
+        }
+        double da = BitsToDouble(static_cast<std::uint64_t>(a));
+        if (!push(static_cast<std::int64_t>(da))) {
+          result.error = VmError::kStackOverflow;
+          result.instructions_executed = executed;
+          return result;
+        }
+        break;
+      }
     }
 
     pc = next_pc;
-    // The verifier guarantees every jump target is a valid instruction
-    // start and every non-jump next_pc is <= code.size() by construction
-    // (it's how the verifier itself walked the code), so no bounds check is
-    // needed here -- this is precisely the work verification front-loaded.
+  }
+}
+
+RunResult RunRegisterThreaded(const Program& program,
+                              const std::vector<std::int64_t>& args,
+                              const OpcodeMap* opcode_map,
+                              MemoryContext* mem_ctx) {
+  // Register-Threaded Engine (Flavor 2):
+  // Uses an internal 8-slot register window (R0..R7) and accumulator (acc)
+  // with threaded execution semantics, creating completely different
+  // execution traces and memory signatures from the stack engine.
+  RunResult result;
+
+  VerifyError verr = VerifyError::kNone;
+  auto instruction_starts = VerifyProgram(program, &verr, opcode_map);
+  if (!instruction_starts.has_value()) {
+    result.error = VmError::kVerificationFailed;
+    result.verify_error = verr;
+    return result;
+  }
+
+  if (args.size() > program.num_locals) {
+    result.error = VmError::kWrongNumberOfArgs;
+    return result;
+  }
+
+  std::vector<std::int64_t> locals(program.num_locals, 0);
+  for (std::size_t k = 0; k < args.size(); ++k) locals[k] = args[k];
+
+  // Register window: R0 through R7
+  std::int64_t regs[8] = {0};
+  std::int64_t acc = 0;
+  std::int64_t aux_stack[kMaxStackDepth];
+  std::size_t aux_sp = 0;
+
+  auto reg_push = [&](std::int64_t v) -> bool {
+    if (aux_sp >= kMaxStackDepth) return false;
+    aux_stack[aux_sp++] = acc;
+    acc = v;
+    regs[aux_sp % 8] = v;
+    return true;
+  };
+
+  auto reg_pop = [&](std::int64_t* out) -> bool {
+    if (aux_sp == 0) return false;
+    *out = acc;
+    acc = aux_stack[--aux_sp];
+    return true;
+  };
+
+  static const OpcodeMap kDefaultOpcodeMap;
+  const OpcodeMap& map = opcode_map ? *opcode_map : kDefaultOpcodeMap;
+
+  const auto& code = program.code;
+  std::size_t pc = 0;
+  std::uint64_t executed = 0;
+  std::vector<std::size_t> call_stack;
+
+  while (true) {
+    if (executed >= kMaxExecutedInstructions) {
+      result.error = VmError::kInstructionBudgetExceeded;
+      result.instructions_executed = executed;
+      return result;
+    }
+    ++executed;
+
+    auto decoded_op = map.Decode(code[pc]);
+    Opcode op = *decoded_op;
+    const std::uint8_t* operand = (pc + 1 < code.size()) ? &code[pc + 1] : nullptr;
+    int operand_len = OperandBytes(op);
+    std::size_t next_pc = pc + 1 + static_cast<std::size_t>(operand_len);
+
+    std::int64_t a = 0, b = 0;
+
+    switch (op) {
+      case Opcode::kPushConst: {
+        std::uint16_t idx = ReadU16(operand);
+        if (!reg_push(program.constants[idx])) {
+          result.error = VmError::kStackOverflow;
+          result.instructions_executed = executed;
+          return result;
+        }
+        break;
+      }
+      case Opcode::kPushLocal: {
+        std::uint8_t idx = operand[0];
+        if (!reg_push(locals[idx])) {
+          result.error = VmError::kStackOverflow;
+          result.instructions_executed = executed;
+          return result;
+        }
+        break;
+      }
+      case Opcode::kStoreLocal: {
+        std::uint8_t idx = operand[0];
+        if (!reg_pop(&a)) {
+          result.error = VmError::kStackUnderflow;
+          result.instructions_executed = executed;
+          return result;
+        }
+        locals[idx] = a;
+        break;
+      }
+      case Opcode::kDup: {
+        if (aux_sp == 0) {
+          result.error = VmError::kStackUnderflow;
+          result.instructions_executed = executed;
+          return result;
+        }
+        if (!reg_push(acc)) {
+          result.error = VmError::kStackOverflow;
+          result.instructions_executed = executed;
+          return result;
+        }
+        break;
+      }
+      case Opcode::kPop: {
+        if (!reg_pop(&a)) {
+          result.error = VmError::kStackUnderflow;
+          result.instructions_executed = executed;
+          return result;
+        }
+        break;
+      }
+      case Opcode::kAdd: {
+        if (!reg_pop(&b) || !reg_pop(&a)) {
+          result.error = VmError::kStackUnderflow;
+          result.instructions_executed = executed;
+          return result;
+        }
+        auto r = CheckedAdd(a, b);
+        if (!r) { result.error = VmError::kArithmeticOverflow; result.instructions_executed = executed; return result; }
+        if (!reg_push(*r)) { result.error = VmError::kStackOverflow; result.instructions_executed = executed; return result; }
+        break;
+      }
+      case Opcode::kSub: {
+        if (!reg_pop(&b) || !reg_pop(&a)) {
+          result.error = VmError::kStackUnderflow;
+          result.instructions_executed = executed;
+          return result;
+        }
+        auto r = CheckedSub(a, b);
+        if (!r) { result.error = VmError::kArithmeticOverflow; result.instructions_executed = executed; return result; }
+        if (!reg_push(*r)) { result.error = VmError::kStackOverflow; result.instructions_executed = executed; return result; }
+        break;
+      }
+      case Opcode::kMul: {
+        if (!reg_pop(&b) || !reg_pop(&a)) {
+          result.error = VmError::kStackUnderflow;
+          result.instructions_executed = executed;
+          return result;
+        }
+        auto r = CheckedMul(a, b);
+        if (!r) { result.error = VmError::kArithmeticOverflow; result.instructions_executed = executed; return result; }
+        if (!reg_push(*r)) { result.error = VmError::kStackOverflow; result.instructions_executed = executed; return result; }
+        break;
+      }
+      case Opcode::kDiv: {
+        if (!reg_pop(&b) || !reg_pop(&a)) {
+          result.error = VmError::kStackUnderflow;
+          result.instructions_executed = executed;
+          return result;
+        }
+        if (b == 0) { result.error = VmError::kDivisionByZero; result.instructions_executed = executed; return result; }
+        auto r = CheckedDiv(a, b);
+        if (!r) { result.error = VmError::kArithmeticOverflow; result.instructions_executed = executed; return result; }
+        if (!reg_push(*r)) { result.error = VmError::kStackOverflow; result.instructions_executed = executed; return result; }
+        break;
+      }
+      case Opcode::kMod: {
+        if (!reg_pop(&b) || !reg_pop(&a)) {
+          result.error = VmError::kStackUnderflow;
+          result.instructions_executed = executed;
+          return result;
+        }
+        if (b == 0) { result.error = VmError::kDivisionByZero; result.instructions_executed = executed; return result; }
+        auto r = CheckedMod(a, b);
+        if (!r) { result.error = VmError::kArithmeticOverflow; result.instructions_executed = executed; return result; }
+        if (!reg_push(*r)) { result.error = VmError::kStackOverflow; result.instructions_executed = executed; return result; }
+        break;
+      }
+      case Opcode::kAnd: {
+        if (!reg_pop(&b) || !reg_pop(&a)) { result.error = VmError::kStackUnderflow; result.instructions_executed = executed; return result; }
+        if (!reg_push(a & b)) { result.error = VmError::kStackOverflow; result.instructions_executed = executed; return result; }
+        break;
+      }
+      case Opcode::kOr: {
+        if (!reg_pop(&b) || !reg_pop(&a)) { result.error = VmError::kStackUnderflow; result.instructions_executed = executed; return result; }
+        if (!reg_push(a | b)) { result.error = VmError::kStackOverflow; result.instructions_executed = executed; return result; }
+        break;
+      }
+      case Opcode::kXor: {
+        if (!reg_pop(&b) || !reg_pop(&a)) { result.error = VmError::kStackUnderflow; result.instructions_executed = executed; return result; }
+        if (!reg_push(a ^ b)) { result.error = VmError::kStackOverflow; result.instructions_executed = executed; return result; }
+        break;
+      }
+      case Opcode::kNot: {
+        if (!reg_pop(&a)) { result.error = VmError::kStackUnderflow; result.instructions_executed = executed; return result; }
+        if (!reg_push(~a)) { result.error = VmError::kStackOverflow; result.instructions_executed = executed; return result; }
+        break;
+      }
+      case Opcode::kCmpEq: {
+        if (!reg_pop(&b) || !reg_pop(&a)) { result.error = VmError::kStackUnderflow; result.instructions_executed = executed; return result; }
+        if (!reg_push(a == b ? 1 : 0)) { result.error = VmError::kStackOverflow; result.instructions_executed = executed; return result; }
+        break;
+      }
+      case Opcode::kCmpLt: {
+        if (!reg_pop(&b) || !reg_pop(&a)) { result.error = VmError::kStackUnderflow; result.instructions_executed = executed; return result; }
+        if (!reg_push(a < b ? 1 : 0)) { result.error = VmError::kStackOverflow; result.instructions_executed = executed; return result; }
+        break;
+      }
+      case Opcode::kCmpGt: {
+        if (!reg_pop(&b) || !reg_pop(&a)) { result.error = VmError::kStackUnderflow; result.instructions_executed = executed; return result; }
+        if (!reg_push(a > b ? 1 : 0)) { result.error = VmError::kStackOverflow; result.instructions_executed = executed; return result; }
+        break;
+      }
+      case Opcode::kJmp: {
+        next_pc = ReadU16(operand);
+        break;
+      }
+      case Opcode::kJz: {
+        if (!reg_pop(&a)) { result.error = VmError::kStackUnderflow; result.instructions_executed = executed; return result; }
+        if (a == 0) next_pc = ReadU16(operand);
+        break;
+      }
+      case Opcode::kJnz: {
+        if (!reg_pop(&a)) { result.error = VmError::kStackUnderflow; result.instructions_executed = executed; return result; }
+        if (a != 0) next_pc = ReadU16(operand);
+        break;
+      }
+      case Opcode::kRet: {
+        if (!reg_pop(&a)) { result.error = VmError::kStackUnderflow; result.instructions_executed = executed; return result; }
+        result.error = VmError::kNone;
+        result.value = a;
+        result.instructions_executed = executed;
+        return result;
+      }
+      case Opcode::kLoadMem8: {
+        if (!reg_pop(&a)) { result.error = VmError::kStackUnderflow; result.instructions_executed = executed; return result; }
+        if (!mem_ctx || a < 0 || static_cast<std::size_t>(a) >= mem_ctx->data.size()) {
+          result.error = VmError::kMemoryAccessOutOfBounds;
+          result.instructions_executed = executed;
+          return result;
+        }
+        if (!reg_push(static_cast<std::int64_t>(mem_ctx->data[static_cast<std::size_t>(a)]))) {
+          result.error = VmError::kStackOverflow;
+          result.instructions_executed = executed;
+          return result;
+        }
+        break;
+      }
+      case Opcode::kStoreMem8: {
+        if (!reg_pop(&b) || !reg_pop(&a)) { result.error = VmError::kStackUnderflow; result.instructions_executed = executed; return result; }
+        if (!mem_ctx || a < 0 || static_cast<std::size_t>(a) >= mem_ctx->data.size()) {
+          result.error = VmError::kMemoryAccessOutOfBounds;
+          result.instructions_executed = executed;
+          return result;
+        }
+        mem_ctx->data[static_cast<std::size_t>(a)] = static_cast<std::uint8_t>(b & 0xFF);
+        break;
+      }
+      case Opcode::kLoadMem64: {
+        if (!reg_pop(&a)) { result.error = VmError::kStackUnderflow; result.instructions_executed = executed; return result; }
+        if (!mem_ctx || a < 0 || static_cast<std::size_t>(a) + 8 > mem_ctx->data.size()) {
+          result.error = VmError::kMemoryAccessOutOfBounds;
+          result.instructions_executed = executed;
+          return result;
+        }
+        std::uint64_t uval = 0;
+        const std::uint8_t* p = &mem_ctx->data[static_cast<std::size_t>(a)];
+        for (int k = 0; k < 8; ++k) uval |= (static_cast<std::uint64_t>(p[k]) << (k * 8));
+        if (!reg_push(static_cast<std::int64_t>(uval))) {
+          result.error = VmError::kStackOverflow;
+          result.instructions_executed = executed;
+          return result;
+        }
+        break;
+      }
+      case Opcode::kStoreMem64: {
+        if (!reg_pop(&b) || !reg_pop(&a)) { result.error = VmError::kStackUnderflow; result.instructions_executed = executed; return result; }
+        if (!mem_ctx || a < 0 || static_cast<std::size_t>(a) + 8 > mem_ctx->data.size()) {
+          result.error = VmError::kMemoryAccessOutOfBounds;
+          result.instructions_executed = executed;
+          return result;
+        }
+        std::uint64_t uval = static_cast<std::uint64_t>(b);
+        std::uint8_t* p = &mem_ctx->data[static_cast<std::size_t>(a)];
+        for (int k = 0; k < 8; ++k) p[k] = static_cast<std::uint8_t>((uval >> (k * 8)) & 0xFF);
+        break;
+      }
+      case Opcode::kCall: {
+        if (call_stack.size() >= 64) {
+          result.error = VmError::kCallStackOverflow;
+          result.instructions_executed = executed;
+          return result;
+        }
+        call_stack.push_back(next_pc);
+        next_pc = ReadU16(operand);
+        break;
+      }
+      case Opcode::kRetSub: {
+        if (call_stack.empty()) {
+          result.error = VmError::kCallStackUnderflow;
+          result.instructions_executed = executed;
+          return result;
+        }
+        next_pc = call_stack.back();
+        call_stack.pop_back();
+        break;
+      }
+      case Opcode::kCallProgram: {
+        std::uint16_t prog_id = ReadU16(operand);
+        const Program* callee = ProgramRegistry::Get(prog_id);
+        if (!callee) {
+          result.error = VmError::kVerificationFailed;
+          result.instructions_executed = executed;
+          return result;
+        }
+        std::vector<std::int64_t> callee_args(callee->num_locals, 0);
+        for (int k = static_cast<int>(callee->num_locals) - 1; k >= 0; --k) {
+          std::int64_t arg_val = 0;
+          if (reg_pop(&arg_val)) callee_args[k] = arg_val;
+        }
+        auto sub_res = RunRegisterThreaded(*callee, callee_args, opcode_map, mem_ctx);
+        if (sub_res.error != VmError::kNone) {
+          result.error = sub_res.error;
+          result.instructions_executed = executed + sub_res.instructions_executed;
+          return result;
+        }
+        executed += sub_res.instructions_executed;
+        if (!reg_push(sub_res.value)) {
+          result.error = VmError::kStackOverflow;
+          result.instructions_executed = executed;
+          return result;
+        }
+        break;
+      }
+      case Opcode::kFAdd: {
+        if (!reg_pop(&b) || !reg_pop(&a)) { result.error = VmError::kStackUnderflow; result.instructions_executed = executed; return result; }
+        double da = BitsToDouble(static_cast<std::uint64_t>(a));
+        double db = BitsToDouble(static_cast<std::uint64_t>(b));
+        if (!reg_push(static_cast<std::int64_t>(DoubleToBits(da + db)))) {
+          result.error = VmError::kStackOverflow; result.instructions_executed = executed; return result;
+        }
+        break;
+      }
+      case Opcode::kFSub: {
+        if (!reg_pop(&b) || !reg_pop(&a)) { result.error = VmError::kStackUnderflow; result.instructions_executed = executed; return result; }
+        double da = BitsToDouble(static_cast<std::uint64_t>(a));
+        double db = BitsToDouble(static_cast<std::uint64_t>(b));
+        if (!reg_push(static_cast<std::int64_t>(DoubleToBits(da - db)))) {
+          result.error = VmError::kStackOverflow; result.instructions_executed = executed; return result;
+        }
+        break;
+      }
+      case Opcode::kFMul: {
+        if (!reg_pop(&b) || !reg_pop(&a)) { result.error = VmError::kStackUnderflow; result.instructions_executed = executed; return result; }
+        double da = BitsToDouble(static_cast<std::uint64_t>(a));
+        double db = BitsToDouble(static_cast<std::uint64_t>(b));
+        if (!reg_push(static_cast<std::int64_t>(DoubleToBits(da * db)))) {
+          result.error = VmError::kStackOverflow; result.instructions_executed = executed; return result;
+        }
+        break;
+      }
+      case Opcode::kFDiv: {
+        if (!reg_pop(&b) || !reg_pop(&a)) { result.error = VmError::kStackUnderflow; result.instructions_executed = executed; return result; }
+        double da = BitsToDouble(static_cast<std::uint64_t>(a));
+        double db = BitsToDouble(static_cast<std::uint64_t>(b));
+        if (db == 0.0) { result.error = VmError::kDivisionByZero; result.instructions_executed = executed; return result; }
+        if (!reg_push(static_cast<std::int64_t>(DoubleToBits(da / db)))) {
+          result.error = VmError::kStackOverflow; result.instructions_executed = executed; return result;
+        }
+        break;
+      }
+      case Opcode::kFCmpEq: {
+        if (!reg_pop(&b) || !reg_pop(&a)) { result.error = VmError::kStackUnderflow; result.instructions_executed = executed; return result; }
+        double da = BitsToDouble(static_cast<std::uint64_t>(a));
+        double db = BitsToDouble(static_cast<std::uint64_t>(b));
+        if (!reg_push(da == db ? 1 : 0)) { result.error = VmError::kStackOverflow; result.instructions_executed = executed; return result; }
+        break;
+      }
+      case Opcode::kFCmpLt: {
+        if (!reg_pop(&b) || !reg_pop(&a)) { result.error = VmError::kStackUnderflow; result.instructions_executed = executed; return result; }
+        double da = BitsToDouble(static_cast<std::uint64_t>(a));
+        double db = BitsToDouble(static_cast<std::uint64_t>(b));
+        if (!reg_push(da < db ? 1 : 0)) { result.error = VmError::kStackOverflow; result.instructions_executed = executed; return result; }
+        break;
+      }
+      case Opcode::kFCmpGt: {
+        if (!reg_pop(&b) || !reg_pop(&a)) { result.error = VmError::kStackUnderflow; result.instructions_executed = executed; return result; }
+        double da = BitsToDouble(static_cast<std::uint64_t>(a));
+        double db = BitsToDouble(static_cast<std::uint64_t>(b));
+        if (!reg_push(da > db ? 1 : 0)) { result.error = VmError::kStackOverflow; result.instructions_executed = executed; return result; }
+        break;
+      }
+      case Opcode::kIntToFloat: {
+        if (!reg_pop(&a)) { result.error = VmError::kStackUnderflow; result.instructions_executed = executed; return result; }
+        double da = static_cast<double>(a);
+        if (!reg_push(static_cast<std::int64_t>(DoubleToBits(da)))) { result.error = VmError::kStackOverflow; result.instructions_executed = executed; return result; }
+        break;
+      }
+      case Opcode::kFloatToInt: {
+        if (!reg_pop(&a)) { result.error = VmError::kStackUnderflow; result.instructions_executed = executed; return result; }
+        double da = BitsToDouble(static_cast<std::uint64_t>(a));
+        if (!reg_push(static_cast<std::int64_t>(da))) { result.error = VmError::kStackOverflow; result.instructions_executed = executed; return result; }
+        break;
+      }
+    }
+
+    pc = next_pc;
   }
 }
 

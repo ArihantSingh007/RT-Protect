@@ -134,6 +134,7 @@ void PrintUsage() {
       "Usage:\n"
       "  Project Integration & Build Operations:\n"
       "    rtprotect-tool integrate <project-path> [options]\n"
+      "    rtprotect-tool unreal-integrate <uproject-path> [options]\n"
       "      --profile <dev|balanced|maximum>   Protection hardening profile (default: balanced)\n"
       "      --target <name>                   Specify CMake executable target to protect\n"
       "      --dry-run                         Preview plan without modifying files\n"
@@ -1127,6 +1128,7 @@ int main(int argc, char** argv) {
 
   // Integration & Lifecycle commands
   if (cmd == "integrate") return CmdIntegrate(argc, argv);
+  if (cmd == "unreal-integrate") return CmdIntegrate(argc, argv);
   if (cmd == "sign-release") return CmdSignRelease(argc, argv);
   if (cmd == "rollback") return CmdRollback(argc, argv);
   if (cmd == "validate-build") return CmdValidateBuild(argc, argv);

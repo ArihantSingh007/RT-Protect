@@ -23,6 +23,8 @@
 #include "antitamper/risk_policy.h"
 #include "bytecode_vm/compiler.h"
 #include "bytecode_vm/opcode_map.h"
+#include "tooling/cxx_ast_scanner.h"
+#include "tooling/unreal_integration.h"
 #include "bytecode_vm/serialize.h"
 #include "bytecode_vm/vm.h"
 #include "crypto/aead.h"
@@ -290,202 +292,124 @@ bool TransformSourceFile(const fs::path& file_path,
 
   auto opcode_map = rtprotect::vm::OpcodeMap::FromSeed(opcode_seed);
 
-  // 1. Scan for functions marked with RTPROTECT_VIRTUALIZE or // @rtprotect_virtualize or [[rtprotect::virtualize]]
-  std::vector<std::string> tags = {"RTPROTECT_VIRTUALIZE", "// @rtprotect_virtualize", "[[rtprotect::virtualize]]"};
-  for (const auto& tag : tags) {
-    std::size_t tag_pos = 0;
-    while ((tag_pos = content.find(tag, tag_pos)) != std::string::npos) {
-      // Find start of function signature after the tag
-      std::size_t fn_start = tag_pos + tag.size();
-      while (fn_start < content.size() && std::isspace(static_cast<unsigned char>(content[fn_start]))) {
-        ++fn_start;
-      }
-      if (fn_start >= content.size()) break;
+  // 1. AST-aware scan for functions marked with RTPROTECT_VIRTUALIZE or [[rtprotect::virtualize]]
+  CxxAstScanner scanner(content);
+  auto tagged_fns = scanner.FindTaggedFunctions();
 
-      // Find function header up to '{'
-      std::size_t brace_open = content.find('{', fn_start);
-      if (brace_open == std::string::npos) break;
+  // Process in reverse order so replacements do not invalidate earlier offsets
+  std::sort(tagged_fns.begin(), tagged_fns.end(), [](const ExtractedFunction& a, const ExtractedFunction& b) {
+    return a.full_range.start > b.full_range.start;
+  });
 
-      // Find matching closing brace '}' respecting strings and comments
-      int brace_depth = 1;
-      std::size_t i = brace_open + 1;
-      std::size_t brace_close = std::string::npos;
-      while (i < content.size() && brace_depth > 0) {
-        char c = content[i];
-        if (c == '/' && i + 1 < content.size() && content[i + 1] == '/') {
-          // Line comment: skip to newline
-          i += 2;
-          while (i < content.size() && content[i] != '\n') ++i;
-          continue;
-        }
-        if (c == '/' && i + 1 < content.size() && content[i + 1] == '*') {
-          // Block comment: skip to */
-          i += 2;
-          while (i + 1 < content.size() && !(content[i] == '*' && content[i + 1] == '/')) ++i;
-          if (i + 1 < content.size()) i += 2;
-          continue;
-        }
-        if (c == '"') {
-          // String literal: skip to unescaped "
-          ++i;
-          while (i < content.size() && content[i] != '"') {
-            if (content[i] == '\\' && i + 1 < content.size()) ++i;
-            ++i;
-          }
-          if (i < content.size()) ++i;
-          continue;
-        }
-        if (c == '\'') {
-          // Char literal: skip to unescaped '
-          ++i;
-          while (i < content.size() && content[i] != '\'') {
-            if (content[i] == '\\' && i + 1 < content.size()) ++i;
-            ++i;
-          }
-          if (i < content.size()) ++i;
-          continue;
-        }
-        if (c == '{') {
-          ++brace_depth;
-        } else if (c == '}') {
-          --brace_depth;
-          if (brace_depth == 0) {
-            brace_close = i;
-            break;
-          }
-        }
-        ++i;
-      }
-      if (brace_depth != 0 || brace_close == std::string::npos) break;
+  for (const auto& fn : tagged_fns) {
+    std::string fn_name = fn.name;
+    const auto& arg_names = fn.arg_names;
 
-      std::string full_fn = content.substr(fn_start, brace_close - fn_start + 1);
+    // Compile function using CompileCSubset with seeded OpcodeMap
+    std::string compile_err;
+    rtprotect::vm::CompilerOptions compiler_opts;
+    compiler_opts.opcode_map = &opcode_map;
 
-      // Parse function name and arguments
-      std::string header = content.substr(fn_start, brace_open - fn_start);
-      auto lparen = header.find('(');
-      auto rparen = header.find(')', lparen);
-      if (lparen == std::string::npos || rparen == std::string::npos) {
-        tag_pos = brace_close + 1;
-        continue;
+    auto prog = rtprotect::vm::CompileCSubset(fn.full_signature_and_body, &compile_err, compiler_opts);
+    if (!prog.has_value()) {
+      prog = rtprotect::vm::CompileCSubset(fn.body, &compile_err, compiler_opts);
+    }
+
+    if (prog.has_value()) {
+      auto serialized = rtprotect::vm::Serialize(*prog);
+
+      std::array<std::uint8_t, 16> fn_salt{};
+      if (RAND_bytes(fn_salt.data(), static_cast<int>(fn_salt.size())) != 1) {
+        for (std::size_t k = 0; k < fn_salt.size(); ++k) fn_salt[k] = static_cast<std::uint8_t>(k ^ 0x33);
       }
 
-      // Extract function name (last token before '(')
-      std::string pre_paren = header.substr(0, lparen);
-      while (!pre_paren.empty() && std::isspace(static_cast<unsigned char>(pre_paren.back()))) pre_paren.pop_back();
-      auto name_start = pre_paren.find_last_of(" \t\n*&");
-      std::string fn_name = (name_start == std::string::npos) ? pre_paren : pre_paren.substr(name_start + 1);
+      auto master_key = DeriveBuildFunctionMasterKey(vm_root, manifest_pubkey, product_id, fn_salt.data(), fn_salt.size());
+      if (!master_key.has_value()) continue;
 
-      // Extract argument names
-      std::string args_str = header.substr(lparen + 1, rparen - lparen - 1);
-      std::vector<std::string> arg_names;
-      std::stringstream arg_ss(args_str);
-      std::string item;
-      while (std::getline(arg_ss, item, ',')) {
-        while (!item.empty() && std::isspace(static_cast<unsigned char>(item.front()))) item.erase(0, 1);
-        while (!item.empty() && std::isspace(static_cast<unsigned char>(item.back()))) item.pop_back();
-        if (item.empty() || item == "void") continue;
-        auto a_start = item.find_last_of(" \t*&");
-        std::string aname = (a_start == std::string::npos) ? item : item.substr(a_start + 1);
-        arg_names.push_back(aname);
+      rtprotect::antitamper::RiskAssessment clean_risk;
+      clean_risk.risk_score = 0;
+      auto bound_key = rtprotect::antitamper::DeriveTamperBoundKey(*master_key, clean_risk, fn_name);
+      auto encrypted = rtprotect::crypto::Encrypt(bound_key, serialized.data(), serialized.size());
+      if (!encrypted.has_value()) continue;
+
+      // Extract function header signature
+      std::string header = fn.header;
+      while (!header.empty() && std::isspace(static_cast<unsigned char>(header.front()))) header.erase(0, 1);
+      while (!header.empty() && std::isspace(static_cast<unsigned char>(header.back()))) header.pop_back();
+
+      std::ostringstream rep_ss;
+      rep_ss << "// [RTProtect Bytecode-Virtualized Function: " << fn_name << "]\n";
+      rep_ss << header << " {\n";
+      rep_ss << "    static const std::uint8_t s_enc_code[] = {\n        "
+             << FormatByteArrayLiteral(encrypted->ciphertext.data(), encrypted->ciphertext.size()) << "\n    };\n";
+      rep_ss << "    static const std::uint8_t s_nonce[] = {\n        "
+             << FormatByteArrayLiteral(encrypted->nonce.bytes, sizeof(encrypted->nonce.bytes)) << "\n    };\n";
+      rep_ss << "    static const std::uint8_t s_tag[] = {\n        "
+             << FormatByteArrayLiteral(encrypted->tag, sizeof(encrypted->tag)) << "\n    };\n";
+      rep_ss << "    static const std::uint8_t s_fn_salt[] = {\n        "
+             << FormatByteArrayLiteral(fn_salt.data(), fn_salt.size()) << "\n    };\n";
+      rep_ss << "    static std::uint64_t s_tamper_accum = 0;\n";
+      rep_ss << "    rtprotect::antitamper::ScatterTamperCheck(\"" << fn_name << "_entry\", &s_tamper_accum);\n";
+      rep_ss << "    auto s_risk = rtprotect::antitamper::AssessFastEnvironmentRisk();\n";
+      rep_ss << "    if (s_tamper_accum != 0) s_risk.risk_score = 100;\n";
+      rep_ss << "    auto s_fn_key = rtprotect_client::GetFunctionMasterKey(s_fn_salt, sizeof(s_fn_salt));\n";
+      rep_ss << "    if (!s_fn_key.has_value()) return 0;\n";
+      rep_ss << "    auto s_bound_key = rtprotect::antitamper::DeriveTamperBoundKey(*s_fn_key, s_risk, \"" << fn_name << "\");\n";
+      rep_ss << "    rtprotect::crypto::EncryptedMessage s_msg;\n";
+      rep_ss << "    std::memcpy(s_msg.nonce.bytes, s_nonce, sizeof(s_nonce));\n";
+      rep_ss << "    s_msg.ciphertext.assign(s_enc_code, s_enc_code + sizeof(s_enc_code));\n";
+      rep_ss << "    std::memcpy(s_msg.tag, s_tag, sizeof(s_tag));\n";
+      rep_ss << "    auto s_plain = rtprotect::crypto::Decrypt(s_bound_key, s_msg, nullptr, 0, nullptr);\n";
+      rep_ss << "    if (!s_plain.has_value()) return 0;\n";
+      rep_ss << "    auto s_prog = rtprotect::vm::Deserialize(s_plain->data(), s_plain->size());\n";
+      rep_ss << "    if (!s_prog.has_value()) return 0;\n";
+      rep_ss << "    std::vector<std::int64_t> s_args = {";
+      for (std::size_t k = 0; k < arg_names.size(); ++k) {
+        if (k > 0) rep_ss << ", ";
+        rep_ss << "static_cast<std::int64_t>(" << arg_names[k] << ")";
       }
+      rep_ss << "};\n";
+      rep_ss << "    rtprotect::vm::MemoryContext s_mem_ctx(65536);\n";
+      rep_ss << "    auto s_res = rtprotect::vm::Run(*s_prog, s_args, &rtprotect_client::GetBuildOpcodeMap(), &s_mem_ctx);\n";
+      rep_ss << "    if (s_res.error != rtprotect::vm::VmError::kNone) {\n";
+      rep_ss << "        s_tamper_accum ^= (0xDEADBEEF00000000ULL | static_cast<std::uint64_t>(s_res.error));\n";
+      rep_ss << "        rtprotect::antitamper::ScatterTamperCheck(\"" << fn_name << "_fault\", &s_tamper_accum);\n";
+      rep_ss << "        return 0;\n";
+      rep_ss << "    }\n";
+      rep_ss << "    return s_res.value;\n";
+      rep_ss << "}";
 
-      // Compile function using CompileCSubset with seeded OpcodeMap
-      std::string compile_err;
-      rtprotect::vm::CompilerOptions compiler_opts;
-      compiler_opts.opcode_map = &opcode_map;
-      auto prog = rtprotect::vm::CompileCSubset(full_fn, &compile_err, compiler_opts);
-      if (prog.has_value()) {
-        auto serialized = rtprotect::vm::Serialize(*prog);
-
-        std::array<std::uint8_t, 16> fn_salt{};
-        if (RAND_bytes(fn_salt.data(), static_cast<int>(fn_salt.size())) != 1) {
-          for (std::size_t k = 0; k < fn_salt.size(); ++k) fn_salt[k] = static_cast<std::uint8_t>(k ^ 0x33);
-        }
-
-        auto master_key = DeriveBuildFunctionMasterKey(vm_root, manifest_pubkey, product_id, fn_salt.data(), fn_salt.size());
-        if (!master_key.has_value()) {
-          tag_pos = brace_close + 1;
-          continue;
-        }
-
-        rtprotect::antitamper::RiskAssessment clean_risk;
-        clean_risk.risk_score = 0;
-        auto bound_key = rtprotect::antitamper::DeriveTamperBoundKey(*master_key, clean_risk, fn_name);
-        auto encrypted = rtprotect::crypto::Encrypt(bound_key, serialized.data(), serialized.size());
-        if (!encrypted.has_value()) {
-          tag_pos = brace_close + 1;
-          continue;
-        }
-
-        // Generate C++ replacement wrapper (NO plaintext master key in binary!)
-        std::ostringstream rep_ss;
-        rep_ss << "// [RTProtect Bytecode-Virtualized Function: " << fn_name << "]\n";
-        rep_ss << header << " {\n";
-        rep_ss << "    static const std::uint8_t s_enc_code[] = {\n        "
-               << FormatByteArrayLiteral(encrypted->ciphertext.data(), encrypted->ciphertext.size()) << "\n    };\n";
-        rep_ss << "    static const std::uint8_t s_nonce[] = {\n        "
-               << FormatByteArrayLiteral(encrypted->nonce.bytes, sizeof(encrypted->nonce.bytes)) << "\n    };\n";
-        rep_ss << "    static const std::uint8_t s_tag[] = {\n        "
-               << FormatByteArrayLiteral(encrypted->tag, sizeof(encrypted->tag)) << "\n    };\n";
-        rep_ss << "    static const std::uint8_t s_fn_salt[] = {\n        "
-               << FormatByteArrayLiteral(fn_salt.data(), fn_salt.size()) << "\n    };\n";
-        rep_ss << "    static std::uint64_t s_tamper_accum = 0;\n";
-        rep_ss << "    rtprotect::antitamper::ScatterTamperCheck(\"" << fn_name << "_entry\", &s_tamper_accum);\n";
-        rep_ss << "    auto s_risk = rtprotect::antitamper::AssessFastEnvironmentRisk();\n";
-        rep_ss << "    if (s_tamper_accum != 0) s_risk.risk_score = 100;\n";
-        rep_ss << "    auto s_fn_key = rtprotect_client::GetFunctionMasterKey(s_fn_salt, sizeof(s_fn_salt));\n";
-        rep_ss << "    if (!s_fn_key.has_value()) return 0;\n";
-        rep_ss << "    auto s_bound_key = rtprotect::antitamper::DeriveTamperBoundKey(*s_fn_key, s_risk, \"" << fn_name << "\");\n";
-        rep_ss << "    rtprotect::crypto::EncryptedMessage s_msg;\n";
-        rep_ss << "    std::memcpy(s_msg.nonce.bytes, s_nonce, sizeof(s_nonce));\n";
-        rep_ss << "    s_msg.ciphertext.assign(s_enc_code, s_enc_code + sizeof(s_enc_code));\n";
-        rep_ss << "    std::memcpy(s_msg.tag, s_tag, sizeof(s_tag));\n";
-        rep_ss << "    auto s_plain = rtprotect::crypto::Decrypt(s_bound_key, s_msg, nullptr, 0, nullptr);\n";
-        rep_ss << "    if (!s_plain.has_value()) return 0;\n";
-        rep_ss << "    auto s_prog = rtprotect::vm::Deserialize(s_plain->data(), s_plain->size());\n";
-        rep_ss << "    if (!s_prog.has_value()) return 0;\n";
-        rep_ss << "    std::vector<std::int64_t> s_args = {";
-        for (std::size_t k = 0; k < arg_names.size(); ++k) {
-          if (k > 0) rep_ss << ", ";
-          rep_ss << "static_cast<std::int64_t>(" << arg_names[k] << ")";
-        }
-        rep_ss << "};\n";
-        rep_ss << "    rtprotect::vm::MemoryContext s_mem_ctx(65536);\n";
-        rep_ss << "    auto s_res = rtprotect::vm::Run(*s_prog, s_args, &rtprotect_client::GetBuildOpcodeMap(), &s_mem_ctx);\n";
-        rep_ss << "    if (s_res.error != rtprotect::vm::VmError::kNone) {\n";
-        rep_ss << "        s_tamper_accum ^= (0xDEADBEEF00000000ULL | static_cast<std::uint64_t>(s_res.error));\n";
-        rep_ss << "        rtprotect::antitamper::ScatterTamperCheck(\"" << fn_name << "_fault\", &s_tamper_accum);\n";
-        rep_ss << "        return 0;\n";
-        rep_ss << "    }\n";
-        rep_ss << "    return s_res.value;\n";
-        rep_ss << "}";
-
-        // Replace tag through brace_close with the wrapper
-        std::size_t replace_len = (brace_close - tag_pos + 1);
-        content.replace(tag_pos, replace_len, rep_ss.str());
-        tag_pos += rep_ss.str().size();
-
-        out_virtualized.push_back(fn_name);
-        modified = true;
-      } else {
-        tag_pos = brace_close + 1;
-      }
+      content.replace(fn.full_range.start, fn.full_range.end - fn.full_range.start, rep_ss.str());
+      out_virtualized.push_back(fn_name);
+      modified = true;
     }
   }
 
-  // 2. Scan for RTPROTECT_STRING("...") and replace with OBFUSCATED_STRING("...")
-  std::size_t str_pos = 0;
-  while ((str_pos = content.find("RTPROTECT_STRING(\"", str_pos)) != std::string::npos) {
-    auto end_quote = content.find("\")", str_pos + 18);
-    if (end_quote != std::string::npos) {
-      std::string str_lit = content.substr(str_pos + 17, end_quote - str_pos - 16);
-      std::string repl = "OBFUSCATED_STRING(" + str_lit + ")";
-      content.replace(str_pos, (end_quote + 2) - str_pos, repl);
-      str_pos += repl.size();
-      ++out_obfuscated_count;
+  // 2. Translation-unit string obfuscation (Step 5)
+  if (profile == ProtectionProfile::kMaximum || profile == ProtectionProfile::kBalanced) {
+    CxxAstScanner post_scanner(content);
+    std::size_t unit_obf = 0;
+    std::string rewritten = post_scanner.RewriteTranslationUnitStrings(&unit_obf);
+    if (unit_obf > 0) {
+      content = rewritten;
+      out_obfuscated_count += unit_obf;
       modified = true;
-    } else {
-      str_pos += 18;
+    }
+  } else {
+    // Explicit RTPROTECT_STRING("...") handling
+    std::size_t str_pos = 0;
+    while ((str_pos = content.find("RTPROTECT_STRING(\"", str_pos)) != std::string::npos) {
+      auto end_quote = content.find("\")", str_pos + 18);
+      if (end_quote != std::string::npos) {
+        std::string str_lit = content.substr(str_pos + 17, end_quote - str_pos - 16);
+        std::string repl = "OBFUSCATED_STRING(" + str_lit + ")";
+        content.replace(str_pos, (end_quote + 2) - str_pos, repl);
+        str_pos += repl.size();
+        ++out_obfuscated_count;
+        modified = true;
+      } else {
+        str_pos += 18;
+      }
     }
   }
 
@@ -649,8 +573,10 @@ ChangePlan PlanIntegration(const IntegrationOptions& options) {
 
     plan.is_supported = true;
     plan.files_to_modify.push_back(cmake_file.string());
+  } else if (IsUnrealProject(proj_path)) {
+    return PlanUnrealIntegration(options);
   } else {
-    plan.explanation = "No supported build system found (CMakeLists.txt required)";
+    plan.explanation = "No supported build system found (CMakeLists.txt or .uproject required)";
     return plan;
   }
 
@@ -687,6 +613,10 @@ IntegrationReport ExecuteIntegration(const IntegrationOptions& options) {
     report.success = false;
     report.error_message = plan.explanation;
     return report;
+  }
+
+  if (plan.detected_build_system == "UnrealBuildTool (UBT)") {
+    return ExecuteUnrealIntegration(options);
   }
 
   // Validate identifiers

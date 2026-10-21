@@ -1,6 +1,8 @@
 // tests/test_antitamper.cpp
 
 #include "antitamper/anti_debug.h"
+#include "antitamper/anti_dump.h"
+#include "antitamper/dynamic_import.h"
 #include "antitamper/env_detect.h"
 #include "antitamper/risk_policy.h"
 #include "tests/micro_test.h"
@@ -119,6 +121,70 @@ MT_TEST(AntiTamper_Watchdog_StartsAndStopsCleanly) {
 MT_TEST(AntiTamper_AssessFastRisk_ExecutesWithoutThreadCreation) {
   RiskAssessment r = AssessFastEnvironmentRisk();
   MT_CHECK(r.risk_score >= 0 && r.risk_score <= 100);
+}
+
+MT_TEST(AntiTamper_DynamicImport_CompileTimeHashValidation) {
+  constexpr std::uint32_t h1 = HashApi("IsDebuggerPresent");
+  constexpr std::uint32_t h2 = HashApi("CheckRemoteDebuggerPresent");
+  MT_CHECK(h1 != 0);
+  MT_CHECK(h2 != 0);
+  MT_CHECK(h1 != h2);
+
+  // Case insensitive hash matches uppercase / lowercase
+  constexpr std::uint32_t mod_lower = HashApiCaseInsensitive("kernel32.dll");
+  constexpr std::uint32_t mod_upper = HashApiCaseInsensitive("KERNEL32.DLL");
+  MT_CHECK(mod_lower == mod_upper);
+
+  const wchar_t wide_name[] = L"KERNEL32.DLL";
+  std::uint32_t mod_wide = HashApiWideCaseInsensitive(wide_name, 12);
+  MT_CHECK(mod_wide == mod_lower);
+}
+
+MT_TEST(AntiTamper_DynamicImport_ResolveExportByHash) {
+#if defined(_WIN32)
+  void* k32_base = GetLoadedModuleBaseByHash(kHashKernel32);
+  MT_CHECK(k32_base != nullptr);
+
+  auto fnVirtualProtect = ResolveExportByHash(k32_base, kHashVirtualProtect);
+  MT_CHECK(fnVirtualProtect != nullptr);
+
+  auto fnIsDbg = ResolveExportByHash(k32_base, kHashIsDebuggerPresent);
+  MT_CHECK(fnIsDbg != nullptr);
+
+  // Invalid hash should return nullptr
+  auto fnInvalid = ResolveExportByHash(k32_base, 0x12345678);
+  MT_CHECK(fnInvalid == nullptr);
+#else
+  MT_CHECK(true);
+#endif
+}
+
+MT_TEST(AntiTamper_AntiDump_DetectMemoryDumper_CleanEnvironment) {
+  // In normal test execution, no dumper module or dbghelp should be present
+  bool dumper = DetectMemoryDumper();
+  MT_CHECK(!dumper);
+}
+
+MT_TEST(AntiTamper_AntiDump_DetectMemoryProbing_CleanEnvironment) {
+  bool probing = DetectMemoryProbing();
+  MT_CHECK(!probing);
+}
+
+MT_TEST(AntiTamper_AntiDump_EphemeralExecutionGuard_ExecuteAndCleanse) {
+  EphemeralExecutionGuard guard;
+#if defined(_WIN32)
+  // Windows x64: lea rax, [rcx + rcx + 7]; ret -> computes 2*x + 7
+  static const std::uint8_t kPayload[] = { 0x48, 0x8d, 0x44, 0x09, 0x07, 0xc3 };
+#else
+  // SysV x64: lea rax, [rdi + rdi + 7]; ret -> computes 2*x + 7
+  static const std::uint8_t kPayload[] = { 0x48, 0x8d, 0x44, 0x3f, 0x07, 0xc3 };
+#endif
+  std::int64_t result = 0;
+  bool ok = guard.ExecuteEphemeral(kPayload, sizeof(kPayload), 5, &result);
+  MT_CHECK(ok);
+  MT_CHECK(result == 17);  // 2*5 + 7 = 17
+  // After execution completes, memory should have been cleansed and freed
+  MT_CHECK(!guard.IsAllocated());
 }
 
 MT_MAIN()

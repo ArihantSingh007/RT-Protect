@@ -1,5 +1,7 @@
 add_library(rtprotect_tooling STATIC
     integration_engine.cpp
+    cxx_ast_scanner.cpp
+    unreal_integration.cpp
 )
 target_include_directories(rtprotect_tooling PUBLIC ${CMAKE_SOURCE_DIR})
 target_link_libraries(rtprotect_tooling PUBLIC
