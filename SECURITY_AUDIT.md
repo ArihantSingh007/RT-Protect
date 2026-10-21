@@ -92,12 +92,13 @@ The audit identified and resolved critical architectural vulnerabilities in sign
 | **RTP-SEC-052** | Medium | Confirmed | `tooling/integration_engine.cpp` (`TransformSourceFile`) | Lexical Parser Desynchronization on Strings and Comments: Function brace matching counted braces `{}` inside strings and comments, truncating or corrupting extracted function bodies containing braces in log strings or comments. | Applications with log messages or comments containing `{}` failed integration compilation or produced malformed virtualized routines. | Virtualizing functions with braces inside strings or comments. | Implemented lexical state machine tracking string literals, character literals, single-line comments, and multi-line comments, ignoring braces within literals and comments. | Verified in `test_integration_engine.cpp` (`TestFunctionExtractionHandlesCommentsAndStrings`). |
 | **RTP-SEC-053** | High | Confirmed | `tooling/integration_engine.cpp` (`TransformSourceFile`), `bytecode_vm/vm.cpp` | Missing `MemoryContext` in Virtualized Wrapper and Unhandled VM Execution Faults: Generated function wrappers passed `nullptr` for `MemoryContext`, causing all virtualized functions utilizing memory operations (`load8`/`store8`/`load64`/`store64`) to return 0 with `kMemoryAccessOutOfBounds`. Wrapper discarded `s_res.error`. | Virtualized algorithms utilizing memory buffers fail silently at runtime; execution faults (overflow, budget, invalid opcode) indistinguishable from valid 0 returns. | Calling virtualized routine with memory operations. | Allocated and passed `rtprotect::vm::MemoryContext s_mem_ctx(65536)` in generated wrapper; checked `s_res.error != VmError::kNone`, perturbing `s_tamper_accum` and triggering tamper response on any execution fault. | Verified in `test_integration_engine.cpp` (`TestFunctionVirtualizationExecutionRoundTrip` Case 11 & 12). |
 | **RTP-SEC-054** | Medium | Confirmed | `antitamper/anti_debug.cpp`, `risk_policy.cpp`, `tooling/integration_engine.cpp` | Thread-Spawning Overhead in Hot Paths & Idle Hardware Watchdog: Generated wrappers called `AssessEnvironmentRisk()` per invocation, creating helper threads on Windows for thread-context inspection, while the background watchdog sat idle. | Heavy performance overhead in virtualized function hot paths; watchdog thread unused outside tests. | Invoking virtualized functions in tight loops. | Implemented `AssessFastEnvironmentRisk()` (zero threads, sub-microsecond); launched background watchdog (`StartHardwareBreakpointWatchdog(500)`) at process init in runtime glue; wrappers query cached atomic flags; added Linux multi-layer debugger checks (`TracerPid`, `wchan`, `ptrace(PTRACE_TRACEME)`). | Verified in `test_antitamper.cpp` (`AntiTamper_AssessFastRisk_ExecutesWithoutThreadCreation`, `AntiTamper_Watchdog_StartsAndStopsCleanly`). |
+| **RTP-SEC-055** | High | Confirmed | `licensing/activation_service.*`, `activation_database.*`, `activation_client.*`, `activation_server_http.*`, `tooling/activation_server_main.cpp` | Missing Networked Activation Authority & Cross-Machine Virtualization Key Sequencing Gap: Relying on local-only token generation caused independent machines to generate distinct random `vm_root` values, preventing distributed binaries from executing virtualized bytecode on client devices. | Distributed protected binaries fail closed at runtime on foreign customer devices; licenses could not be remotely validated, renewed, or revoked. | Running protected binary on a secondary machine without pre-shared local cache. | Implemented full networked Activation Authority service with `/activate`, `/renew`, and `/deactivate` endpoints, ACID database persistence (`ActivationDatabase`), ephemeral HKDF transport payload encryption, multi-seat concurrency enforcement, anti-replay nonces, and native HTTP client transport (`WinHttp` + socket fallback), bridging canonical `vm_root` distribution. | Verified in `test_activation_service.cpp` (full lifecycle, concurrency limits, anti-replay, revocation detection, and live HTTP loopback network tests). |
 
 ---
 
 ## 3. Verification & Quality Assurance Summary
 
-The entire suite of 19 automated unit, component, and integration tests passes with 100% success rate on Windows x64:
+The entire suite of 20 automated unit, component, and integration tests passes with 100% success rate on Windows x64:
 
 ```
 Test project C:/Users/Arihant Singh/Downloads/rtprotect_hardening_WIP/build
@@ -115,19 +116,20 @@ Test project C:/Users/Arihant Singh/Downloads/rtprotect_hardening_WIP/build
       Start 12: test_checksum_flattened ..........   Passed    0.03 sec
       Start 13: test_license .....................   Passed    0.03 sec
       Start 14: test_activation ..................   Passed    0.03 sec
-      Start 15: test_hardware_id .................   Passed    0.02 sec
-      Start 16: test_update_manifest .............   Passed    0.04 sec
-      Start 17: test_antitamper ..................   Passed    0.02 sec
-      Start 18: test_opcode_map ..................   Passed    0.02 sec
-      Start 19: test_integration_engine ..........   Passed    2.84 sec
+      Start 15: test_activation_service ..........   Passed    0.18 sec
+      Start 16: test_hardware_id .................   Passed    0.02 sec
+      Start 17: test_update_manifest .............   Passed    0.04 sec
+      Start 18: test_antitamper ..................   Passed    0.02 sec
+      Start 19: test_opcode_map ..................   Passed    0.02 sec
+      Start 20: test_integration_engine ..........   Passed    2.84 sec
 
-100% tests passed, 0 tests failed out of 19 (Total Test Time: 3.44 sec)
+100% tests passed, 0 tests failed out of 20
 ```
 
 Packaging execution via `tooling/package_release.ps1` verifies all targets, strips release executables, and produces a complete distribution archive:
 - **Package Archive:** `dist/rtprotect-<date>-windows-x64.zip`
 - **Directory Layout:**
-  - `bin/`: `rtprotect-tool.exe`, `rtprotect-bench.exe`, `libcrypto-3-x64.dll`
+  - `bin/`: `rtprotect-tool.exe`, `rtprotect-activation-server.exe`, `rtprotect-bench.exe`, `libcrypto-3-x64.dll`
   - `include/`: `antitamper/`, `bytecode_vm/`, `crypto/`, `integrity/`, `licensing/`, `obfuscation/`, `tooling/`
   - `lib/`: `librtprotect_antitamper.a`, `librtprotect_crypto.a`, `librtprotect_integrity.a`, `librtprotect_licensing.a`, `librtprotect_licensing_buildtools.a`, `librtprotect_tooling.a`, `librtprotect_vm.a`
   - `docs/`: Complete security and integration architecture specifications

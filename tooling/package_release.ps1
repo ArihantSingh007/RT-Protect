@@ -74,6 +74,12 @@ if (-not (Test-Path $BenchExe)) {
 }
 if (Test-Path $BenchExe) { Copy-Item $BenchExe (Join-Path $PkgDir "bin") }
 
+$ServerExe = Join-Path $BuildDir "tooling\rtprotect-activation-server.exe"
+if (-not (Test-Path $ServerExe)) {
+    $ServerExe = Join-Path $BuildDir "tooling\Release\rtprotect-activation-server.exe"
+}
+if (Test-Path $ServerExe) { Copy-Item $ServerExe (Join-Path $PkgDir "bin") }
+
 # Include OpenSSL runtime DLL if present
 if ($OpenSslDir -and (Test-Path "$OpenSslDir\bin\libcrypto-3-x64.dll")) {
     Copy-Item "$OpenSslDir\bin\libcrypto-3-x64.dll" (Join-Path $PkgDir "bin")

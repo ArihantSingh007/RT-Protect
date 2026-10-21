@@ -378,7 +378,7 @@ ActivationStatus VerifyActivationTicket(const ActivationTicket& ticket,
   return ActivationStatus::kValid;
 }
 
-std::vector<std::uint8_t> SerializeActivationToken(const ActivationToken& token) {
+std::vector<std::uint8_t> SerializeActivationTokenForSigning(const ActivationToken& token) {
   if (token.license_id.size() > kMaxActivationFieldLen ||
       token.device_fingerprint_hash.size() > kMaxActivationFieldLen) {
     return {};
@@ -397,6 +397,13 @@ std::vector<std::uint8_t> SerializeActivationToken(const ActivationToken& token)
   buf.insert(buf.end(), token.vm_root.begin(), token.vm_root.end());
   WriteU64(buf, token.sequence_number);
 
+  return buf;
+}
+
+std::vector<std::uint8_t> SerializeActivationToken(const ActivationToken& token) {
+  auto buf = SerializeActivationTokenForSigning(token);
+  if (buf.empty()) return {};
+  buf.insert(buf.end(), token.signature.begin(), token.signature.end());
   return buf;
 }
 
@@ -428,7 +435,21 @@ std::optional<ActivationToken> DeserializeActivationToken(const std::uint8_t* da
 
   if (!ReadU64(p, end, token.sequence_number)) return std::nullopt;
 
+  if (p < end) {
+    if (static_cast<std::size_t>(end - p) != token.signature.size()) {
+      return std::nullopt;
+    }
+    std::memcpy(token.signature.data(), p, token.signature.size());
+    p += token.signature.size();
+  }
+
   return token;
+}
+
+bool VerifyActivationTokenSignature(const ActivationToken& token, const integrity::Ed25519PublicKey& pubkey) {
+  auto bytes_signed = SerializeActivationTokenForSigning(token);
+  if (bytes_signed.empty()) return false;
+  return integrity::VerifyManifestSignature(bytes_signed, token.signature, pubkey);
 }
 
 std::string GetActivationTokenPath(const std::string& product_id) {

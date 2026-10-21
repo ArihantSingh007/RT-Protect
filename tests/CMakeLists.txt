@@ -75,6 +75,20 @@ target_link_libraries(test_activation PRIVATE rtprotect_licensing rtprotect_lice
 target_include_directories(test_activation PRIVATE ${CMAKE_SOURCE_DIR})
 add_test(NAME test_activation COMMAND test_activation)
 
+add_executable(test_activation_service test_activation_service.cpp)
+target_link_libraries(test_activation_service PRIVATE
+    rtprotect_licensing
+    rtprotect_licensing_buildtools
+    rtprotect_integrity_buildtools
+    rtprotect_integrity
+    rtprotect_crypto
+)
+if(WIN32)
+    target_link_libraries(test_activation_service PRIVATE winhttp ws2_32)
+endif()
+target_include_directories(test_activation_service PRIVATE ${CMAKE_SOURCE_DIR})
+add_test(NAME test_activation_service COMMAND test_activation_service)
+
 add_executable(test_hardware_id test_hardware_id.cpp)
 target_link_libraries(test_hardware_id PRIVATE rtprotect_licensing)
 target_include_directories(test_hardware_id PRIVATE ${CMAKE_SOURCE_DIR})

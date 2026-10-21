@@ -1,0 +1,87 @@
+// licensing/activation_service.h
+//
+// Vendor-side online activation authority business logic.
+// Implements /activate, /renew, and /deactivate operations with seat enforcement,
+// ephemeral transport encryption, and anti-replay nonce tracking.
+
+#pragma once
+
+#include <array>
+#include <cstdint>
+#include <memory>
+#include <optional>
+#include <string>
+
+#include "crypto/aead.h"
+#include "integrity/keys.h"
+#include "licensing/activation.h"
+#include "licensing/activation_database.h"
+
+namespace rtprotect::licensing {
+
+struct ActivateRequest {
+  std::string license_key;
+  std::string device_fingerprint;
+  std::string product_id;
+  std::string client_version = "1.0.0";
+  std::uint64_t client_timestamp = 0;
+  std::array<std::uint8_t, 32> client_nonce{};
+};
+
+struct ActivateResponse {
+  ActivationStatus status = ActivationStatus::kMalformed;
+  std::string error_message;
+  std::array<std::uint8_t, 32> server_nonce{};
+  std::string encrypted_token_hex;
+  std::optional<ActivationToken> token; // Decrypted token for direct in-process callers
+};
+
+struct RenewRequest {
+  std::string token_hex; // Serialized ActivationToken in hex
+  std::string device_fingerprint;
+  std::array<std::uint8_t, 32> client_nonce{};
+};
+
+struct RenewResponse {
+  ActivationStatus status = ActivationStatus::kMalformed;
+  std::string error_message;
+  std::array<std::uint8_t, 32> server_nonce{};
+  std::string encrypted_token_hex;
+  std::optional<ActivationToken> token;
+};
+
+struct DeactivateRequest {
+  std::string token_hex;
+  std::string device_fingerprint;
+};
+
+struct DeactivateResponse {
+  bool success = false;
+  std::string error_message;
+};
+
+class ActivationService {
+ public:
+  ActivationService(ActivationDatabase& db,
+                    integrity::Ed25519PrivateKey signing_key,
+                    const integrity::Ed25519PublicKey& verification_key);
+
+  // In-process business logic
+  ActivateResponse ProcessActivate(const ActivateRequest& req, std::uint64_t current_time = 0);
+  RenewResponse ProcessRenew(const RenewRequest& req, std::uint64_t current_time = 0);
+  DeactivateResponse ProcessDeactivate(const DeactivateRequest& req, std::uint64_t current_time = 0);
+
+  // JSON REST handlers (for HTTP daemon)
+  std::string HandleActivateJson(const std::string& json_body, std::uint64_t current_time = 0);
+  std::string HandleRenewJson(const std::string& json_body, std::uint64_t current_time = 0);
+  std::string HandleDeactivateJson(const std::string& json_body, std::uint64_t current_time = 0);
+
+  const integrity::Ed25519PublicKey& public_key() const { return verification_key_; }
+
+ private:
+  ActivationDatabase& db_;
+  integrity::Ed25519PrivateKey signing_key_;
+  integrity::Ed25519PublicKey verification_key_;
+};
+
+}  // namespace rtprotect::licensing
