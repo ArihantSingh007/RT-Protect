@@ -8,9 +8,15 @@
 
 #pragma once
 
+#include <array>
+#include <cstdint>
+#include <filesystem>
+#include <optional>
 #include <string>
 #include <vector>
-#include <optional>
+
+#include "crypto/aead.h"
+#include "integrity/keys.h"
 
 namespace rtprotect::tooling {
 
@@ -89,6 +95,10 @@ struct IntegrationReport {
   std::string license_file;
   bool build_succeeded = false;
   bool validation_succeeded = false;
+  std::vector<std::string> virtualized_functions;
+  std::size_t obfuscated_string_count = 0;
+  std::size_t scattered_check_count = 0;
+  std::uint32_t opcode_seed = 0;
 
   std::string ToJson() const;
 };
@@ -116,5 +126,26 @@ bool ValidateProtectedBuild(const std::string& project_dir,
                             const std::string& manifest_path,
                             const std::string& signature_path,
                             std::string* error_out = nullptr);
+
+// Derives function master key dynamically using HKDF from build authority seed,
+// manifest public key, product ID, and function-specific salt.
+std::optional<crypto::Aes256Key> DeriveBuildFunctionMasterKey(
+    const std::array<std::uint8_t, 32>& build_auth_seed,
+    const integrity::Ed25519PublicKey& manifest_pubkey,
+    const std::string& product_id,
+    const std::uint8_t* salt,
+    std::size_t salt_len);
+
+// Transforms target source file: virtualizes RTPROTECT_VIRTUALIZE functions,
+// obfuscates string literals, and injects scattered tamper checkpoints.
+bool TransformSourceFile(const std::filesystem::path& file_path,
+                         const ProtectionProfile profile,
+                         const std::uint32_t opcode_seed,
+                         const std::array<std::uint8_t, 32>& build_auth_seed,
+                         const integrity::Ed25519PublicKey& manifest_pubkey,
+                         const std::string& product_id,
+                         std::vector<std::string>& out_virtualized,
+                         std::size_t& out_obfuscated_count,
+                         std::size_t& out_scattered_count);
 
 }  // namespace rtprotect::tooling

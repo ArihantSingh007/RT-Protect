@@ -82,6 +82,15 @@ StackEffect GetStackEffect(Opcode op) {
       return {1, -1};
     case Opcode::kRet:
       return {1, -1};
+    case Opcode::kLoadMem8:
+    case Opcode::kLoadMem64:
+      return {1, 0};
+    case Opcode::kStoreMem8:
+    case Opcode::kStoreMem64:
+      return {2, -2};
+    case Opcode::kCall:
+    case Opcode::kRetSub:
+      return {0, 0};
   }
   return {0, 0};  // unreachable: every Opcode value is handled above, and
                    // IsValidOpcode() already rejected anything that isn't
@@ -149,7 +158,8 @@ std::optional<std::unordered_set<std::uint32_t>> VerifyProgram(const Program& pr
       }
       case Opcode::kJmp:
       case Opcode::kJz:
-      case Opcode::kJnz: {
+      case Opcode::kJnz:
+      case Opcode::kCall: {
         std::uint16_t target = ReadU16(&code[i + 1]);
         jump_targets.emplace_back(static_cast<std::uint32_t>(i), target);
         break;
@@ -238,11 +248,17 @@ std::optional<std::unordered_set<std::uint32_t>> VerifyProgram(const Program& pr
     };
 
     VerifyError propagate_error = VerifyError::kNone;
-    if (op == Opcode::kRet) {
+    if (op == Opcode::kRet || op == Opcode::kRetSub) {
       // Terminal: no successor to propagate to.
     } else if (op == Opcode::kJmp) {
       std::uint16_t target = ReadU16(&code[offset + 1]);
       if (!propagate(target, &propagate_error)) return fail(propagate_error);
+    } else if (op == Opcode::kCall) {
+      std::uint16_t target = ReadU16(&code[offset + 1]);
+      if (!propagate(target, &propagate_error)) return fail(propagate_error);
+      std::uint32_t fallthrough = static_cast<std::uint32_t>(offset + 1 + operand_len);
+      if (fallthrough >= n) return fail(VerifyError::kControlFlowFallsOffEnd);
+      if (!propagate(fallthrough, &propagate_error)) return fail(propagate_error);
     } else if (op == Opcode::kJz || op == Opcode::kJnz) {
       std::uint16_t target = ReadU16(&code[offset + 1]);
       if (!propagate(target, &propagate_error)) return fail(propagate_error);

@@ -25,6 +25,8 @@
 #include "licensing/license.h"
 #include "licensing/license_signer.h"
 #include "licensing/license_verifier.h"
+#include "licensing/activation.h"
+#include "licensing/activation_server.h"
 #include "tooling/file_io.h"
 #include "tooling/integration_engine.h"
 
@@ -183,6 +185,31 @@ void PrintUsage() {
       "\n"
       "    rtprotect-tool fingerprint [--canonical]\n"
       "      Computes and displays multi-metric hardware fingerprint of local machine.\n"
+      "\n"
+      "  Online Activation & Revocation:\n"
+      "    rtprotect-tool activate-issue [options]\n"
+      "      --priv-key <file>                 Vendor Ed25519 private key (required)\n"
+      "      --license-id <id>                 Authorized license ID (required)\n"
+      "      --out <file>                      Output ticket file path (required)\n"
+      "      --hwid <id>                       Device hardware ID (default: local machine ID)\n"
+      "      --validity-hours <n>              Ticket validity duration in hours (default: 24)\n"
+      "      --format <binary|text>            Output format (default: binary)\n"
+      "      --revocation-db <file>            Optional revocation database to verify against\n"
+      "\n"
+      "    rtprotect-tool activate-verify [options]\n"
+      "      --pub-key <file>                  Vendor Ed25519 public key (required)\n"
+      "      --ticket <file>                   Activation ticket file to verify (required)\n"
+      "      --license-id <id>                 Expected license ID (optional)\n"
+      "      --hwid <id>                       Expected hardware ID (default: local machine ID)\n"
+      "      --revocation-db <file>            Optional revocation database to check\n"
+      "\n"
+      "    rtprotect-tool activate-revoke --db <file> [options]\n"
+      "      --revoke-license <id>             Add license ID to revocation list\n"
+      "      --revoke-ticket <id>              Add ticket ID to revocation list\n"
+      "      --unrevoke-license <id>           Remove license ID from revocation list\n"
+      "      --unrevoke-ticket <id>            Remove ticket ID from revocation list\n"
+      "      --reason <string>                 Reason for revocation\n"
+      "      --list                            Display current revocation database entries\n"
       "\n"
       "  Cryptographic & Integrity Primitives:\n"
       "    rtprotect-tool genkey-ed25519 <priv-out> <pub-out>\n"
@@ -830,6 +857,253 @@ int CmdFingerprint(int argc, char** argv) {
   return 0;
 }
 
+int CmdActivateIssue(int argc, char** argv) {
+  std::string priv_key_file;
+  std::string license_id;
+  std::string out_file;
+  std::string hwid;
+  std::string format = "binary";
+  std::string revocation_db_file;
+  int validity_hours = 24;
+
+  for (int i = 2; i < argc; ++i) {
+    std::string arg = argv[i];
+    if (arg == "--priv-key" && i + 1 < argc) priv_key_file = argv[++i];
+    else if (arg == "--license-id" && i + 1 < argc) license_id = argv[++i];
+    else if (arg == "--out" && i + 1 < argc) out_file = argv[++i];
+    else if (arg == "--hwid" && i + 1 < argc) hwid = argv[++i];
+    else if (arg == "--validity-hours" && i + 1 < argc) validity_hours = std::atoi(argv[++i]);
+    else if (arg == "--format" && i + 1 < argc) format = argv[++i];
+    else if (arg == "--revocation-db" && i + 1 < argc) revocation_db_file = argv[++i];
+    else {
+      std::fprintf(stderr, "error: unknown argument '%s'\n", arg.c_str());
+      return 2;
+    }
+  }
+
+  if (priv_key_file.empty() || license_id.empty() || out_file.empty()) {
+    std::fprintf(stderr, "error: --priv-key, --license-id, and --out are required for activate-issue\n");
+    return 2;
+  }
+
+  auto priv_bytes = ReadFile(priv_key_file);
+  if (!priv_bytes.has_value() || priv_bytes->size() != integrity::kEd25519PrivateKeyLen) {
+    std::fprintf(stderr, "error: invalid private key file: %s\n", priv_key_file.c_str());
+    return 1;
+  }
+  auto priv_key = integrity::Ed25519PrivateKey::FromBytes(priv_bytes->data(), priv_bytes->size());
+  if (!priv_key.has_value()) {
+    std::fprintf(stderr, "error: could not load private key\n");
+    return 1;
+  }
+
+  licensing::ActivationManager mgr;
+  if (!revocation_db_file.empty()) {
+    auto db_text = ReadTextFile(revocation_db_file);
+    if (db_text.has_value()) {
+      mgr.ImportRevocationListJson(*db_text);
+    }
+  }
+
+  std::string target_hwid = (hwid.empty() || hwid == "local") ? licensing::GetLocalHardwareId() : hwid;
+  auto now = static_cast<std::uint64_t>(std::time(nullptr));
+  auto req = licensing::CreateActivationRequest(license_id, target_hwid, "1.0.0", now);
+
+  std::uint64_t validity_seconds = static_cast<std::uint64_t>(std::max(1, validity_hours)) * 3600ULL;
+  auto result = mgr.IssueTicket(req, *priv_key, validity_seconds, now);
+  if (result.status != licensing::ActivationStatus::kValid || !result.ticket.has_value()) {
+    std::fprintf(stderr, "error: failed to issue activation ticket: %s\n",
+                 result.error_message.empty() ? licensing::ToString(result.status) : result.error_message.c_str());
+    return 1;
+  }
+
+  if (format == "text") {
+    std::string text = licensing::ActivationTicketToText(*result.ticket);
+    if (!WriteTextFile(out_file, text)) {
+      std::fprintf(stderr, "error: failed to write ticket file: %s\n", out_file.c_str());
+      return 1;
+    }
+  } else {
+    auto bin = licensing::SerializeActivationTicket(*result.ticket);
+    if (!WriteFile(out_file, bin.data(), bin.size())) {
+      std::fprintf(stderr, "error: failed to write ticket file: %s\n", out_file.c_str());
+      return 1;
+    }
+  }
+
+  std::printf("Successfully issued activation ticket: %s\n", out_file.c_str());
+  std::printf("  Ticket ID:     %s\n", result.ticket->ticket_id.c_str());
+  std::printf("  License ID:    %s\n", result.ticket->license_id.c_str());
+  std::printf("  Hardware ID:   %s\n", result.ticket->hardware_id.c_str());
+  std::printf("  Issued At:     %llu\n", static_cast<unsigned long long>(result.ticket->issued_at));
+  std::printf("  Expires At:    %llu (%d hours)\n", static_cast<unsigned long long>(result.ticket->expires_at), validity_hours);
+  return 0;
+}
+
+int CmdActivateVerify(int argc, char** argv) {
+  std::string pub_key_file;
+  std::string ticket_file;
+  std::string expected_license;
+  std::string expected_hwid;
+  std::string revocation_db_file;
+
+  for (int i = 2; i < argc; ++i) {
+    std::string arg = argv[i];
+    if (arg == "--pub-key" && i + 1 < argc) pub_key_file = argv[++i];
+    else if (arg == "--ticket" && i + 1 < argc) ticket_file = argv[++i];
+    else if (arg == "--license-id" && i + 1 < argc) expected_license = argv[++i];
+    else if (arg == "--hwid" && i + 1 < argc) expected_hwid = argv[++i];
+    else if (arg == "--revocation-db" && i + 1 < argc) revocation_db_file = argv[++i];
+    else {
+      std::fprintf(stderr, "error: unknown argument '%s'\n", arg.c_str());
+      return 2;
+    }
+  }
+
+  if (pub_key_file.empty() || ticket_file.empty()) {
+    std::fprintf(stderr, "error: --pub-key and --ticket are required for activate-verify\n");
+    return 2;
+  }
+
+  auto pub_bytes = ReadFile(pub_key_file);
+  if (!pub_bytes.has_value() || pub_bytes->size() != integrity::kEd25519PublicKeyLen) {
+    std::fprintf(stderr, "error: invalid public key file: %s\n", pub_key_file.c_str());
+    return 1;
+  }
+  integrity::Ed25519PublicKey pub_key;
+  std::memcpy(pub_key.data(), pub_bytes->data(), 32);
+
+  auto tkt_data = ReadFile(ticket_file);
+  if (!tkt_data.has_value()) {
+    std::fprintf(stderr, "error: could not read ticket file: %s\n", ticket_file.c_str());
+    return 1;
+  }
+
+  std::optional<licensing::ActivationTicket> ticket =
+      licensing::DeserializeActivationTicket(tkt_data->data(), tkt_data->size());
+  if (!ticket.has_value()) {
+    std::string text(reinterpret_cast<const char*>(tkt_data->data()), tkt_data->size());
+    ticket = licensing::ActivationTicketFromText(text);
+  }
+
+  if (!ticket.has_value()) {
+    std::fprintf(stderr, "error: failed to parse activation ticket (corrupted or unrecognized format)\n");
+    return 1;
+  }
+
+  if (!revocation_db_file.empty()) {
+    auto db_text = ReadTextFile(revocation_db_file);
+    if (db_text.has_value()) {
+      licensing::ActivationManager mgr;
+      mgr.ImportRevocationListJson(*db_text);
+      if (mgr.IsLicenseRevoked(ticket->license_id)) {
+        std::fprintf(stderr, "VERIFICATION FAILED: License '%s' has been revoked\n", ticket->license_id.c_str());
+        return 1;
+      }
+      if (mgr.IsTicketRevoked(ticket->ticket_id)) {
+        std::fprintf(stderr, "VERIFICATION FAILED: Ticket '%s' has been revoked\n", ticket->ticket_id.c_str());
+        return 1;
+      }
+    }
+  }
+
+  licensing::ActivationRequest req;
+  req.license_id = expected_license.empty() ? ticket->license_id : expected_license;
+  req.hardware_id = (expected_hwid.empty() || expected_hwid == "local") ? licensing::GetLocalHardwareId() : expected_hwid;
+  req.nonce = ticket->nonce; // Mirrored nonce check
+
+  auto now = static_cast<std::uint64_t>(std::time(nullptr));
+  auto status = licensing::VerifyActivationTicket(*ticket, pub_key, req, now);
+
+  if (status != licensing::ActivationStatus::kValid) {
+    std::fprintf(stderr, "VERIFICATION FAILED: %s\n", licensing::ToString(status));
+    return 1;
+  }
+
+  std::printf("Ticket Verification Succeeded:\n");
+  std::printf("  Ticket ID:    %s\n", ticket->ticket_id.c_str());
+  std::printf("  License ID:   %s\n", ticket->license_id.c_str());
+  std::printf("  Hardware ID:  %s\n", ticket->hardware_id.c_str());
+  std::printf("  Issued At:    %llu\n", static_cast<unsigned long long>(ticket->issued_at));
+  std::printf("  Expires At:   %llu\n", static_cast<unsigned long long>(ticket->expires_at));
+  std::printf("  Status:       Valid\n");
+  return 0;
+}
+
+int CmdActivateRevoke(int argc, char** argv) {
+  std::string db_file;
+  std::string revoke_license_id;
+  std::string revoke_ticket_id;
+  std::string unrevoke_license_id;
+  std::string unrevoke_ticket_id;
+  std::string reason = "Revoked by vendor";
+  bool list_entries = false;
+
+  for (int i = 2; i < argc; ++i) {
+    std::string arg = argv[i];
+    if (arg == "--db" && i + 1 < argc) db_file = argv[++i];
+    else if (arg == "--revoke-license" && i + 1 < argc) revoke_license_id = argv[++i];
+    else if (arg == "--revoke-ticket" && i + 1 < argc) revoke_ticket_id = argv[++i];
+    else if (arg == "--unrevoke-license" && i + 1 < argc) unrevoke_license_id = argv[++i];
+    else if (arg == "--unrevoke-ticket" && i + 1 < argc) unrevoke_ticket_id = argv[++i];
+    else if (arg == "--reason" && i + 1 < argc) reason = argv[++i];
+    else if (arg == "--list") list_entries = true;
+    else {
+      std::fprintf(stderr, "error: unknown argument '%s'\n", arg.c_str());
+      return 2;
+    }
+  }
+
+  if (db_file.empty()) {
+    std::fprintf(stderr, "error: --db <file> is required for activate-revoke\n");
+    return 2;
+  }
+
+  licensing::ActivationManager mgr;
+  auto existing = ReadTextFile(db_file);
+  if (existing.has_value()) {
+    mgr.ImportRevocationListJson(*existing);
+  }
+
+  bool modified = false;
+  if (!revoke_license_id.empty()) {
+    mgr.RevokeLicense(revoke_license_id, reason);
+    std::printf("Revoked license: %s (reason: %s)\n", revoke_license_id.c_str(), reason.c_str());
+    modified = true;
+  }
+  if (!revoke_ticket_id.empty()) {
+    mgr.RevokeTicket(revoke_ticket_id, reason);
+    std::printf("Revoked ticket: %s (reason: %s)\n", revoke_ticket_id.c_str(), reason.c_str());
+    modified = true;
+  }
+  if (!unrevoke_license_id.empty()) {
+    mgr.UnrevokeLicense(unrevoke_license_id);
+    std::printf("Unrevoked license: %s\n", unrevoke_license_id.c_str());
+    modified = true;
+  }
+  if (!unrevoke_ticket_id.empty()) {
+    mgr.UnrevokeTicket(unrevoke_ticket_id);
+    std::printf("Unrevoked ticket: %s\n", unrevoke_ticket_id.c_str());
+    modified = true;
+  }
+
+  if (modified) {
+    std::string exported = mgr.ExportRevocationListJson();
+    if (!WriteTextFile(db_file, exported)) {
+      std::fprintf(stderr, "error: failed to write updated revocation db: %s\n", db_file.c_str());
+      return 1;
+    }
+    std::printf("Saved updated revocation database to %s\n", db_file.c_str());
+  }
+
+  if (list_entries || !modified) {
+    std::printf("Current Revocation Database (%s):\n", db_file.c_str());
+    std::string json = mgr.ExportRevocationListJson();
+    std::printf("%s\n", json.c_str());
+  }
+  return 0;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -862,6 +1136,11 @@ int main(int argc, char** argv) {
   if (cmd == "license-verify") return CmdLicenseVerify(argc, argv);
   if (cmd == "license-inspect") return CmdLicenseInspect(argc, argv);
   if (cmd == "fingerprint") return CmdFingerprint(argc, argv);
+
+  // Online Activation & Revocation
+  if (cmd == "activate-issue") return CmdActivateIssue(argc, argv);
+  if (cmd == "activate-verify") return CmdActivateVerify(argc, argv);
+  if (cmd == "activate-revoke") return CmdActivateRevoke(argc, argv);
 
   // Cryptographic Primitives
   if (cmd == "genkey-ed25519") return CmdGenkeyEd25519(argc, argv);

@@ -38,9 +38,17 @@ enum class VmError {
                         // whose mathematical result doesn't fit in int64_t.
   kInstructionBudgetExceeded,  // runaway loop protection -- see design note below
   kWrongNumberOfArgs,
+  kMemoryAccessOutOfBounds,    // Memory load/store offset out of bounds
+  kCallStackOverflow,          // Call stack exceeded maximum recursion depth
+  kCallStackUnderflow,         // RetSub executed without an active call frame
 };
 
 const char* ToString(VmError error);
+
+struct MemoryContext {
+  std::vector<std::uint8_t> data;
+  explicit MemoryContext(std::size_t size = 4096) : data(size, 0) {}
+};
 
 struct RunResult {
   VmError error = VmError::kNone;
@@ -70,6 +78,7 @@ class OpcodeMap;
 
 RunResult Run(const Program& program,
               const std::vector<std::int64_t>& args,
-              const OpcodeMap* opcode_map = nullptr);
+              const OpcodeMap* opcode_map = nullptr,
+              MemoryContext* mem_ctx = nullptr);
 
 }  // namespace rtprotect::vm

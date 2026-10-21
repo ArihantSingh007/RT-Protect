@@ -148,3 +148,62 @@ rtprotect-tool.exe license-verify `
     --product com.vendor.cadsoftware `
     --edition Enterprise
 ```
+
+---
+
+## 6. Online Activation Tickets & Revocation Subsystem
+
+While static asymmetric licenses provide offline verification, commercial anti-piracy systems require a mechanism to cap concurrent activations across machines and instantly revoke compromised licenses or leaked tickets.
+
+### 6.1 Ticket Architecture & Wire Specification
+RTProtect implements a short-lived **Activation Ticket** subsystem:
+1. **Challenge Request (`ActivationRequest`):** The client application generates a cryptographically random 32-byte challenge `nonce`, records the local `hardware_id` and client timestamp, and submits it to the vendor activation endpoint.
+2. **Authority Issuance (`ActivationTicket`):** The vendor licensing authority verifies active concurrency against registered seats, validates revocation status, generates a random 32-byte `session_key`, and signs the ticket with the vendor's Ed25519 private key.
+3. **Short Temporal Windows:** Tickets typically have a validity window of 24 hours to 7 days (`validity_seconds`). Once expired, the client application must re-activate online.
+
+### 6.2 Dynamic Concurrency Caps & Instant Revocation
+The vendor server (`ActivationManager`) tracks active sessions per `license_id`:
+- Concurrent device activations exceeding `max_concurrency` are rejected with `ActivationStatus::kConcurrencyLimitExceeded`.
+- Hardware ID renewals from the same machine refresh active tickets without consuming additional seats.
+- Revoked licenses or tickets take effect immediately upon next activation or via synchronized revocation lists (`activate-revoke`).
+
+### 6.3 Activation CLI Workflows
+```powershell
+# Issue an activation ticket (valid for 24 hours)
+rtprotect-tool.exe activate-issue `
+    --priv-key vendor_master.priv `
+    --license-id "LIC-ENTERPRISE-001" `
+    --hwid local `
+    --validity-hours 24 `
+    --out "device.ticket"
+
+# Verify ticket against public key and local device
+rtprotect-tool.exe activate-verify `
+    --pub-key vendor_master.pub `
+    --ticket "device.ticket" `
+    --license-id "LIC-ENTERPRISE-001"
+
+# Revoke a leaked license or compromised ticket
+rtprotect-tool.exe activate-revoke `
+    --db revocations.json `
+    --revoke-license "LIC-ENTERPRISE-001" `
+    --reason "Compromised credential reported"
+```
+
+---
+
+## 7. Machine Fingerprinting Limitations & Virtual Machine Cloning
+
+Hardware binding relies on OS-exposed metrics (`cpuid`, root volume serial, OS MachineGuid, hostname) and a persistent local device seed (`LOCALAPPDATA\RTProtect\device.seed` / `~/.config/rtprotect/device.seed`).
+
+### 7.1 The VM Snapshot & Image Replication Boundary
+In purely user-mode software protection, perfect protection against full VM snapshot replication is theoretically impossible without external trusted hardware (TPM / hardware dongles) or network telemetry:
+- **VM Cloning:** If a virtual machine is snapshotted or cloned, the guest OS state, registry, volume serials, and filesystem files (including `device.seed`) are cloned verbatim. Both clones will generate identical hardware IDs and pass local hardware similarity checks.
+- **Container Sandboxing:** Containers sharing an identical container base image and virtualized root volume will encounter probe fallbacks unless a unique persistent seed is maintained.
+
+### 7.2 Layered Mitigations
+RTProtect counters VM cloning and container replication through layered controls:
+1. **Short-Lived Online Activation Tickets:** Cloned machines can run until ticket expiration (maximum 24h), but cannot renew online simultaneously when concurrency seats are capped.
+2. **Non-Deterministic Probe Fallbacks:** When OS hardware queries fail (e.g. inside restrictive sandboxes), RTProtect mixes a cryptographically random device secret (`GetOrCreateDeviceSeed()`) rather than static public literals, ensuring different sandboxed machines do not collide on identical fallback hashes.
+3. **Hypervisor & VM Detection:** Anti-tamper heuristics detect hypervisor environments and virtualized machine signatures, enabling risk policies to restrict high-value operations or demand online verification.
+

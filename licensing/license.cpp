@@ -297,6 +297,7 @@ const char* ToString(LicenseStatus status) {
     case LicenseStatus::kExpired: return "license expired";
     case LicenseStatus::kNotYetValid: return "license not yet valid (future issue time)";
     case LicenseStatus::kHardwareMismatch: return "hardware fingerprint mismatch";
+    case LicenseStatus::kHardwareDegraded: return "hardware probes degraded under strict policy";
     case LicenseStatus::kProductMismatch: return "product identifier mismatch";
     case LicenseStatus::kEditionMismatch: return "product edition mismatch";
     case LicenseStatus::kClockRollbackDetected: return "system clock rollback detected";

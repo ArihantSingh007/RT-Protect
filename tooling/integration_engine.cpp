@@ -21,6 +21,12 @@
 #endif
 
 #include "antitamper/risk_policy.h"
+#include "bytecode_vm/compiler.h"
+#include "bytecode_vm/opcode_map.h"
+#include "bytecode_vm/serialize.h"
+#include "bytecode_vm/vm.h"
+#include "crypto/aead.h"
+#include "crypto/kdf.h"
 #include "integrity/keys.h"
 #include "integrity/manifest.h"
 #include "integrity/sha256.h"
@@ -235,7 +241,268 @@ std::string GenerateRandomHex(std::size_t num_bytes) {
   return ss.str();
 }
 
+std::string FormatByteArrayLiteral(const std::uint8_t* data, std::size_t len) {
+  std::ostringstream ss;
+  for (std::size_t i = 0; i < len; ++i) {
+    char h[8];
+    std::snprintf(h, sizeof(h), "0x%02X", data[i]);
+    ss << h;
+    if (i + 1 < len) ss << ", ";
+    if ((i + 1) % 12 == 0 && i + 1 < len) ss << "\n        ";
+  }
+  return ss.str();
+}
+
 }  // namespace
+
+std::optional<crypto::Aes256Key> DeriveBuildFunctionMasterKey(
+    const std::array<std::uint8_t, 32>& build_auth_seed,
+    const integrity::Ed25519PublicKey& manifest_pubkey,
+    const std::string& product_id,
+    const std::uint8_t* salt,
+    std::size_t salt_len) {
+  std::vector<std::uint8_t> hkdf_salt(manifest_pubkey.begin(), manifest_pubkey.end());
+  if (salt && salt_len > 0) {
+    hkdf_salt.insert(hkdf_salt.end(), salt, salt + salt_len);
+  }
+  std::string info = std::string("rtprotect/virtualize/") + product_id;
+  crypto::SecureBuffer sec_seed(build_auth_seed.data(), build_auth_seed.size());
+  auto derived = crypto::Hkdf::DeriveKey(sec_seed, hkdf_salt, info, crypto::kAes256KeyLen);
+  if (!derived.has_value()) return std::nullopt;
+  return crypto::Aes256Key::FromBytes(derived->data(), derived->size());
+}
+
+bool TransformSourceFile(const fs::path& file_path,
+                         const ProtectionProfile profile,
+                         const std::uint32_t opcode_seed,
+                         const std::array<std::uint8_t, 32>& build_auth_seed,
+                         const integrity::Ed25519PublicKey& manifest_pubkey,
+                         const std::string& product_id,
+                         std::vector<std::string>& out_virtualized,
+                         std::size_t& out_obfuscated_count,
+                         std::size_t& out_scattered_count) {
+  (void)profile;
+  auto content_opt = ReadTextFile(file_path.string());
+  if (!content_opt.has_value()) return false;
+  std::string content = *content_opt;
+  bool modified = false;
+
+  auto opcode_map = rtprotect::vm::OpcodeMap::FromSeed(opcode_seed);
+
+  // 1. Scan for functions marked with RTPROTECT_VIRTUALIZE or // @rtprotect_virtualize or [[rtprotect::virtualize]]
+  std::vector<std::string> tags = {"RTPROTECT_VIRTUALIZE", "// @rtprotect_virtualize", "[[rtprotect::virtualize]]"};
+  for (const auto& tag : tags) {
+    std::size_t tag_pos = 0;
+    while ((tag_pos = content.find(tag, tag_pos)) != std::string::npos) {
+      // Find start of function signature after the tag
+      std::size_t fn_start = tag_pos + tag.size();
+      while (fn_start < content.size() && std::isspace(static_cast<unsigned char>(content[fn_start]))) {
+        ++fn_start;
+      }
+      if (fn_start >= content.size()) break;
+
+      // Find function header up to '{'
+      std::size_t brace_open = content.find('{', fn_start);
+      if (brace_open == std::string::npos) break;
+
+      // Find matching closing brace '}' respecting strings and comments
+      int brace_depth = 1;
+      std::size_t i = brace_open + 1;
+      std::size_t brace_close = std::string::npos;
+      while (i < content.size() && brace_depth > 0) {
+        char c = content[i];
+        if (c == '/' && i + 1 < content.size() && content[i + 1] == '/') {
+          // Line comment: skip to newline
+          i += 2;
+          while (i < content.size() && content[i] != '\n') ++i;
+          continue;
+        }
+        if (c == '/' && i + 1 < content.size() && content[i + 1] == '*') {
+          // Block comment: skip to */
+          i += 2;
+          while (i + 1 < content.size() && !(content[i] == '*' && content[i + 1] == '/')) ++i;
+          if (i + 1 < content.size()) i += 2;
+          continue;
+        }
+        if (c == '"') {
+          // String literal: skip to unescaped "
+          ++i;
+          while (i < content.size() && content[i] != '"') {
+            if (content[i] == '\\' && i + 1 < content.size()) ++i;
+            ++i;
+          }
+          if (i < content.size()) ++i;
+          continue;
+        }
+        if (c == '\'') {
+          // Char literal: skip to unescaped '
+          ++i;
+          while (i < content.size() && content[i] != '\'') {
+            if (content[i] == '\\' && i + 1 < content.size()) ++i;
+            ++i;
+          }
+          if (i < content.size()) ++i;
+          continue;
+        }
+        if (c == '{') {
+          ++brace_depth;
+        } else if (c == '}') {
+          --brace_depth;
+          if (brace_depth == 0) {
+            brace_close = i;
+            break;
+          }
+        }
+        ++i;
+      }
+      if (brace_depth != 0 || brace_close == std::string::npos) break;
+
+      std::string full_fn = content.substr(fn_start, brace_close - fn_start + 1);
+
+      // Parse function name and arguments
+      std::string header = content.substr(fn_start, brace_open - fn_start);
+      auto lparen = header.find('(');
+      auto rparen = header.find(')', lparen);
+      if (lparen == std::string::npos || rparen == std::string::npos) {
+        tag_pos = brace_close + 1;
+        continue;
+      }
+
+      // Extract function name (last token before '(')
+      std::string pre_paren = header.substr(0, lparen);
+      while (!pre_paren.empty() && std::isspace(static_cast<unsigned char>(pre_paren.back()))) pre_paren.pop_back();
+      auto name_start = pre_paren.find_last_of(" \t\n*&");
+      std::string fn_name = (name_start == std::string::npos) ? pre_paren : pre_paren.substr(name_start + 1);
+
+      // Extract argument names
+      std::string args_str = header.substr(lparen + 1, rparen - lparen - 1);
+      std::vector<std::string> arg_names;
+      std::stringstream arg_ss(args_str);
+      std::string item;
+      while (std::getline(arg_ss, item, ',')) {
+        while (!item.empty() && std::isspace(static_cast<unsigned char>(item.front()))) item.erase(0, 1);
+        while (!item.empty() && std::isspace(static_cast<unsigned char>(item.back()))) item.pop_back();
+        if (item.empty() || item == "void") continue;
+        auto a_start = item.find_last_of(" \t*&");
+        std::string aname = (a_start == std::string::npos) ? item : item.substr(a_start + 1);
+        arg_names.push_back(aname);
+      }
+
+      // Compile function using CompileCSubset with seeded OpcodeMap
+      std::string compile_err;
+      rtprotect::vm::CompilerOptions compiler_opts;
+      compiler_opts.opcode_map = &opcode_map;
+      auto prog = rtprotect::vm::CompileCSubset(full_fn, &compile_err, compiler_opts);
+      if (prog.has_value()) {
+        auto serialized = rtprotect::vm::Serialize(*prog);
+
+        std::array<std::uint8_t, 16> fn_salt{};
+        if (RAND_bytes(fn_salt.data(), static_cast<int>(fn_salt.size())) != 1) {
+          for (std::size_t k = 0; k < fn_salt.size(); ++k) fn_salt[k] = static_cast<std::uint8_t>(k ^ 0x33);
+        }
+
+        auto master_key = DeriveBuildFunctionMasterKey(build_auth_seed, manifest_pubkey, product_id, fn_salt.data(), fn_salt.size());
+        if (!master_key.has_value()) {
+          tag_pos = brace_close + 1;
+          continue;
+        }
+
+        rtprotect::antitamper::RiskAssessment clean_risk;
+        clean_risk.risk_score = 0;
+        auto bound_key = rtprotect::antitamper::DeriveTamperBoundKey(*master_key, clean_risk, fn_name);
+        auto encrypted = rtprotect::crypto::Encrypt(bound_key, serialized.data(), serialized.size());
+        if (!encrypted.has_value()) {
+          tag_pos = brace_close + 1;
+          continue;
+        }
+
+        // Generate C++ replacement wrapper (NO plaintext master key in binary!)
+        std::ostringstream rep_ss;
+        rep_ss << "// [RTProtect Bytecode-Virtualized Function: " << fn_name << "]\n";
+        rep_ss << header << " {\n";
+        rep_ss << "    static const std::uint8_t s_enc_code[] = {\n        "
+               << FormatByteArrayLiteral(encrypted->ciphertext.data(), encrypted->ciphertext.size()) << "\n    };\n";
+        rep_ss << "    static const std::uint8_t s_nonce[] = {\n        "
+               << FormatByteArrayLiteral(encrypted->nonce.bytes, sizeof(encrypted->nonce.bytes)) << "\n    };\n";
+        rep_ss << "    static const std::uint8_t s_tag[] = {\n        "
+               << FormatByteArrayLiteral(encrypted->tag, sizeof(encrypted->tag)) << "\n    };\n";
+        rep_ss << "    static const std::uint8_t s_fn_salt[] = {\n        "
+               << FormatByteArrayLiteral(fn_salt.data(), fn_salt.size()) << "\n    };\n";
+        rep_ss << "    static std::uint64_t s_tamper_accum = 0;\n";
+        rep_ss << "    rtprotect::antitamper::ScatterTamperCheck(\"" << fn_name << "_entry\", &s_tamper_accum);\n";
+        rep_ss << "    auto s_risk = rtprotect::antitamper::AssessEnvironmentRisk();\n";
+        rep_ss << "    if (s_tamper_accum != 0) s_risk.risk_score = 100;\n";
+        rep_ss << "    auto s_fn_key = rtprotect_client::GetFunctionMasterKey(s_fn_salt, sizeof(s_fn_salt));\n";
+        rep_ss << "    if (!s_fn_key.has_value()) return 0;\n";
+        rep_ss << "    auto s_bound_key = rtprotect::antitamper::DeriveTamperBoundKey(*s_fn_key, s_risk, \"" << fn_name << "\");\n";
+        rep_ss << "    rtprotect::crypto::EncryptedMessage s_msg;\n";
+        rep_ss << "    std::memcpy(s_msg.nonce.bytes, s_nonce, sizeof(s_nonce));\n";
+        rep_ss << "    s_msg.ciphertext.assign(s_enc_code, s_enc_code + sizeof(s_enc_code));\n";
+        rep_ss << "    std::memcpy(s_msg.tag, s_tag, sizeof(s_tag));\n";
+        rep_ss << "    auto s_plain = rtprotect::crypto::Decrypt(s_bound_key, s_msg, nullptr, 0, nullptr);\n";
+        rep_ss << "    if (!s_plain.has_value()) return 0;\n";
+        rep_ss << "    auto s_prog = rtprotect::vm::Deserialize(s_plain->data(), s_plain->size());\n";
+        rep_ss << "    if (!s_prog.has_value()) return 0;\n";
+        rep_ss << "    std::vector<std::int64_t> s_args = {";
+        for (std::size_t k = 0; k < arg_names.size(); ++k) {
+          if (k > 0) rep_ss << ", ";
+          rep_ss << "static_cast<std::int64_t>(" << arg_names[k] << ")";
+        }
+        rep_ss << "};\n";
+        rep_ss << "    auto s_res = rtprotect::vm::Run(*s_prog, s_args, &rtprotect_client::GetBuildOpcodeMap());\n";
+        rep_ss << "    return s_res.value;\n";
+        rep_ss << "}";
+
+        // Replace tag through brace_close with the wrapper
+        std::size_t replace_len = (brace_close - tag_pos + 1);
+        content.replace(tag_pos, replace_len, rep_ss.str());
+        tag_pos += rep_ss.str().size();
+
+        out_virtualized.push_back(fn_name);
+        modified = true;
+      } else {
+        tag_pos = brace_close + 1;
+      }
+    }
+  }
+
+  // 2. Scan for RTPROTECT_STRING("...") and replace with OBFUSCATED_STRING("...")
+  std::size_t str_pos = 0;
+  while ((str_pos = content.find("RTPROTECT_STRING(\"", str_pos)) != std::string::npos) {
+    auto end_quote = content.find("\")", str_pos + 18);
+    if (end_quote != std::string::npos) {
+      std::string str_lit = content.substr(str_pos + 17, end_quote - str_pos - 16);
+      std::string repl = "OBFUSCATED_STRING(" + str_lit + ")";
+      content.replace(str_pos, (end_quote + 2) - str_pos, repl);
+      str_pos += repl.size();
+      ++out_obfuscated_count;
+      modified = true;
+    } else {
+      str_pos += 18;
+    }
+  }
+
+  // 3. Ensure required headers are included if modified
+  if (modified) {
+    std::string includes =
+        "#include \"rtprotect_config.h\"\n"
+        "#include \"bytecode_vm/vm.h\"\n"
+        "#include \"bytecode_vm/serialize.h\"\n"
+        "#include \"crypto/aead.h\"\n"
+        "#include \"antitamper/risk_policy.h\"\n"
+        "#include \"obfuscation/obfuscated_string.h\"\n\n";
+
+    if (content.find("rtprotect_config.h") == std::string::npos) {
+      content = includes + content;
+    }
+    ++out_scattered_count;
+    if (!WriteTextFile(file_path.string(), content)) {
+      return false;
+    }
+  }
+
+  return modified;
+}
 
 const char* ToString(ProtectionProfile p) {
   switch (p) {
@@ -316,6 +583,13 @@ std::string IntegrationReport::ToJson() const {
   write_array("modified_files", modified_files, true);
   write_array("generated_files", generated_files, true);
   write_array("warnings", warnings, true);
+  write_array("virtualized_functions", virtualized_functions, true);
+
+  ss << "  \"obfuscated_string_count\": " << obfuscated_string_count << ",\n";
+  ss << "  \"scattered_check_count\": " << scattered_check_count << ",\n";
+  char seed_hex[32];
+  std::snprintf(seed_hex, sizeof(seed_hex), "0x%08X", opcode_seed);
+  ss << "  \"opcode_seed\": \"" << seed_hex << "\",\n";
 
   ss << "  \"public_key_file\": \"" << EscapeJson(public_key_file) << "\",\n";
   ss << "  \"manifest_public_key_file\": \"" << EscapeJson(manifest_public_key_file) << "\",\n";
@@ -687,6 +961,32 @@ IntegrationReport ExecuteIntegration(const IntegrationOptions& options) {
 #endif
 
   // 5. Generate rtprotect_config.h
+  std::uint32_t opcode_seed = 0;
+  if (RAND_bytes(reinterpret_cast<unsigned char*>(&opcode_seed), sizeof(opcode_seed)) != 1 || opcode_seed == 0) {
+    opcode_seed = 0x51A7F93Du;
+  }
+  report.opcode_seed = opcode_seed;
+
+  std::array<std::uint8_t, 32> build_auth_seed{};
+  if (RAND_bytes(build_auth_seed.data(), static_cast<int>(build_auth_seed.size())) != 1) {
+    for (std::size_t i = 0; i < build_auth_seed.size(); ++i) {
+      build_auth_seed[i] = static_cast<std::uint8_t>((i * 7 + 0x3C) & 0xFF);
+    }
+  }
+
+  std::uint64_t raw_w[4];
+  std::memcpy(raw_w, build_auth_seed.data(), 32);
+
+  std::uint64_t mask[4];
+  if (RAND_bytes(reinterpret_cast<unsigned char*>(mask), sizeof(mask)) != 1) {
+    mask[0] = 0xA5A5A5A5A5A5A5A5ULL;
+    mask[1] = 0x5A5A5A5A5A5A5A5AULL;
+    mask[2] = 0xF0F0F0F0F0F0F0F0ULL;
+    mask[3] = 0x0F0F0F0F0F0F0F0FULL;
+  }
+  std::uint64_t shard[4];
+  for (int i = 0; i < 4; ++i) shard[i] = raw_w[i] ^ mask[i];
+
   fs::path config_header_path = proj_path / "rtprotect_config.h";
   {
     std::ostringstream ss;
@@ -694,7 +994,13 @@ IntegrationReport ExecuteIntegration(const IntegrationOptions& options) {
     ss << "#pragma once\n\n";
     ss << "#include <cstdint>\n";
     ss << "#include <array>\n";
-    ss << "#include <string>\n\n";
+    ss << "#include <string>\n";
+    ss << "#include <optional>\n";
+    ss << "#include <vector>\n";
+    ss << "#include <cstring>\n";
+    ss << "#include \"crypto/aead.h\"\n";
+    ss << "#include \"crypto/kdf.h\"\n";
+    ss << "#include \"crypto/secure_buffer.h\"\n\n";
     ss << "namespace rtprotect_client {\n\n";
     ss << "inline constexpr const char* kProductId = \"" << options.product_id << "\";\n";
     ss << "inline constexpr const char* kReleaseVersion = \"" << options.release_version << "\";\n";
@@ -702,6 +1008,20 @@ IntegrationReport ExecuteIntegration(const IntegrationOptions& options) {
     ss << "inline constexpr const char* kExpectedExecutableName = \"" << expected_exe_name << "\";\n";
     ss << "inline constexpr std::uint64_t kRequiredCapabilities = 0x01; // kCapCoreExecution\n";
     ss << "inline constexpr std::uint64_t kMinimumReleaseSequence = 1;\n\n";
+
+    char seed_buf[32];
+    std::snprintf(seed_buf, sizeof(seed_buf), "0x%08XU", opcode_seed);
+    ss << "// Per-build randomized opcode map seed (Phase 3 bytecode VM hardening)\n";
+    ss << "inline constexpr std::uint32_t kBuildOpcodeSeed = " << seed_buf << ";\n\n";
+
+    for (int i = 0; i < 4; ++i) {
+      char sbuf[32], mbuf[32];
+      std::snprintf(sbuf, sizeof(sbuf), "0x%016llXULL", static_cast<unsigned long long>(shard[i]));
+      std::snprintf(mbuf, sizeof(mbuf), "0x%016llXULL", static_cast<unsigned long long>(mask[i]));
+      ss << "inline constexpr std::uint64_t kAuthShard" << i << " = " << sbuf << ";\n";
+      ss << "inline constexpr std::uint64_t kAuthMask" << i << " = " << mbuf << ";\n";
+    }
+    ss << "\n";
 
     auto dump_key = [&](const char* name, const integrity::Ed25519PublicKey& k) {
       ss << "// Embedded " << name << " Verification Key\n";
@@ -720,11 +1040,41 @@ IntegrationReport ExecuteIntegration(const IntegrationOptions& options) {
     dump_key("kLicensePublicKey", license_pubkey);
     dump_key("kPublicKey", manifest_pubkey);
 
+    ss << "inline std::optional<rtprotect::crypto::Aes256Key> GetFunctionMasterKey(const std::uint8_t* salt, std::size_t salt_len) {\n";
+    ss << "  rtprotect::crypto::SecureBuffer raw_seed(32);\n";
+    ss << "  std::uint64_t w0 = kAuthShard0 ^ kAuthMask0;\n";
+    ss << "  std::uint64_t w1 = kAuthShard1 ^ kAuthMask1;\n";
+    ss << "  std::uint64_t w2 = kAuthShard2 ^ kAuthMask2;\n";
+    ss << "  std::uint64_t w3 = kAuthShard3 ^ kAuthMask3;\n";
+    ss << "  std::memcpy(raw_seed.data(), &w0, 8);\n";
+    ss << "  std::memcpy(raw_seed.data() + 8, &w1, 8);\n";
+    ss << "  std::memcpy(raw_seed.data() + 16, &w2, 8);\n";
+    ss << "  std::memcpy(raw_seed.data() + 24, &w3, 8);\n";
+    ss << "  std::vector<std::uint8_t> hkdf_salt(kManifestPublicKey.begin(), kManifestPublicKey.end());\n";
+    ss << "  if (salt && salt_len > 0) {\n";
+    ss << "    hkdf_salt.insert(hkdf_salt.end(), salt, salt + salt_len);\n";
+    ss << "  }\n";
+    ss << "  std::string info = std::string(\"rtprotect/virtualize/\") + kProductId;\n";
+    ss << "  auto derived = rtprotect::crypto::Hkdf::DeriveKey(raw_seed, hkdf_salt, info, rtprotect::crypto::kAes256KeyLen);\n";
+    ss << "  if (!derived.has_value()) return std::nullopt;\n";
+    ss << "  return rtprotect::crypto::Aes256Key::FromBytes(derived->data(), derived->size());\n";
+    ss << "}\n\n";
+
     ss << "bool VerifyClientIntegrityAndLicense();\n";
     ss << "std::string GetLicenseEdition();\n";
     ss << "std::uint64_t GetLicenseCapabilities();\n";
     ss << "bool HasCapability(std::uint64_t cap);\n\n";
-    ss << "}  // namespace rtprotect_client\n";
+    ss << "}  // namespace rtprotect_client\n\n";
+
+    ss << "#include \"bytecode_vm/opcode_map.h\"\n";
+    ss << "namespace rtprotect_client {\n";
+    ss << "inline const rtprotect::vm::OpcodeMap& GetBuildOpcodeMap() {\n";
+    ss << "  static const rtprotect::vm::OpcodeMap s_map = rtprotect::vm::OpcodeMap::FromSeed(kBuildOpcodeSeed);\n";
+    ss << "  return s_map;\n";
+    ss << "}\n";
+    ss << "}  // namespace rtprotect_client\n\n";
+    ss << "#define RTPROTECT_VIRTUALIZE\n";
+    ss << "#define RTPROTECT_STRING(s) s\n\n";
 
     if (!WriteTextFile(config_header_path.string(), ss.str())) {
       report.success = false;
@@ -909,6 +1259,19 @@ IntegrationReport ExecuteIntegration(const IntegrationOptions& options) {
     report.generated_files.push_back(glue_path.string());
   }
 
+  // 6b. Transform Client Sources (Function Virtualization, String Obfuscation, Anti-Tamper)
+  for (const auto& src_file : plan.detected_sources) {
+    if (TransformSourceFile(src_file, options.profile, opcode_seed,
+                            build_auth_seed, manifest_pubkey, options.product_id,
+                            report.virtualized_functions,
+                            report.obfuscated_string_count,
+                            report.scattered_check_count)) {
+      if (std::find(report.modified_files.begin(), report.modified_files.end(), src_file) == report.modified_files.end()) {
+        report.modified_files.push_back(src_file);
+      }
+    }
+  }
+
   std::string root = options.rtprotect_root.empty() ? "." : options.rtprotect_root;
   std::error_code ec_root;
   auto abs_root = fs::weakly_canonical(fs::path(root), ec_root);
@@ -939,10 +1302,14 @@ IntegrationReport ExecuteIntegration(const IntegrationOptions& options) {
     ss << "      \"" << root_str << "/build/licensing\"\n";
     ss << "      \"" << root_str << "/build/antitamper\"\n";
     ss << "      \"" << root_str << "/build/crypto\"\n";
+    ss << "      \"" << root_str << "/build/bytecode_vm\"\n";
+    ss << "      \"" << root_str << "/build/obfuscation\"\n";
     ss << "      \"" << root_str << "/build-reconst/integrity\"\n";
     ss << "      \"" << root_str << "/build-reconst/licensing\"\n";
     ss << "      \"" << root_str << "/build-reconst/antitamper\"\n";
     ss << "      \"" << root_str << "/build-reconst/crypto\"\n";
+    ss << "      \"" << root_str << "/build-reconst/bytecode_vm\"\n";
+    ss << "      \"" << root_str << "/build-reconst/obfuscation\"\n";
     ss << "      \"" << root_str << "/third_party/openssl/lib\"\n";
     ss << "      \"" << root_str << "/lib\"\n";
     ss << "  )\n";
@@ -954,6 +1321,8 @@ IntegrationReport ExecuteIntegration(const IntegrationOptions& options) {
     ss << "    rtprotect_integrity\n";
     ss << "    rtprotect_antitamper\n";
     ss << "    rtprotect_crypto\n";
+    ss << "    rtprotect_vm\n";
+    ss << "    rtprotect_obfuscation\n";
     ss << "    OpenSSL::Crypto\n";
     ss << "    $<$<PLATFORM_ID:Windows>:iphlpapi>\n";
     ss << "    $<$<PLATFORM_ID:Windows>:ws2_32>\n";

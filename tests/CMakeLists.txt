@@ -70,6 +70,11 @@ target_link_libraries(test_license PRIVATE rtprotect_licensing rtprotect_licensi
 target_include_directories(test_license PRIVATE ${CMAKE_SOURCE_DIR})
 add_test(NAME test_license COMMAND test_license)
 
+add_executable(test_activation test_activation.cpp)
+target_link_libraries(test_activation PRIVATE rtprotect_licensing rtprotect_licensing_buildtools rtprotect_integrity_buildtools)
+target_include_directories(test_activation PRIVATE ${CMAKE_SOURCE_DIR})
+add_test(NAME test_activation COMMAND test_activation)
+
 add_executable(test_hardware_id test_hardware_id.cpp)
 target_link_libraries(test_hardware_id PRIVATE rtprotect_licensing)
 target_include_directories(test_hardware_id PRIVATE ${CMAKE_SOURCE_DIR})
