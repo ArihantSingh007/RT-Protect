@@ -48,6 +48,10 @@ class ActivationServerHttp {
 
   RateLimiter& ip_rate_limiter() { return ip_rate_limiter_; }
 
+  // Administrative endpoint authentication token
+  void SetAdminAuthToken(const std::string& token) { admin_auth_token_ = token; }
+  const std::string& admin_auth_token() const { return admin_auth_token_; }
+
   // Maximum allowed sizes for denial-of-service prevention
   static constexpr std::size_t kMaxHeaderBytes = 8192;         // 8 KB max headers
   static constexpr std::size_t kMaxRequestBodyBytes = 65536;   // 64 KB max payload
@@ -84,6 +88,7 @@ class ActivationServerHttp {
   std::string tls_cert_file_;
   std::string tls_key_file_;
   void* ssl_ctx_{nullptr}; // SSL_CTX* when TLS enabled
+  std::string admin_auth_token_;
   RateLimiter ip_rate_limiter_{5.0, 30.0}; // 5 tokens/sec, burst 30 tokens per IP
 };
 

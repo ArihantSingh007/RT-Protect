@@ -121,7 +121,7 @@ ActivationService::ActivationService(
     const integrity::Ed25519PublicKey& verification_key)
     : db_(db), signing_key_(std::move(signing_key)), verification_key_(verification_key) {}
 
-ActivateResponse ActivationService::ProcessActivate(const ActivateRequest& req, std::uint64_t current_time) {
+ActivateResponse ActivationService::ProcessActivate(const ActivateRequest& req, std::uint64_t current_time, bool check_rate_limit) {
   ActivateResponse resp;
   if (current_time == 0) current_time = GetCurrentTimestamp();
 
@@ -131,12 +131,14 @@ ActivateResponse ActivationService::ProcessActivate(const ActivateRequest& req, 
     return resp;
   }
 
-  int retry_after = 0;
-  if (!license_rate_limiter_.Allow(req.license_key, 1.0, &retry_after)) {
-    resp.status = ActivationStatus::kConcurrencyLimitExceeded;
-    resp.error_message = "Rate limit exceeded for license (retry after " + std::to_string(retry_after) + "s)";
-    db_.RecordEvent({current_time, ActivationEventType::kRateLimited, req.license_key, req.device_fingerprint, req.client_ip, resp.error_message});
-    return resp;
+  if (check_rate_limit) {
+    int retry_after = 0;
+    if (!license_rate_limiter_.Allow(req.license_key, 1.0, &retry_after)) {
+      resp.status = ActivationStatus::kConcurrencyLimitExceeded;
+      resp.error_message = "Rate limit exceeded for license (retry after " + std::to_string(retry_after) + "s)";
+      db_.RecordEvent({current_time, ActivationEventType::kRateLimited, req.license_key, req.device_fingerprint, req.client_ip, resp.error_message});
+      return resp;
+    }
   }
 
   // 1. Look up license in database
@@ -254,7 +256,7 @@ ActivateResponse ActivationService::ProcessActivate(const ActivateRequest& req, 
   return resp;
 }
 
-RenewResponse ActivationService::ProcessRenew(const RenewRequest& req, std::uint64_t current_time) {
+RenewResponse ActivationService::ProcessRenew(const RenewRequest& req, std::uint64_t current_time, bool check_rate_limit) {
   RenewResponse resp;
   if (current_time == 0) current_time = GetCurrentTimestamp();
 
@@ -288,12 +290,14 @@ RenewResponse ActivationService::ProcessRenew(const RenewRequest& req, std::uint
     return resp;
   }
 
-  int retry_after = 0;
-  if (!license_rate_limiter_.Allow(token.license_id, 1.0, &retry_after)) {
-    resp.status = ActivationStatus::kConcurrencyLimitExceeded;
-    resp.error_message = "Rate limit exceeded for license (retry after " + std::to_string(retry_after) + "s)";
-    db_.RecordEvent({current_time, ActivationEventType::kRateLimited, token.license_id, req.device_fingerprint, req.client_ip, resp.error_message});
-    return resp;
+  if (check_rate_limit) {
+    int retry_after = 0;
+    if (!license_rate_limiter_.Allow(token.license_id, 1.0, &retry_after)) {
+      resp.status = ActivationStatus::kConcurrencyLimitExceeded;
+      resp.error_message = "Rate limit exceeded for license (retry after " + std::to_string(retry_after) + "s)";
+      db_.RecordEvent({current_time, ActivationEventType::kRateLimited, token.license_id, req.device_fingerprint, req.client_ip, resp.error_message});
+      return resp;
+    }
   }
 
   // 3. Grace period expiration check
@@ -453,6 +457,21 @@ DeactivateResponse ActivationService::ProcessDeactivate(const DeactivateRequest&
 }
 
 std::string ActivationService::HandleActivateJson(const std::string& json_body, std::uint64_t current_time, const std::string& client_ip) {
+  if (current_time == 0) current_time = GetCurrentTimestamp();
+
+  // Enforce IP rate limiting
+  int retry_after = 0;
+  if (!client_ip.empty() && !ip_rate_limiter_.Allow(client_ip, 1.0, &retry_after)) {
+    db_.RecordEvent({current_time, ActivationEventType::kRateLimited, "", "", client_ip, "IP rate limit exceeded"});
+    std::ostringstream ss;
+    ss << "{\n"
+       << "  \"status\": \"rate_limited\",\n"
+       << "  \"error\": \"Rate limit exceeded for IP address (retry after " << retry_after << "s)\",\n"
+       << "  \"retry_after\": " << retry_after << "\n"
+       << "}\n";
+    return ss.str();
+  }
+
   ActivateRequest req;
   req.client_ip = client_ip;
   auto lic = ExtractJsonStringField(json_body, "license_key");
@@ -474,7 +493,19 @@ std::string ActivationService::HandleActivateJson(const std::string& json_body, 
     req.client_timestamp = std::strtoull(ts->c_str(), nullptr, 10);
   }
 
-  auto resp = ProcessActivate(req, current_time);
+  // Enforce license rate limiting
+  if (!req.license_key.empty() && !license_rate_limiter_.Allow(req.license_key, 1.0, &retry_after)) {
+    db_.RecordEvent({current_time, ActivationEventType::kRateLimited, req.license_key, req.device_fingerprint, client_ip, "License rate limit exceeded"});
+    std::ostringstream ss;
+    ss << "{\n"
+       << "  \"status\": \"rate_limited\",\n"
+       << "  \"error\": \"Rate limit exceeded for license key (retry after " << retry_after << "s)\",\n"
+       << "  \"retry_after\": " << retry_after << "\n"
+       << "}\n";
+    return ss.str();
+  }
+
+  auto resp = ProcessActivate(req, current_time, /*check_rate_limit=*/false);
 
   std::ostringstream ss;
   ss << "{\n";
@@ -489,6 +520,21 @@ std::string ActivationService::HandleActivateJson(const std::string& json_body, 
 }
 
 std::string ActivationService::HandleRenewJson(const std::string& json_body, std::uint64_t current_time, const std::string& client_ip) {
+  if (current_time == 0) current_time = GetCurrentTimestamp();
+
+  // Enforce IP rate limiting
+  int retry_after = 0;
+  if (!client_ip.empty() && !ip_rate_limiter_.Allow(client_ip, 1.0, &retry_after)) {
+    db_.RecordEvent({current_time, ActivationEventType::kRateLimited, "", "", client_ip, "IP rate limit exceeded"});
+    std::ostringstream ss;
+    ss << "{\n"
+       << "  \"status\": \"rate_limited\",\n"
+       << "  \"error\": \"Rate limit exceeded for IP address (retry after " << retry_after << "s)\",\n"
+       << "  \"retry_after\": " << retry_after << "\n"
+       << "}\n";
+    return ss.str();
+  }
+
   RenewRequest req;
   req.client_ip = client_ip;
   auto tok = ExtractJsonStringField(json_body, "token");
@@ -502,7 +548,27 @@ std::string ActivationService::HandleRenewJson(const std::string& json_body, std
   if (tok) req.token_hex = *tok;
   if (dev) req.device_fingerprint = *dev;
 
-  auto resp = ProcessRenew(req, current_time);
+  // Enforce license rate limiting if token can be parsed
+  if (tok.has_value() && tok->size() >= 64) {
+    std::vector<std::uint8_t> raw_token(tok->size() / 2);
+    if (HexToBytes(*tok, raw_token.data(), raw_token.size())) {
+      auto token_opt = DeserializeActivationToken(raw_token.data(), raw_token.size());
+      if (token_opt.has_value()) {
+        if (!license_rate_limiter_.Allow(token_opt->license_id, 1.0, &retry_after)) {
+          db_.RecordEvent({current_time, ActivationEventType::kRateLimited, token_opt->license_id, dev.value_or(""), client_ip, "License rate limit exceeded"});
+          std::ostringstream ss;
+          ss << "{\n"
+             << "  \"status\": \"rate_limited\",\n"
+             << "  \"error\": \"Rate limit exceeded for license key (retry after " << retry_after << "s)\",\n"
+             << "  \"retry_after\": " << retry_after << "\n"
+             << "}\n";
+          return ss.str();
+        }
+      }
+    }
+  }
+
+  auto resp = ProcessRenew(req, current_time, /*check_rate_limit=*/false);
 
   std::ostringstream ss;
   ss << "{\n";

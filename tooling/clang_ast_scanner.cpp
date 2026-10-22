@@ -3,6 +3,7 @@
 #include "tooling/clang_ast_scanner.h"
 
 #include <algorithm>
+#include <cctype>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
@@ -10,10 +11,12 @@
 #include <sstream>
 
 #include "tooling/file_io.h"
+#include "tooling/simple_json.h"
 
 #if defined(_WIN32)
 #include <windows.h>
 #else
+#include <sys/types.h>
 #include <sys/wait.h>
 #include <unistd.h>
 #endif
@@ -33,9 +36,52 @@ std::string NormalizePath(const std::string& p) {
   return s;
 }
 
-// Executes a subprocess and captures standard output
-bool RunSubprocessCaptureOutput(const std::string& cmd_line, std::string* out_stdout) {
+// Executes a subprocess directly via argv array without any shell interpreter (popen/cmd.exe/sh).
+// Completely immune to shell command injection attacks.
+bool RunProcessCaptureOutput(const std::string& exe,
+                             const std::vector<std::string>& args,
+                             std::string* out_stdout) {
 #if defined(_WIN32)
+  // Build properly MSVC-escaped command line using standard backslash/quote rules
+  std::string cmd_line = "\"" + exe + "\"";
+  for (const auto& a : args) {
+    cmd_line += " ";
+    if (a.empty()) {
+      cmd_line += "\"\"";
+      continue;
+    }
+    bool need_quote = false;
+    for (char c : a) {
+      if (std::isspace(static_cast<unsigned char>(c)) || c == '"') {
+        need_quote = true;
+        break;
+      }
+    }
+    if (!need_quote) {
+      cmd_line += a;
+    } else {
+      cmd_line += "\"";
+      for (std::size_t i = 0; i < a.size(); ++i) {
+        std::size_t backslashes = 0;
+        while (i < a.size() && a[i] == '\\') {
+          backslashes++;
+          i++;
+        }
+        if (i == a.size()) {
+          cmd_line.append(backslashes * 2, '\\');
+          break;
+        } else if (a[i] == '"') {
+          cmd_line.append(backslashes * 2 + 1, '\\');
+          cmd_line += '"';
+        } else {
+          cmd_line.append(backslashes, '\\');
+          cmd_line += a[i];
+        }
+      }
+      cmd_line += "\"";
+    }
+  }
+
   SECURITY_ATTRIBUTES sa{};
   sa.nLength = sizeof(sa);
   sa.bInheritHandle = TRUE;
@@ -55,11 +101,13 @@ bool RunSubprocessCaptureOutput(const std::string& cmd_line, std::string* out_st
   si.hStdError = hWritePipe;
 
   PROCESS_INFORMATION pi{};
-  std::string mutable_cmd = cmd_line;
+  std::vector<char> cmd_buf(cmd_line.begin(), cmd_line.end());
+  cmd_buf.push_back('\0');
 
+  // Direct CreateProcessA invocation: NO cmd.exe shell wrapper
   BOOL ok = ::CreateProcessA(
       nullptr,
-      mutable_cmd.data(),
+      cmd_buf.data(),
       nullptr,
       nullptr,
       TRUE,
@@ -84,7 +132,7 @@ bool RunSubprocessCaptureOutput(const std::string& cmd_line, std::string* out_st
   }
 
   ::CloseHandle(hReadPipe);
-  ::WaitForSingleObject(pi.hProcess, 10000);
+  ::WaitForSingleObject(pi.hProcess, 15000);
 
   DWORD exit_code = 0;
   ::GetExitCodeProcess(pi.hProcess, &exit_code);
@@ -94,17 +142,47 @@ bool RunSubprocessCaptureOutput(const std::string& cmd_line, std::string* out_st
   if (out_stdout) *out_stdout = std::move(output);
   return (exit_code == 0);
 #else
-  FILE* pipe = popen(cmd_line.c_str(), "r");
-  if (!pipe) return false;
+  // POSIX: pipe() + fork() + execvp() -- NEVER invoke /bin/sh or popen()
+  int pipefd[2];
+  if (pipe(pipefd) < 0) return false;
 
-  char buf[4096];
-  std::string output;
-  while (fgets(buf, sizeof(buf), pipe)) {
-    output.append(buf);
+  pid_t pid = fork();
+  if (pid < 0) {
+    close(pipefd[0]);
+    close(pipefd[1]);
+    return false;
   }
-  int status = pclose(pipe);
+
+  if (pid == 0) {
+    close(pipefd[0]);
+    dup2(pipefd[1], STDOUT_FILENO);
+    dup2(pipefd[1], STDERR_FILENO);
+    close(pipefd[1]);
+
+    std::vector<char*> argv_ptrs;
+    argv_ptrs.push_back(const_cast<char*>(exe.c_str()));
+    for (const auto& a : args) {
+      argv_ptrs.push_back(const_cast<char*>(a.c_str()));
+    }
+    argv_ptrs.push_back(nullptr);
+
+    execvp(exe.c_str(), argv_ptrs.data());
+    _exit(127);
+  }
+
+  close(pipefd[1]);
+  std::string output;
+  char buf[4096];
+  ssize_t bytes = 0;
+  while ((bytes = read(pipefd[0], buf, sizeof(buf))) > 0) {
+    output.append(buf, static_cast<std::size_t>(bytes));
+  }
+  close(pipefd[0]);
+
+  int status = 0;
+  waitpid(pid, &status, 0);
   if (out_stdout) *out_stdout = std::move(output);
-  return (status == 0);
+  return (WIFEXITED(status) && WEXITSTATUS(status) == 0);
 #endif
 }
 
@@ -114,41 +192,27 @@ std::optional<CompilationDatabase> CompilationDatabase::LoadFromFile(const std::
   auto content = ReadTextFile(json_path);
   if (!content.has_value() || content->empty()) return std::nullopt;
 
+  auto parsed = JsonValue::Parse(*content);
+  if (!parsed.has_value() || !parsed->is_array()) return std::nullopt;
+
   CompilationDatabase db;
-  // Parse compile_commands.json entries
-  // Standard format: [ { "directory": "...", "command": "...", "file": "..." }, ... ]
-  std::string str = *content;
-  std::size_t pos = 0;
+  for (const auto& item : parsed->as_array()) {
+    if (!item.is_object()) continue;
 
-  while ((pos = str.find('{', pos)) != std::string::npos) {
-    auto end_obj = str.find('}', pos);
-    if (end_obj == std::string::npos) break;
-
-    std::string obj = str.substr(pos, end_obj - pos + 1);
     CompileCommandEntry entry;
+    entry.file = item["file"].as_string();
+    entry.directory = item["directory"].as_string();
+    entry.command = item["command"].as_string();
 
-    auto extract_field = [&](const std::string& field_name) -> std::string {
-      std::string pattern = "\"" + field_name + "\"";
-      auto fpos = obj.find(pattern);
-      if (fpos == std::string::npos) return "";
-      auto colon = obj.find(':', fpos);
-      if (colon == std::string::npos) return "";
-      auto quote1 = obj.find('"', colon);
-      if (quote1 == std::string::npos) return "";
-      auto quote2 = obj.find('"', quote1 + 1);
-      if (quote2 == std::string::npos) return "";
-      return obj.substr(quote1 + 1, quote2 - quote1 - 1);
-    };
-
-    entry.file = extract_field("file");
-    entry.directory = extract_field("directory");
-    entry.command = extract_field("command");
+    if (item.contains("arguments") && item["arguments"].is_array()) {
+      for (const auto& arg : item["arguments"].as_array()) {
+        entry.arguments.push_back(arg.as_string());
+      }
+    }
 
     if (!entry.file.empty()) {
       db.entries_[NormalizePath(entry.file)] = entry;
     }
-
-    pos = end_obj + 1;
   }
 
   return db;
@@ -166,8 +230,27 @@ std::vector<std::string> CompilationDatabase::GetFlagsForFile(const std::string&
   std::string norm = NormalizePath(file_path);
   auto it = entries_.find(norm);
   if (it == entries_.end()) {
-    // Default standard flags
     return { "-std=c++20", "-I." };
+  }
+
+  if (!it->second.arguments.empty()) {
+    std::vector<std::string> flags;
+    bool skip_next = false;
+    for (std::size_t i = 1; i < it->second.arguments.size(); ++i) {
+      const auto& arg = it->second.arguments[i];
+      if (skip_next) {
+        skip_next = false;
+        continue;
+      }
+      if (arg == "-c") continue;
+      if (arg == "-o") {
+        skip_next = true;
+        continue;
+      }
+      if (arg == it->second.file || NormalizePath(arg) == norm) continue;
+      flags.push_back(arg);
+    }
+    return flags;
   }
 
   std::vector<std::string> flags;
@@ -179,7 +262,7 @@ std::vector<std::string> CompilationDatabase::GetFlagsForFile(const std::string&
   while (iss >> token) {
     if (is_first) {
       is_first = false;
-      continue; // Skip compiler executable
+      continue;
     }
     if (skip_next) {
       skip_next = false;
@@ -221,16 +304,14 @@ std::string ClangAstScanner::GetClangBinaryPath() {
     if (fs::exists(path)) return path;
   }
 
-  // Check PATH
-#if defined(_WIN32)
+  // Check PATH without shell expansion
   std::string out;
-  if (RunSubprocessCaptureOutput("where.exe clang.exe", &out) && !out.empty()) {
+  if (RunProcessCaptureOutput("where.exe", { "clang.exe" }, &out) && !out.empty()) {
     auto nl = out.find('\n');
     if (nl != std::string::npos) out = out.substr(0, nl);
     while (!out.empty() && (out.back() == '\r' || out.back() == ' ')) out.pop_back();
     if (fs::exists(out)) return out;
   }
-#endif
 
   return "";
 }
@@ -246,7 +327,6 @@ bool ClangAstScanner::ValidateVirtualizationEligibility(const ClangFunctionDecl&
     return false;
   }
 
-  // Reject unsupported return types (e.g. non-primitive structs, classes)
   static const char* const kSupportedPrimitives[] = {
       "int", "long", "long long", "int64_t", "int32_t", "uint64_t", "uint32_t",
       "short", "char", "bool", "void", "unsigned int", "unsigned long"
@@ -275,78 +355,91 @@ std::vector<ClangFunctionDecl> ClangAstScanner::AnalyzeTranslationUnit(
   std::string clang_bin = GetClangBinaryPath();
   if (clang_bin.empty()) return results;
 
-  std::ostringstream cmd;
-  cmd << "\"" << clang_bin << "\" -fsyntax-only -Xclang -ast-dump=json ";
+  // Build argv array: NO shell string concatenation, NO popen
+  std::vector<std::string> args = {
+      "-fsyntax-only",
+      "-Xclang",
+      "-ast-dump=json"
+  };
   for (const auto& flag : compiler_flags) {
-    cmd << flag << " ";
+    if (!flag.empty()) {
+      args.push_back(flag);
+    }
   }
-  cmd << "\"" << source_path << "\"";
+  args.push_back(source_path);
 
   std::string json_output;
-  RunSubprocessCaptureOutput(cmd.str(), &json_output);
-  if (json_output.empty()) return results;
+  if (!RunProcessCaptureOutput(clang_bin, args, &json_output) || json_output.empty()) {
+    return results;
+  }
 
-  // Read source text to verify annotations and line bounds
   auto src_text = ReadTextFile(source_path);
   if (!src_text.has_value()) return results;
 
-  // Parse JSON AST FunctionDecl elements
-  std::size_t pos = 0;
-  while ((pos = json_output.find("\"kind\": \"FunctionDecl\"", pos)) != std::string::npos) {
-    // Find enclosing object start
-    std::size_t obj_start = json_output.rfind('{', pos);
-    if (obj_start == std::string::npos) {
-      pos += 22;
-      continue;
-    }
+  auto ast_root = JsonValue::Parse(json_output);
+  if (!ast_root.has_value() || !ast_root->is_object()) {
+    return results;
+  }
 
-    // Extract function name
-    auto name_pos = json_output.find("\"name\": \"", pos);
-    if (name_pos != std::string::npos && name_pos - pos < 500) {
-      auto name_end = json_output.find('"', name_pos + 9);
-      std::string fn_name = json_output.substr(name_pos + 9, name_end - name_pos - 9);
+  // Robustly traverse AST using simple_json
+  std::vector<const JsonValue*> nodes_to_visit = { &(*ast_root) };
+  while (!nodes_to_visit.empty()) {
+    const JsonValue* node = nodes_to_visit.back();
+    nodes_to_visit.pop_back();
 
-      // Check if this function is tagged with RTPROTECT_VIRTUALIZE in source text
-      std::string tag_pattern = "RTPROTECT_VIRTUALIZE";
-      std::string attr_pattern = "[[rtprotect::virtualize]]";
+    if (node->contains("kind") && (*node)["kind"].as_string() == "FunctionDecl") {
+      std::string fn_name = (*node)["name"].as_string();
+      if (!fn_name.empty()) {
+        std::size_t src_fn_pos = src_text->find(fn_name);
+        if (src_fn_pos != std::string::npos) {
+          std::size_t lookback = (src_fn_pos >= 200) ? 200 : src_fn_pos;
+          std::string prefix = src_text->substr(src_fn_pos - lookback, lookback);
 
-      std::size_t src_fn_pos = src_text->find(fn_name);
-      if (src_fn_pos != std::string::npos) {
-        std::size_t lookback = (src_fn_pos >= 200) ? 200 : src_fn_pos;
-        std::string prefix = src_text->substr(src_fn_pos - lookback, lookback);
+          bool is_tagged = (prefix.find("RTPROTECT_VIRTUALIZE") != std::string::npos ||
+                            prefix.find("[[rtprotect::virtualize]]") != std::string::npos);
 
-        bool is_tagged = (prefix.find(tag_pattern) != std::string::npos ||
-                          prefix.find(attr_pattern) != std::string::npos);
+          if (is_tagged) {
+            ClangFunctionDecl decl;
+            decl.name = fn_name;
+            decl.is_virtualized_annotated = true;
 
-        if (is_tagged) {
-          ClangFunctionDecl decl;
-          decl.name = fn_name;
-          decl.is_virtualized_annotated = true;
+            if (node->contains("type") && (*node)["type"].contains("qualType")) {
+              std::string full_type = (*node)["type"]["qualType"].as_string();
+              auto paren = full_type.find('(');
+              decl.return_type = (paren != std::string::npos) ? full_type.substr(0, paren) : full_type;
+              while (!decl.return_type.empty() && decl.return_type.back() == ' ') {
+                decl.return_type.pop_back();
+              }
+            }
 
-          // Extract return type from AST JSON
-          auto type_pos = json_output.find("\"qualType\": \"", pos);
-          if (type_pos != std::string::npos && type_pos - pos < 400) {
-            auto type_end = json_output.find('"', type_pos + 13);
-            std::string full_type = json_output.substr(type_pos + 13, type_end - type_pos - 13);
-            auto paren = full_type.find('(');
-            decl.return_type = (paren != std::string::npos) ? full_type.substr(0, paren) : full_type;
-            // Trim whitespace
-            while (!decl.return_type.empty() && decl.return_type.back() == ' ') decl.return_type.pop_back();
+            if (node->contains("inner") && (*node)["inner"].is_array()) {
+              for (const auto& inner : (*node)["inner"].as_array()) {
+                std::string inner_kind = inner["kind"].as_string();
+                if (inner_kind == "ParmVarDecl") {
+                  decl.param_names.push_back(inner["name"].as_string());
+                  if (inner.contains("type") && inner["type"].contains("qualType")) {
+                    decl.param_types.push_back(inner["type"]["qualType"].as_string());
+                  }
+                } else if (inner_kind == "CXXThrowExpr" || inner_kind == "CXXTryStmt") {
+                  decl.has_unsupported_constructs = true;
+                  decl.unsupported_reason = "C++ exceptions are not supported in virtualized routines";
+                }
+              }
+            }
+
+            results.push_back(decl);
           }
-
-          // Check for unsupported constructs
-          if (src_text->find("throw ", src_fn_pos) != std::string::npos ||
-              src_text->find("try {", src_fn_pos) != std::string::npos) {
-            decl.has_unsupported_constructs = true;
-            decl.unsupported_reason = "C++ exceptions are not supported in virtualized routines";
-          }
-
-          results.push_back(decl);
         }
       }
     }
 
-    pos += 22;
+    if (node->contains("inner") && (*node)["inner"].is_array()) {
+      for (const auto& child : (*node)["inner"].as_array()) {
+        if (child.is_object()) {
+          nodes_to_visit.push_back(&child);
+        }
+      }
+    }
   }
 
   return results;

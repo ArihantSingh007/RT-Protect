@@ -2,15 +2,22 @@
 
 #include "licensing/activation_server_http.h"
 
+#include <algorithm>
+#include <array>
+#include <cctype>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <iomanip>
+#include <optional>
 #include <sstream>
 #include <vector>
 
-#include <openssl/ssl.h>
+#include <openssl/crypto.h>
 #include <openssl/err.h>
+#include <openssl/rand.h>
+#include <openssl/ssl.h>
 
 #if defined(_WIN32)
 #include <winsock2.h>
@@ -60,10 +67,51 @@ void SetSocketTimeouts(socket_t s, int timeout_seconds) {
 #endif
 }
 
+bool ConstantTimeStringEquals(const std::string& a, const std::string& b) {
+  if (a.size() != b.size()) return false;
+  return CRYPTO_memcmp(a.data(), b.data(), a.size()) == 0;
+}
+
+std::optional<std::string> FindHeaderCaseInsensitive(const std::string& headers, const std::string& header_name) {
+  std::string lower_headers = headers;
+  for (char& c : lower_headers) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+  std::string lower_name = header_name;
+  for (char& c : lower_name) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+
+  std::string search = "\n" + lower_name + ":";
+  std::size_t val_start = std::string::npos;
+  auto pos = lower_headers.find(search);
+  if (pos != std::string::npos) {
+    val_start = pos + search.size();
+  } else if (lower_headers.rfind(lower_name + ":", 0) == 0) {
+    val_start = lower_name.size() + 1;
+  }
+
+  if (val_start == std::string::npos) return std::nullopt;
+
+  while (val_start < headers.size() && (headers[val_start] == ' ' || headers[val_start] == '\t')) {
+    ++val_start;
+  }
+  auto end = headers.find("\r", val_start);
+  if (end == std::string::npos) end = headers.find("\n", val_start);
+  if (end == std::string::npos) end = headers.size();
+
+  return headers.substr(val_start, end - val_start);
+}
+
 }  // namespace
 
 ActivationServerHttp::ActivationServerHttp(ActivationService& service)
-    : service_(service) {}
+    : service_(service) {
+  std::array<std::uint8_t, 32> rand_token{};
+  if (RAND_bytes(rand_token.data(), static_cast<int>(rand_token.size())) == 1) {
+    std::ostringstream ss;
+    for (auto b : rand_token) {
+      ss << std::hex << std::setw(2) << std::setfill('0') << static_cast<int>(b);
+    }
+    admin_auth_token_ = ss.str();
+  }
+}
 
 ActivationServerHttp::~ActivationServerHttp() {
   Stop();
@@ -341,21 +389,6 @@ void ActivationServerHttp::HandleClient(uintptr_t client_sock_fd, const std::str
   // Set 5-second socket timeout to prevent Slowloris attacks
   SetSocketTimeouts(client_sock, 5);
 
-  int retry_after = 0;
-  if (!client_ip.empty() && !ip_rate_limiter_.Allow(client_ip, 1.0, &retry_after)) {
-    const std::string busy_resp =
-        "HTTP/1.1 429 Too Many Requests\r\n"
-        "Content-Type: application/json\r\n"
-        "Retry-After: " + std::to_string(retry_after) + "\r\n"
-        "Connection: close\r\n\r\n"
-        "{\"status\":\"rate_limited\",\"error\":\"Too Many Requests\",\"retry_after\":" +
-        std::to_string(retry_after) + "}\n";
-    send(client_sock, busy_resp.data(), static_cast<int>(busy_resp.size()), 0);
-    UnregisterClientSocket(client_sock_fd);
-    CLOSE_SOCKET(client_sock);
-    return;
-  }
-
   SSL* ssl = nullptr;
   if (is_tls_ && ssl_ctx_) {
     ssl = SSL_new(reinterpret_cast<SSL_CTX*>(ssl_ctx_));
@@ -386,6 +419,25 @@ void ActivationServerHttp::HandleClient(uintptr_t client_sock_fd, const std::str
     }
     return send(client_sock, buf, len, 0);
   };
+
+  int retry_after = 0;
+  if (!client_ip.empty() && !ip_rate_limiter_.Allow(client_ip, 1.0, &retry_after)) {
+    const std::string busy_resp =
+        "HTTP/1.1 429 Too Many Requests\r\n"
+        "Content-Type: application/json\r\n"
+        "Retry-After: " + std::to_string(retry_after) + "\r\n"
+        "Connection: close\r\n\r\n"
+        "{\"status\":\"rate_limited\",\"error\":\"Too Many Requests\",\"retry_after\":" +
+        std::to_string(retry_after) + "}\n";
+    raw_write(busy_resp.data(), static_cast<int>(busy_resp.size()));
+    if (ssl) {
+      SSL_shutdown(ssl);
+      SSL_free(ssl);
+    }
+    UnregisterClientSocket(client_sock_fd);
+    CLOSE_SOCKET(client_sock);
+    return;
+  }
 
   std::string raw_req;
   char buf[4096];
@@ -435,6 +487,8 @@ void ActivationServerHttp::HandleClient(uintptr_t client_sock_fd, const std::str
 
   std::string status_line = "HTTP/1.1 200 OK";
   std::string resp_body;
+  std::string retry_after_header;
+  std::string extra_headers;
 
   if (payload_too_large) {
     status_line = "HTTP/1.1 413 Payload Too Large";
@@ -468,26 +522,70 @@ void ActivationServerHttp::HandleClient(uintptr_t client_sock_fd, const std::str
     } else if (path == "/health" && method == "GET") {
       resp_body = "{\"status\":\"ok\"}\n";
     } else if (path.rfind("/events", 0) == 0 && method == "GET") {
-      // Administrative audit event inspection
-      auto events = service_.GetRecentEvents("", 50);
-      std::ostringstream ess;
-      ess << "{\n  \"events\": [\n";
-      for (std::size_t i = 0; i < events.size(); ++i) {
-        const auto& e = events[i];
-        ess << "    {\n"
-            << "      \"timestamp\": " << e.timestamp << ",\n"
-            << "      \"type\": \"" << ToString(e.type) << "\",\n"
-            << "      \"license_id\": \"" << e.license_id << "\",\n"
-            << "      \"device_fingerprint\": \"" << e.device_fingerprint << "\",\n"
-            << "      \"ip\": \"" << e.ip_address << "\",\n"
-            << "      \"details\": \"" << e.details << "\"\n"
-            << "    }" << (i + 1 < events.size() ? "," : "") << "\n";
+      // Administrative audit event inspection (requires authentication)
+      bool authorized = false;
+      if (!admin_auth_token_.empty()) {
+        std::string headers_part = (header_end != std::string::npos) ? raw_req.substr(0, header_end) : raw_req;
+        auto x_admin = FindHeaderCaseInsensitive(headers_part, "X-Admin-Key");
+        if (x_admin.has_value() && ConstantTimeStringEquals(*x_admin, admin_auth_token_)) {
+          authorized = true;
+        } else {
+          auto auth_hdr = FindHeaderCaseInsensitive(headers_part, "Authorization");
+          if (auth_hdr.has_value()) {
+            std::string auth = *auth_hdr;
+            if (auth.rfind("Bearer ", 0) == 0 || auth.rfind("bearer ", 0) == 0) {
+              std::string token = auth.substr(7);
+              while (!token.empty() && (token.front() == ' ' || token.front() == '\t')) token.erase(0, 1);
+              if (ConstantTimeStringEquals(token, admin_auth_token_)) {
+                authorized = true;
+              }
+            }
+          }
+        }
       }
-      ess << "  ]\n}\n";
-      resp_body = ess.str();
+
+      if (!authorized) {
+        status_line = "HTTP/1.1 401 Unauthorized";
+        extra_headers = "WWW-Authenticate: Bearer realm=\"RTProtect Admin\"\r\n";
+        resp_body = "{\n  \"error\": \"Unauthorized: missing or invalid administrative authentication key\"\n}\n";
+      } else {
+        auto events = service_.GetRecentEvents("", 50);
+        std::ostringstream ess;
+        ess << "{\n  \"events\": [\n";
+        for (std::size_t i = 0; i < events.size(); ++i) {
+          const auto& e = events[i];
+          ess << "    {\n"
+              << "      \"timestamp\": " << e.timestamp << ",\n"
+              << "      \"type\": \"" << ToString(e.type) << "\",\n"
+              << "      \"license_id\": \"" << e.license_id << "\",\n"
+              << "      \"device_fingerprint\": \"" << e.device_fingerprint << "\",\n"
+              << "      \"ip\": \"" << e.ip_address << "\",\n"
+              << "      \"details\": \"" << e.details << "\"\n"
+              << "    }" << (i + 1 < events.size() ? "," : "") << "\n";
+        }
+        ess << "  ]\n}\n";
+        resp_body = ess.str();
+      }
     } else {
       status_line = "HTTP/1.1 404 Not Found";
       resp_body = "{\"error\":\"endpoint not found\"}\n";
+    }
+
+    if (resp_body.find("\"status\": \"rate_limited\"") != std::string::npos ||
+        resp_body.find("\"status\":\"rate_limited\"") != std::string::npos) {
+      status_line = "HTTP/1.1 429 Too Many Requests";
+      auto ra_pos = resp_body.find("\"retry_after\":");
+      if (ra_pos != std::string::npos) {
+        ra_pos += 14;
+        while (ra_pos < resp_body.size() && (resp_body[ra_pos] == ' ' || resp_body[ra_pos] == '\t')) ++ra_pos;
+        std::string ra_val;
+        while (ra_pos < resp_body.size() && (resp_body[ra_pos] >= '0' && resp_body[ra_pos] <= '9')) {
+          ra_val += resp_body[ra_pos++];
+        }
+        if (!ra_val.empty()) {
+          retry_after_header = "Retry-After: " + ra_val + "\r\n";
+        }
+      }
     }
   }
 
@@ -495,6 +593,12 @@ void ActivationServerHttp::HandleClient(uintptr_t client_sock_fd, const std::str
   resp_stream << status_line << "\r\n";
   resp_stream << "Content-Type: application/json\r\n";
   resp_stream << "Content-Length: " << resp_body.size() << "\r\n";
+  if (!retry_after_header.empty()) {
+    resp_stream << retry_after_header;
+  }
+  if (!extra_headers.empty()) {
+    resp_stream << extra_headers;
+  }
   resp_stream << "Connection: close\r\n";
   resp_stream << "\r\n";
   resp_stream << resp_body;
