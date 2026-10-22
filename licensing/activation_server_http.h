@@ -7,9 +7,13 @@
 #pragma once
 
 #include <atomic>
+#include <condition_variable>
 #include <cstdint>
+#include <mutex>
 #include <string>
 #include <thread>
+#include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include "licensing/activation_service.h"
@@ -27,7 +31,7 @@ class ActivationServerHttp {
   // Starts the HTTP/HTTPS server on specified port (use 0 for auto-assigned ephemeral port)
   bool Start(std::uint16_t port = 8080, const std::string& host = "127.0.0.1");
 
-  // Stops server and terminates worker threads
+  // Stops server and cleanly joins all in-flight worker threads
   void Stop();
 
   bool is_running() const { return running_.load(); }
@@ -44,6 +48,10 @@ class ActivationServerHttp {
   void ServerLoop();
   void HandleClient(uintptr_t client_sock_fd);
 
+  void RegisterClientSocket(uintptr_t s);
+  void UnregisterClientSocket(uintptr_t s);
+  void CloseAllClientSockets();
+
   ActivationService& service_;
   std::atomic<bool> running_{false};
   std::atomic<std::size_t> active_clients_{0};
@@ -51,6 +59,16 @@ class ActivationServerHttp {
   std::string host_{"127.0.0.1"};
   uintptr_t listen_fd_{~0ULL}; // SOCKET on Win32, int on POSIX
   std::thread accept_thread_;
+
+  // Worker thread lifecycle tracking to prevent shutdown use-after-free
+  std::mutex workers_mu_;
+  std::condition_variable workers_cv_;
+  std::unordered_map<std::thread::id, std::thread> active_workers_;
+  std::vector<std::thread> finished_workers_;
+
+  // Open socket tracking to unblock in-flight workers on shutdown
+  std::mutex sockets_mu_;
+  std::unordered_set<uintptr_t> client_sockets_;
 
   bool is_tls_{false};
   std::string tls_cert_file_;
