@@ -74,7 +74,7 @@ ActivationServerHttp::~ActivationServerHttp() {
 }
 
 bool ActivationServerHttp::EnableTls(const std::string& cert_file, const std::string& key_file) {
-  if (running_.load()) return false; // Must be set before Start()
+  if (running_.load()) return false; // Must be configured before Start()
 
   if (ssl_ctx_) {
     SSL_CTX_free(reinterpret_cast<SSL_CTX*>(ssl_ctx_));
@@ -161,6 +161,25 @@ bool ActivationServerHttp::Start(std::uint16_t port, const std::string& host) {
   return true;
 }
 
+void ActivationServerHttp::RegisterClientSocket(uintptr_t s) {
+  std::lock_guard<std::mutex> lock(sockets_mu_);
+  client_sockets_.insert(s);
+}
+
+void ActivationServerHttp::UnregisterClientSocket(uintptr_t s) {
+  std::lock_guard<std::mutex> lock(sockets_mu_);
+  client_sockets_.erase(s);
+}
+
+void ActivationServerHttp::CloseAllClientSockets() {
+  std::lock_guard<std::mutex> lock(sockets_mu_);
+  for (uintptr_t s_fd : client_sockets_) {
+    socket_t s = static_cast<socket_t>(s_fd);
+    CLOSE_SOCKET(s);
+  }
+  client_sockets_.clear();
+}
+
 void ActivationServerHttp::Stop() {
   if (!running_.exchange(false)) return;
 
@@ -174,13 +193,17 @@ void ActivationServerHttp::Stop() {
     accept_thread_.join();
   }
 
-  // Wait for in-flight requests to complete
-  auto start = std::chrono::steady_clock::now();
-  while (active_clients_.load() > 0) {
-    std::this_thread::sleep_for(std::chrono::milliseconds(10));
-    if (std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now() - start).count() > 2) {
-      break;
+  // Force-close all open client sockets so in-flight workers immediately unblock from recv()
+  CloseAllClientSockets();
+
+  // Safely wait for all active worker threads to terminate and join them
+  {
+    std::unique_lock<std::mutex> lock(workers_mu_);
+    workers_cv_.wait(lock, [this]() { return active_workers_.empty(); });
+    for (auto& t : finished_workers_) {
+      if (t.joinable()) t.join();
     }
+    finished_workers_.clear();
   }
 }
 
@@ -188,6 +211,15 @@ void ActivationServerHttp::ServerLoop() {
   socket_t listen_sock = static_cast<socket_t>(listen_fd_);
 
   while (running_.load()) {
+    // Periodically prune any finished worker threads
+    {
+      std::lock_guard<std::mutex> lock(workers_mu_);
+      for (auto& t : finished_workers_) {
+        if (t.joinable()) t.join();
+      }
+      finished_workers_.clear();
+    }
+
     fd_set read_fds;
     FD_ZERO(&read_fds);
     FD_SET(listen_sock, &read_fds);
@@ -204,8 +236,19 @@ void ActivationServerHttp::ServerLoop() {
     socket_t client_sock = accept(listen_sock, reinterpret_cast<sockaddr*>(&client_addr), &client_len);
     if (client_sock == INVALID_SOCKET_VALUE) continue;
 
-    // Concurrency limit enforcement
-    if (active_clients_.load() >= kMaxConcurrentClients) {
+    // Atomic concurrency cap check & acquisition (strictly eliminates TOCTOU overshoot)
+    std::size_t curr = active_clients_.load(std::memory_order_relaxed);
+    bool slot_acquired = false;
+    while (curr < kMaxConcurrentClients) {
+      if (active_clients_.compare_exchange_weak(curr, curr + 1,
+                                               std::memory_order_acquire,
+                                               std::memory_order_relaxed)) {
+        slot_acquired = true;
+        break;
+      }
+    }
+
+    if (!slot_acquired) {
       const char* busy_resp =
           "HTTP/1.1 503 Service Unavailable\r\n"
           "Content-Type: application/json\r\n"
@@ -217,17 +260,33 @@ void ActivationServerHttp::ServerLoop() {
       continue;
     }
 
-    // Dispatch connection to worker thread to prevent single client from blocking the service
-    active_clients_++;
-    std::thread([this, client_sock]() {
+    // Spawn and track worker thread lifecycle
+    std::thread t([this, client_sock]() {
       HandleClient(static_cast<uintptr_t>(client_sock));
-      active_clients_--;
-    }).detach();
+
+      {
+        std::lock_guard<std::mutex> lock(workers_mu_);
+        auto it = active_workers_.find(std::this_thread::get_id());
+        if (it != active_workers_.end()) {
+          finished_workers_.push_back(std::move(it->second));
+          active_workers_.erase(it);
+        }
+        active_clients_.fetch_sub(1, std::memory_order_release);
+      }
+      workers_cv_.notify_all();
+    });
+
+    std::thread::id tid = t.get_id();
+    {
+      std::lock_guard<std::mutex> lock(workers_mu_);
+      active_workers_[tid] = std::move(t);
+    }
   }
 }
 
 void ActivationServerHttp::HandleClient(uintptr_t client_sock_fd) {
   socket_t client_sock = static_cast<socket_t>(client_sock_fd);
+  RegisterClientSocket(client_sock_fd);
 
   // Set 5-second socket timeout to prevent Slowloris attacks
   SetSocketTimeouts(client_sock, 5);
@@ -236,12 +295,14 @@ void ActivationServerHttp::HandleClient(uintptr_t client_sock_fd) {
   if (is_tls_ && ssl_ctx_) {
     ssl = SSL_new(reinterpret_cast<SSL_CTX*>(ssl_ctx_));
     if (!ssl) {
+      UnregisterClientSocket(client_sock_fd);
       CLOSE_SOCKET(client_sock);
       return;
     }
     SSL_set_fd(ssl, static_cast<int>(client_sock));
     if (SSL_accept(ssl) <= 0) {
       SSL_free(ssl);
+      UnregisterClientSocket(client_sock_fd);
       CLOSE_SOCKET(client_sock);
       return;
     }
@@ -318,6 +379,7 @@ void ActivationServerHttp::HandleClient(uintptr_t client_sock_fd) {
       SSL_shutdown(ssl);
       SSL_free(ssl);
     }
+    UnregisterClientSocket(client_sock_fd);
     CLOSE_SOCKET(client_sock);
     return;
   } else {
@@ -361,6 +423,7 @@ void ActivationServerHttp::HandleClient(uintptr_t client_sock_fd) {
     SSL_shutdown(ssl);
     SSL_free(ssl);
   }
+  UnregisterClientSocket(client_sock_fd);
   CLOSE_SOCKET(client_sock);
 }
 

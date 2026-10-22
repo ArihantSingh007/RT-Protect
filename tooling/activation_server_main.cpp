@@ -8,7 +8,10 @@
 #include <csignal>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
+#include <iomanip>
 #include <iostream>
+#include <sstream>
 #include <string>
 #include <thread>
 
@@ -41,6 +44,9 @@ void PrintUsage() {
             << "  --host <h>                     Listen address (default: 127.0.0.1)\n"
             << "  --db <path>                    Database file path (default: activations.db)\n"
             << "  --key <path>                   Ed25519 signing private key file (required or auto-generated)\n"
+            << "  --tls-cert <path>              TLS server certificate PEM file\n"
+            << "  --tls-key <path>               TLS server private key PEM file\n"
+            << "  --insecure-dev-only            Allow non-loopback binding without TLS (insecure)\n"
             << "  --register-license <id> <prod> <seats> [vm_root_hex]\n"
             << "                                 Register a license and exit\n"
             << "  --revoke-license <id>          Revoke a license and exit\n"
@@ -75,6 +81,9 @@ int main(int argc, char* argv[]) {
   std::string host = "127.0.0.1";
   std::string db_path = "activations.db";
   std::string key_path;
+  std::string tls_cert_path;
+  std::string tls_key_path;
+  bool insecure_dev_only = false;
 
   std::string reg_lic_id;
   std::string reg_prod_id;
@@ -99,6 +108,12 @@ int main(int argc, char* argv[]) {
       db_path = argv[++i];
     } else if (arg == "--key" && i + 1 < argc) {
       key_path = argv[++i];
+    } else if (arg == "--tls-cert" && i + 1 < argc) {
+      tls_cert_path = argv[++i];
+    } else if (arg == "--tls-key" && i + 1 < argc) {
+      tls_key_path = argv[++i];
+    } else if (arg == "--insecure-dev-only") {
+      insecure_dev_only = true;
     } else if (arg == "--register-license" && i + 3 < argc) {
       reg_lic_id = argv[++i];
       reg_prod_id = argv[++i];
@@ -194,6 +209,25 @@ int main(int argc, char* argv[]) {
 
   ActivationService service(db, std::move(key_pair->private_key), key_pair->public_key);
   ActivationServerHttp server(service);
+
+  if (!tls_cert_path.empty() || !tls_key_path.empty()) {
+    if (tls_cert_path.empty() || tls_key_path.empty()) {
+      std::cerr << "Error: Both --tls-cert and --tls-key must be specified together.\n";
+      return 1;
+    }
+    if (!server.EnableTls(tls_cert_path, tls_key_path)) {
+      std::cerr << "Error: Failed to enable TLS with certificate '" << tls_cert_path
+                << "' and key '" << tls_key_path << "'. Check file paths and PEM format.\n";
+      return 1;
+    }
+  }
+
+  bool is_loopback = (host == "127.0.0.1" || host == "localhost" || host == "::1");
+  if (!is_loopback && !server.is_tls() && !insecure_dev_only) {
+    std::cerr << "Error: Refusing to start unencrypted HTTP server on non-loopback host '" << host
+              << "'. Pass --tls-cert and --tls-key to enable TLS, or pass --insecure-dev-only to override.\n";
+    return 1;
+  }
 
   if (!server.Start(port, host)) {
     std::cerr << "Error: Failed to start HTTP server on " << host << ":" << port << "\n";
