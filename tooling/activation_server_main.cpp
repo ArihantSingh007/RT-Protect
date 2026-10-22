@@ -19,6 +19,7 @@
 
 #include "integrity/keys.h"
 #include "integrity/signer.h"
+#include "integrity/verifier.h"
 #include "licensing/activation_database.h"
 #include "licensing/activation_server_http.h"
 #include "licensing/activation_service.h"
@@ -197,6 +198,15 @@ int main(int argc, char* argv[]) {
     }
     integrity::Ed25519PublicKey pub{};
     std::memcpy(pub.data(), pbytes->data(), 32);
+
+    // Cryptographically verify that the public key matches the private key
+    std::vector<std::uint8_t> probe_bytes = {'R', 'T', 'P', 'r', 'o', 't', 'e', 'c', 't', 'K', 'e', 'y'};
+    auto sig = integrity::SignManifestBytes(probe_bytes, *priv);
+    if (!sig.has_value() || !integrity::VerifyManifestSignature(probe_bytes, *sig, pub)) {
+      std::cerr << "Error: Loaded public key " << pub_path << " does not match private key " << key_path << "\n";
+      return 1;
+    }
+
     key_pair = integrity::Ed25519KeyPair{std::move(*priv), pub};
   } else {
     std::cout << "Generating ephemeral Ed25519 signing key pair for development server...\n";
@@ -209,6 +219,7 @@ int main(int argc, char* argv[]) {
 
   ActivationService service(db, std::move(key_pair->private_key), key_pair->public_key);
   ActivationServerHttp server(service);
+  server.SetAllowInsecureNonLoopback(insecure_dev_only);
 
   if (!tls_cert_path.empty() || !tls_key_path.empty()) {
     if (tls_cert_path.empty() || tls_key_path.empty()) {

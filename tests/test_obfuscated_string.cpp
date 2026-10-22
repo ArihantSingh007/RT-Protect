@@ -58,4 +58,17 @@ MT_TEST(ObfuscatedString_DifferentCallSites_ProduceDifferentSeeds) {
   MT_CHECK(std::strcmp(rev2.c_str(), "same text, two places") == 0);
 }
 
+MT_TEST(ObfuscatedString_Macro_ConvertsToStdStringAndConstChar) {
+  // Verifies High 14 fix: OBFUSCATED_STRING macro can be directly passed to
+  // functions taking const char* or std::string without type mismatch
+  const char* raw_ptr = OBFUSCATED_STRING("System Operational");
+  MT_CHECK(std::strcmp(raw_ptr, "System Operational") == 0);
+
+  std::string cpp_str = OBFUSCATED_STRING("System Operational");
+  MT_CHECK(cpp_str == "System Operational");
+
+  std::string rtprotect_str = RTPROTECT_STRING("Encrypted Config Value");
+  MT_CHECK(rtprotect_str == "Encrypted Config Value");
+}
+
 MT_MAIN()

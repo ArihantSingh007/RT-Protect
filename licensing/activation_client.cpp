@@ -484,7 +484,12 @@ std::optional<std::string> DispatchHttpPost(const std::string& base_url, const s
     return HttpPostTls(url, endpoint, body, error_out);
   }
 
-  // Plain HTTP used ONLY when caller explicitly provided http:// (e.g. local loopback tests)
+  // Plain HTTP used ONLY when caller explicitly provided http:// on local loopback
+  bool is_loopback = (url.host == "127.0.0.1" || url.host == "localhost" || url.host == "::1");
+  if (!is_loopback) {
+    if (error_out) *error_out = "Refusing insecure plain HTTP connection to non-loopback server: " + base_url + " (HTTPS required)";
+    return std::nullopt;
+  }
   return HttpPostSocket(url, endpoint, body, error_out);
 }
 

@@ -174,14 +174,23 @@ bool CheckRemoteDebugger() {
   }
   return false;
 #else
-  // Layer 3 (Active ptrace check on Linux):
-  // Attempt PTRACE_TRACEME; if another process (debugger, GDB, LLDB, strace) is attached,
-  // ptrace returns -1 with EPERM.
-  if (ptrace(PTRACE_TRACEME, 0, 1, 0) < 0) {
-    return true; // Debugger attached
+  // Passive external debugger / tracer check on Linux:
+  // Inspect /proc/self/status for non-zero TracerPid without mutating
+  // process tracing state via ptrace(PTRACE_TRACEME).
+  std::ifstream f("/proc/self/status");
+  std::string line;
+  while (f && std::getline(f, line)) {
+    if (line.rfind("TracerPid:", 0) == 0) {
+      const char* p = line.c_str() + 10;
+      while (*p == ' ' || *p == '\t') ++p;
+      char* end = nullptr;
+      long pid = std::strtol(p, &end, 10);
+      if (end != p && pid > 0) {
+        return true;
+      }
+      return false;
+    }
   }
-  // Detach if we successfully attached to ourselves
-  ptrace(PTRACE_DETACH, 0, 1, 0);
   return false;
 #endif
 }
