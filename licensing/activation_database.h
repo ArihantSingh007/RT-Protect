@@ -41,6 +41,14 @@ struct ActivationRecord {
   std::uint64_t sequence_number = 1;
 };
 
+struct SeatReservationResult {
+  bool success = false;
+  bool is_new_seat = false;
+  std::uint64_t sequence_number = 1;
+  std::uint64_t first_seen = 0;
+  std::string error;
+};
+
 class ActivationDatabase {
  public:
   ActivationDatabase() = default;
@@ -65,9 +73,17 @@ class ActivationDatabase {
   bool RecordActivation(const ActivationRecord& record);
   bool RemoveActivation(const std::string& license_id, const std::string& device_fingerprint);
 
+  // Atomic seat reservation and lifecycle lease management
+  SeatReservationResult ReserveSeatAtomic(const std::string& license_id,
+                                          const std::string& device_fingerprint,
+                                          std::uint32_t max_seats,
+                                          std::uint64_t current_time,
+                                          std::uint64_t stale_timeout_seconds = 30 * 86400);
+
   // Anti-replay nonce tracking
   bool IsNonceUsed(const std::string& nonce_hex) const;
   bool RecordNonce(const std::string& nonce_hex, std::uint64_t expires_at);
+  bool ConsumeNonceIfUnused(const std::string& nonce_hex, std::uint64_t expires_at);
   void PruneExpiredNonces(std::uint64_t current_time);
 
   // Clear all data (for testing)
@@ -76,6 +92,8 @@ class ActivationDatabase {
   const std::string& db_path() const { return db_path_; }
 
  private:
+  bool SaveLocked() const;
+
   mutable std::mutex mutex_;
   std::string db_path_;
   std::unordered_map<std::string, LicenseRecord> licenses_;

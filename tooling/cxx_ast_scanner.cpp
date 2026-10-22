@@ -282,13 +282,14 @@ std::vector<StringLiteralMatch> CxxAstScanner::FindAllStringLiterals() const {
       std::size_t start = i;
       std::size_t end = SkipStandardString(src_, i);
       if (end > start) {
-        // Check if already enclosed by OBFUSCATED_STRING
+        // Check if already enclosed by OBFUSCATED_STRING, RTPROTECT_STRING, or ScatterTamperCheck
         bool already_obfuscated = false;
-        if (start >= 17) {
-          std::string prefix = src_.substr(start - 17, 17);
-          if (prefix.find("OBFUSCATED_STRING") != std::string::npos) {
-            already_obfuscated = true;
-          }
+        std::size_t lookback_len = (start >= 32) ? 32 : start;
+        std::string prefix = src_.substr(start - lookback_len, lookback_len);
+        if (prefix.find("OBFUSCATED_STRING") != std::string::npos ||
+            prefix.find("RTPROTECT_STRING") != std::string::npos ||
+            prefix.find("ScatterTamperCheck") != std::string::npos) {
+          already_obfuscated = true;
         }
         if (!already_obfuscated) {
           literals.push_back({ {start, end}, src_.substr(start, end - start), false });
@@ -325,9 +326,9 @@ std::string CxxAstScanner::RewriteTranslationUnitStrings(std::size_t* out_obfusc
 
     std::string replacement;
     if (lit.is_raw) {
-      replacement = "std::string(" + lit.literal_text + ")";
+      replacement = lit.literal_text;
     } else {
-      replacement = "std::string(OBFUSCATED_STRING(" + lit.literal_text + "))";
+      replacement = "OBFUSCATED_STRING(" + lit.literal_text + ")";
     }
 
     result.replace(lit.range.start, lit.range.end - lit.range.start, replacement);

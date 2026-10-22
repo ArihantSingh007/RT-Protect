@@ -277,7 +277,7 @@ bool SecureStorage::Store(const std::string& key_name,
   if (!handle) handle = dlopen("libsecret-1.so", RTLD_LAZY);
 
   if (handle) {
-    using StoreFn = int (*)(const void*, const char*, const char*, void*, void**, ...);
+    using StoreFn = int (*)(const void*, const char*, const char*, const char*, void*, void**, ...);
     StoreFn secret_store = reinterpret_cast<StoreFn>(dlsym(handle, "secret_password_store_sync"));
     if (secret_store) {
       // Encode data as hex/base64 or string for secret_password_store_sync

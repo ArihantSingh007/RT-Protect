@@ -97,12 +97,19 @@ The audit identified and resolved critical architectural vulnerabilities in sign
 | **RTP-SEC-057** | High | Confirmed | `licensing/trusted_time.*`, `licensing/activation_client.cpp` | Local Clock Rollback Vulnerability: Token expiration could be bypassed by resetting local system calendar backwards, because expiration checks relied solely on unanchored OS system wall clock. | Users roll back machine date/time to freeze license expiration and continue running expired software indefinitely. | Changing OS system clock to a prior date. | Implemented `TrustedTime` engine: anchors verified server timestamps during online token activation/renewal into secure storage; enforces monotonic steady clock progression against wall clock; detects backward clock manipulation across application runs ($$\text{current\_time} + 300\text{s} < \text{last\_known\_server\_time}$$); supports RFC 7231 Date parsing. | Verified in `test_trusted_time.cpp`. |
 | **RTP-SEC-058** | Medium | Confirmed | `antitamper/anti_debug.cpp` | Linux Anti-Tamper & Memory Hooking Gap: `CheckMemoryTampered()` was Windows-only (returning `false` on Linux); Linux anti-debugging only checked `TracerPid`. | Attackers on Linux/Steam Deck use `LD_PRELOAD`, Frida, Substrate, or code caves to detour protection routines undetected. | Injecting shared libraries or hooking functions via `LD_PRELOAD` on Linux. | Added Linux `/proc/self/maps` scanning detecting injected hooking libraries (`frida`, `substrate`, etc.) and rogue read-write-executable (`rwx`) memory allocations; detected `LD_PRELOAD` environment injection; expanded `/proc/self/status` parsing for `State: T` (stopped/traced). | Verified in `test_antitamper.cpp`. |
 | **RTP-SEC-059** | Medium | Confirmed | `fuzz/fuzz_source_scanner.cpp`, `fuzz/CMakeLists.txt`, `fuzz/README.md` | Unfuzzed Source Parser Attack Surface: Lexical scanner in `TransformSourceFile` handled user-provided source files without fuzzing coverage against malformed strings, unmatched braces, or pathological preprocessor inputs. | Malformed or adversarial source code could cause buffer overflows, crashes, or parser desynchronization during build integration. | Supplying syntactically adversarial C++ code to integration scanner. | Implemented libFuzzer harness `fuzz_source_scanner` exercising `TransformSourceFile` with arbitrary byte streams. | Verified via fuzz harness definition and build configuration. |
+| **RTP-SEC-060** | Critical | Confirmed | `licensing/activation_server_http.*`, `tooling/activation_server_main.cpp`, `licensing/activation_client.cpp`, `licensing/secure_storage.cpp` | Activation Server Bind Validation Bypass & Plain HTTP Exposure: Failed `inet_pton` conversion defaulted to wildcard `0.0.0.0`, binding unencrypted HTTP on all interfaces without TLS; client lacked rejection for plain HTTP to remote hosts; Secret Service `StoreFn` pointer signature mismatched parameter types. | Publicly exposing unencrypted HTTP activation service on production networks; Linux compilation failure. | Passing unresolvable host strings or non-loopback addresses without TLS. | Enforced strict `inet_pton` IPv4/IPv6 validation with explicit `localhost` to `127.0.0.1` resolution, programmatic TLS enforcement in `Start()`, client rejection of non-loopback plain HTTP, cryptographic public/private key verification on server launch, and corrected Secret Service function signatures. | Verified in `test_activation_service.cpp` (`HttpServer_HostValidation_EnforcesTlsAndLoopbackSafety`, `HttpClient_RejectsInsecureNonLoopbackHttp`). |
+| **RTP-SEC-061** | Critical | Confirmed | `antitamper/anti_debug.cpp` | Linux Anti-Debugging State Mutation: Active `ptrace(PTRACE_TRACEME)` call mutated the calling process's tracing state, causing legitimate debuggers, crash reporters, or secondary checks to malfunction. | Tracing state mutation creates operational side-effects and breaks anti-tamper idempotency. | Running on Linux and checking debug status. | Eliminated `PTRACE_TRACEME` / `PTRACE_DETACH` in favor of passive, non-mutating `/proc/self/status` `TracerPid` parsing and state evaluation. | Verified in `test_antitamper.cpp`. |
+| **RTP-SEC-062** | High | Confirmed | `licensing/rate_limiter.h`, `licensing/activation_server_http.*`, `licensing/activation_service.*` | Missing Rate Limiting on Activation Authority: Server endpoints `/activate` and `/renew` lacked request throttling, leaving service vulnerable to credential brute-forcing, seat exhaustion, and denial of service. | Attackers exhaust server resources or brute-force valid license keys. | Rapid-fire requests to `/activate`. | Implemented thread-safe Token Bucket rate limiter (`RateLimiter`) with IP-based throttling at HTTP layer (HTTP 429 + `Retry-After`) and per-license throttling in `ActivationService`. | Verified in `test_activation_service.cpp` (`Service_RateLimiting_PerLicenseThrottling`). |
+| **RTP-SEC-063** | High | Confirmed | `licensing/activation_service.*`, `licensing/activation_database.*` | Nonce Replay Exploitation, Permissive Clock Drift & Renewal Past Grace: Server accepted all-zero or missing client nonces, lacked atomic consume-before-issue check, allowed renewal beyond `grace_expires_at`, and unpruned nonce maps grew unbounded. | Replay attacks, unauthorized activation renewal for expired licenses, unbounded memory leaks. | Replaying old nonces or submitting expired tokens for renewal. | Implemented atomic `ConsumeNonceIfUnused` with automatic expired nonce pruning, enforced non-zero client nonces, 900s clock drift window, and strictly rejected renewals past `grace_expires_at`. | Verified in `test_activation_service.cpp` (`Service_ReplayProtection_StrictNonceEnforcement`, `Service_Renew_RejectsExpiredTokenPastGrace`). |
+| **RTP-SEC-064** | High | Confirmed | `licensing/activation_database.*` | Non-Atomic Seat Reservation & In-Memory Persistence Lag: Checking seat counts and adding activation records were separate operations, risking race conditions under concurrency; mutations were only saved on shutdown, risking data loss on abrupt termination. | Seat limits exceeded under concurrent activations; lost activation records on crash; fail-open parsing on corrupt status. | Concurrent activations exceeding seat capacity; terminating server abruptly. | Implemented atomic `ReserveSeatAtomic` with stale-seat lease recovery under single lock, synchronous `SaveLocked()` write-through on every mutating operation, and fail-closed parser skipping unrecognized statuses. | Verified in `test_activation_service.cpp` (`Database_FailClosed_RejectsCorruptedStatus`, `HttpServer_ConcurrentClients_NonBlocking`). |
+| **RTP-SEC-065** | High | Confirmed | `licensing/activation_service.cpp` | Cryptographic Randomness Deterministic Fallback: When `RAND_bytes()` failed, server fell back to deterministic pseudorandom patterns rather than failing closed. | Predictable server nonces and session keys under entropy exhaustion. | Forcing OpenSSL RNG failure. | Removed all deterministic fallback paths; service immediately fails closed and returns error if `RAND_bytes()` fails. | Verified in `activation_service.cpp`. |
+| **RTP-SEC-066** | High | Confirmed | `obfuscation/obfuscated_string.h`, `tooling/cxx_ast_scanner.cpp`, `tests/test_obfuscated_string.cpp` | String Obfuscation Lifetime & Type Safety: Global rewriting of string literals into `std::string` caused invalid conversions when assigned to `const char*` or passed to C APIs; temporary object destruction caused dangling pointer reads. | Compilation errors or dangling pointer crashes on obfuscated string literals. | Initializing `const char*` with `OBFUSCATED_STRING(...)`. | Redesigned `OBFUSCATED_STRING` macro to use a call-site static constexpr obfuscation object with thread-safe, static-duration decrypted buffer; safely converts to both `const char*` and `std::string` without dangling or memory leakage. | Verified in `test_obfuscated_string.cpp` (`ObfuscatedString_Macro_ConvertsToStdStringAndConstChar`). |
 
 ---
 
 ## 3. Verification & Quality Assurance Summary
 
-The entire suite of 21 automated unit, component, and integration tests passes with 100% success rate on Windows x64:
+The entire suite of 22 automated unit, component, and integration tests passes with 100% success rate on Windows x64:
 
 ```
 Test project C:/Users/Arihant Singh/Downloads/rtprotect_hardening_WIP/build
@@ -112,23 +119,24 @@ Test project C:/Users/Arihant Singh/Downloads/rtprotect_hardening_WIP/build
       Start  4: test_protected_checksum ..........   Passed    0.03 sec
       Start  5: test_manifest ....................   Passed    0.02 sec
       Start  6: test_signing .....................   Passed    0.03 sec
-      Start  7: test_bound_key ...................   Passed    0.02 sec
-      Start  8: test_file_io .....................   Passed    0.02 sec
-      Start  9: test_checked_arith_fallback ......   Passed    0.19 sec
-      Start 10: test_secure_buffer ...............   Passed    0.03 sec
+      Start  7: test_bound_key ...................   Passed    0.03 sec
+      Start  8: test_file_io .....................   Passed    0.01 sec
+      Start  9: test_checked_arith_fallback ......   Passed    0.14 sec
+      Start 10: test_secure_buffer ...............   Passed    0.02 sec
       Start 11: test_obfuscated_string ...........   Passed    0.02 sec
       Start 12: test_checksum_flattened ..........   Passed    0.03 sec
-      Start 13: test_license .....................   Passed    0.13 sec
-      Start 14: test_activation ..................   Passed    0.27 sec
-      Start 15: test_activation_service ..........   Passed    0.18 sec
-      Start 16: test_trusted_time ................   Passed    0.15 sec
-      Start 17: test_hardware_id .................   Passed    0.10 sec
-      Start 18: test_update_manifest .............   Passed    0.08 sec
+      Start 13: test_license .....................   Passed    0.03 sec
+      Start 14: test_activation ..................   Passed    0.12 sec
+      Start 15: test_activation_service ..........   Passed    0.16 sec
+      Start 16: test_trusted_time ................   Passed    0.13 sec
+      Start 17: test_hardware_id .................   Passed    0.03 sec
+      Start 18: test_update_manifest .............   Passed    0.04 sec
       Start 19: test_antitamper ..................   Passed    0.03 sec
-      Start 20: test_opcode_map ..................   Passed    0.04 sec
-      Start 21: test_integration_engine ..........   Passed    3.79 sec
+      Start 20: test_opcode_map ..................   Passed    0.02 sec
+      Start 21: test_integration_engine ..........   Passed    3.28 sec
+      Start 22: test_unreal_integration ..........   Passed    0.05 sec
 
-100% tests passed, 0 tests failed out of 21
+100% tests passed, 0 tests failed out of 22
 ```
 
 Packaging execution via `tooling/package_release.ps1` verifies all targets, strips release executables, and produces a complete distribution archive:

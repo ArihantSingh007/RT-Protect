@@ -33,6 +33,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <string>
 
 namespace rtprotect::obfuscation {
 
@@ -113,6 +114,8 @@ class RevealedString {
   RevealedString& operator=(const RevealedString&) = delete;
 
   const char* c_str() const { return buf_; }
+  operator const char*() const { return buf_; }
+  operator std::string() const { return std::string(buf_, N - 1); }
   std::size_t size() const { return N - 1; }  // excludes the null terminator
 
  private:
@@ -132,3 +135,17 @@ class RevealedString {
       (str), (0x9E3779B97F4A7C15ULL ^                                               \
               (static_cast<unsigned long long>(__LINE__) * 2654435761ULL) ^         \
               static_cast<unsigned long long>(__COUNTER__))))
+
+#define OBFUSCATED_STRING(str)                                                      \
+  ([]() -> const char* {                                                            \
+    static constexpr auto s_obf = RTPROTECT_OBFUSCATE(str);                         \
+    static char s_buf[s_obf.size()];                                                \
+    static const bool s_init = []() {                                               \
+      s_obf.Decrypt(s_buf);                                                         \
+      return true;                                                                  \
+    }();                                                                            \
+    (void)s_init;                                                                   \
+    return s_buf;                                                                   \
+  }())
+
+#define RTPROTECT_STRING(str) OBFUSCATED_STRING(str)

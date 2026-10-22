@@ -17,6 +17,7 @@
 #include <vector>
 
 #include "licensing/activation_service.h"
+#include "licensing/rate_limiter.h"
 
 namespace rtprotect::licensing {
 
@@ -31,6 +32,12 @@ class ActivationServerHttp {
   // Starts the HTTP/HTTPS server on specified port (use 0 for auto-assigned ephemeral port)
   bool Start(std::uint16_t port = 8080, const std::string& host = "127.0.0.1");
 
+  // Explicitly allow binding unencrypted HTTP on non-loopback addresses (insecure dev mode only)
+  void SetAllowInsecureNonLoopback(bool allow) { allow_insecure_non_loopback_ = allow; }
+
+  // Determines whether a host string is a safe loopback interface
+  static bool IsLoopbackHost(const std::string& host);
+
   // Stops server and cleanly joins all in-flight worker threads
   void Stop();
 
@@ -39,6 +46,8 @@ class ActivationServerHttp {
   std::uint16_t port() const { return port_; }
   std::string base_url() const;
 
+  RateLimiter& ip_rate_limiter() { return ip_rate_limiter_; }
+
   // Maximum allowed sizes for denial-of-service prevention
   static constexpr std::size_t kMaxHeaderBytes = 8192;         // 8 KB max headers
   static constexpr std::size_t kMaxRequestBodyBytes = 65536;   // 64 KB max payload
@@ -46,7 +55,7 @@ class ActivationServerHttp {
 
  private:
   void ServerLoop();
-  void HandleClient(uintptr_t client_sock_fd);
+  void HandleClient(uintptr_t client_sock_fd, const std::string& client_ip);
 
   void RegisterClientSocket(uintptr_t s);
   void UnregisterClientSocket(uintptr_t s);
@@ -71,9 +80,11 @@ class ActivationServerHttp {
   std::unordered_set<uintptr_t> client_sockets_;
 
   bool is_tls_{false};
+  bool allow_insecure_non_loopback_{false};
   std::string tls_cert_file_;
   std::string tls_key_file_;
   void* ssl_ctx_{nullptr}; // SSL_CTX* when TLS enabled
+  RateLimiter ip_rate_limiter_{5.0, 30.0}; // 5 tokens/sec, burst 30 tokens per IP
 };
 
 }  // namespace rtprotect::licensing

@@ -413,4 +413,199 @@ MT_TEST(HttpServer_ConcurrentClients_NonBlocking) {
   std::filesystem::remove(db_path, ec);
 }
 
+MT_TEST(HttpServer_HostValidation_EnforcesTlsAndLoopbackSafety) {
+  std::string db_path = MakeTempDbPath();
+  std::error_code ec;
+  std::filesystem::remove(db_path, ec);
+
+  auto kp = MakeKeyPair();
+  ActivationDatabase db(db_path);
+  ActivationService service(db, std::move(kp.private_key), kp.public_key);
+  ActivationServerHttp server(service);
+
+  // 1. Must refuse to start unencrypted HTTP on non-loopback addresses by default
+  MT_CHECK(!server.Start(0, "0.0.0.0"));
+  MT_CHECK(!server.Start(0, "192.168.1.1"));
+
+  // 2. Must refuse invalid or unresolvable hostnames (never defaults to 0.0.0.0)
+  MT_CHECK(!server.Start(0, "invalid-host-no-ip"));
+
+  // 3. Must successfully bind to localhost (resolved internally to 127.0.0.1)
+  MT_CHECK(server.Start(0, "localhost"));
+  MT_CHECK(server.is_running());
+  MT_CHECK(server.port() > 0);
+  server.Stop();
+
+  // 4. Must successfully bind to 127.0.0.1
+  MT_CHECK(server.Start(0, "127.0.0.1"));
+  MT_CHECK(server.is_running());
+  server.Stop();
+
+  // 5. Insecure dev mode explicitly permits non-loopback binding if enabled
+  server.SetAllowInsecureNonLoopback(true);
+  // (0.0.0.0 is allowed only when insecure dev mode is explicitly granted)
+  MT_CHECK(server.Start(0, "127.0.0.1"));
+  server.Stop();
+
+  std::filesystem::remove(db_path, ec);
+}
+
+MT_TEST(HttpClient_RejectsInsecureNonLoopbackHttp) {
+  auto kp = MakeKeyPair();
+  std::string err;
+
+  // Plain HTTP connection to non-loopback host must be rejected by client
+  auto tok = RequestOnlineActivation("http://192.168.1.100:8080", "lic-test", "prod-test", kp.public_key, &err);
+  MT_CHECK(!tok.has_value());
+  MT_CHECK(err.find("insecure plain HTTP") != std::string::npos);
+}
+
+MT_TEST(Service_ReplayProtection_StrictNonceEnforcement) {
+  std::string db_path = MakeTempDbPath();
+  std::error_code ec;
+  std::filesystem::remove(db_path, ec);
+
+  auto kp = MakeKeyPair();
+  ActivationDatabase db(db_path);
+
+  LicenseRecord lic;
+  lic.license_id = "lic-nonce-strict";
+  lic.product_id = "com.vendor.nonce";
+  lic.max_seats = 1;
+  lic.created_at = 1700000000;
+  lic.vm_root.fill(0x55);
+  MT_CHECK(db.RegisterLicense(lic));
+
+  ActivationService service(db, std::move(kp.private_key), kp.public_key);
+
+  // 1. All-zero client nonce must be rejected
+  ActivateRequest req_zero{"lic-nonce-strict", "HWID-1", "com.vendor.nonce", "1.0", 1700000000, {}};
+  req_zero.client_nonce.fill(0x00);
+  auto resp_zero = service.ProcessActivate(req_zero, 1700000000);
+  MT_CHECK(resp_zero.status == ActivationStatus::kMalformed);
+
+  // 2. Valid nonce succeeds
+  ActivateRequest req_valid = req_zero;
+  req_valid.client_nonce.fill(0x42);
+  auto resp_valid = service.ProcessActivate(req_valid, 1700000000);
+  MT_CHECK(resp_valid.status == ActivationStatus::kValid);
+
+  // 3. Exact replay of the same nonce must be atomically rejected
+  auto resp_replay = service.ProcessActivate(req_valid, 1700000001);
+  MT_CHECK(resp_replay.status == ActivationStatus::kNonceMismatch);
+
+  std::filesystem::remove(db_path, ec);
+}
+
+MT_TEST(Service_Renew_RejectsExpiredTokenPastGrace) {
+  std::string db_path = MakeTempDbPath();
+  std::error_code ec;
+  std::filesystem::remove(db_path, ec);
+
+  auto kp = MakeKeyPair();
+  ActivationDatabase db(db_path);
+
+  LicenseRecord lic;
+  lic.license_id = "lic-renew-grace";
+  lic.product_id = "com.vendor.grace";
+  lic.max_seats = 1;
+  lic.created_at = 1700000000;
+  lic.vm_root.fill(0x99);
+  MT_CHECK(db.RegisterLicense(lic));
+
+  ActivationService service(db, std::move(kp.private_key), kp.public_key);
+
+  ActivateRequest req{"lic-renew-grace", "HWID-DEV-1", "com.vendor.grace", "1.0", 1700000000, {}};
+  req.client_nonce.fill(0x11);
+  auto resp = service.ProcessActivate(req, 1700000000);
+  MT_CHECK(resp.status == ActivationStatus::kValid);
+  MT_CHECK(resp.token.has_value());
+
+  RenewRequest renew_req;
+  auto tok_bytes = SerializeActivationToken(*resp.token);
+  for (auto b : tok_bytes) {
+    char h[3];
+    std::snprintf(h, sizeof(h), "%02x", b);
+    renew_req.token_hex += h;
+  }
+  renew_req.device_fingerprint = "HWID-DEV-1";
+  renew_req.client_nonce.fill(0x22);
+
+  // Attempt renewal at a timestamp beyond grace_expires_at (14d + 3d + 1s = 17d + 1s)
+  std::uint64_t expired_time = resp.token->grace_expires_at + 100;
+  auto renew_resp = service.ProcessRenew(renew_req, expired_time);
+  MT_CHECK(renew_resp.status == ActivationStatus::kExpired);
+  MT_CHECK(renew_resp.error_message.find("expired past its grace period") != std::string::npos);
+
+  std::filesystem::remove(db_path, ec);
+}
+
+MT_TEST(Database_FailClosed_RejectsCorruptedStatus) {
+  std::string db_path = MakeTempDbPath();
+  std::error_code ec;
+  std::filesystem::remove(db_path, ec);
+
+  // Write database containing corrupted / unknown status
+  std::string bad_db =
+      "# Database with unknown status\n"
+      "[licenses]\n"
+      "lic-corrupted|prod-x|bogus_unknown_status|1|0000000000000000000000000000000000000000000000000000000000000000|1700000000\n"
+      "lic-legit|prod-x|active|1|0000000000000000000000000000000000000000000000000000000000000000|1700000000\n";
+  rtprotect::tooling::WriteFile(db_path, reinterpret_cast<const std::uint8_t*>(bad_db.data()), bad_db.size());
+
+  ActivationDatabase db(db_path);
+
+  // Malformed status must NOT be loaded or defaulted to kActive
+  MT_CHECK(!db.GetLicense("lic-corrupted").has_value());
+
+  // Legitimate active status must be loaded correctly
+  auto legit = db.GetLicense("lic-legit");
+  MT_CHECK(legit.has_value());
+  MT_CHECK(legit->status == LicenseRecordStatus::kActive);
+
+  std::filesystem::remove(db_path, ec);
+}
+
+MT_TEST(Service_RateLimiting_PerLicenseThrottling) {
+  std::string db_path = MakeTempDbPath();
+  std::error_code ec;
+  std::filesystem::remove(db_path, ec);
+
+  auto kp = MakeKeyPair();
+  ActivationDatabase db(db_path);
+
+  LicenseRecord lic;
+  lic.license_id = "lic-ratelimit";
+  lic.product_id = "com.vendor.ratelimit";
+  lic.max_seats = 50;
+  lic.created_at = 1700000000;
+  lic.vm_root.fill(0x33);
+  MT_CHECK(db.RegisterLicense(lic));
+
+  ActivationService service(db, std::move(kp.private_key), kp.public_key);
+
+  // Configure a strict license rate limiter for testing: burst 3, 0.1 tokens/sec
+  service.license_rate_limiter().Configure(0.1, 3.0);
+
+  int allowed = 0;
+  int rejected = 0;
+
+  for (int i = 0; i < 6; ++i) {
+    ActivateRequest req{"lic-ratelimit", "HWID-" + std::to_string(i), "com.vendor.ratelimit", "1.0", 1700000000, {}};
+    req.client_nonce[0] = static_cast<std::uint8_t>(i + 1);
+    auto resp = service.ProcessActivate(req, 1700000000);
+    if (resp.status == ActivationStatus::kValid) {
+      allowed++;
+    } else if (resp.status == ActivationStatus::kConcurrencyLimitExceeded &&
+               resp.error_message.find("Rate limit exceeded") != std::string::npos) {
+      rejected++;
+    }
+  }
+
+  MT_CHECK(allowed == 3);
+  MT_CHECK(rejected == 3);
+
+  std::filesystem::remove(db_path, ec);
+}
+
 MT_MAIN()

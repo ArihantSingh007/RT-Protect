@@ -16,6 +16,7 @@
 #include "integrity/keys.h"
 #include "licensing/activation.h"
 #include "licensing/activation_database.h"
+#include "licensing/rate_limiter.h"
 
 namespace rtprotect::licensing {
 
@@ -77,11 +78,13 @@ class ActivationService {
   std::string HandleDeactivateJson(const std::string& json_body, std::uint64_t current_time = 0);
 
   const integrity::Ed25519PublicKey& public_key() const { return verification_key_; }
+  RateLimiter& license_rate_limiter() { return license_rate_limiter_; }
 
  private:
   ActivationDatabase& db_;
   integrity::Ed25519PrivateKey signing_key_;
   integrity::Ed25519PublicKey verification_key_;
+  RateLimiter license_rate_limiter_{1.0, 10.0}; // 1 req/sec, burst 10 requests per license
 };
 
 }  // namespace rtprotect::licensing

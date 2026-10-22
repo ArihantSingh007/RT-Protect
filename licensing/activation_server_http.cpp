@@ -114,44 +114,84 @@ std::string ActivationServerHttp::base_url() const {
   return scheme + host_ + ":" + std::to_string(port_);
 }
 
+bool ActivationServerHttp::IsLoopbackHost(const std::string& host) {
+  return (host == "127.0.0.1" || host == "localhost" || host == "::1");
+}
+
 bool ActivationServerHttp::Start(std::uint16_t port, const std::string& host) {
   Stop();
+
+  std::string resolved_host = host;
+  if (resolved_host == "localhost") {
+    resolved_host = "127.0.0.1";
+  }
+
+  bool is_loopback = (resolved_host == "127.0.0.1" || resolved_host == "::1");
+  if (!is_loopback && !is_tls_ && !allow_insecure_non_loopback_) {
+    // Defense-in-depth: Refuse to expose unencrypted HTTP on non-loopback interface
+    return false;
+  }
 
   host_ = host;
   port_ = port;
 
-  socket_t listen_sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-  if (listen_sock == INVALID_SOCKET_VALUE) {
+  sockaddr_in addr4{};
+  addr4.sin_family = AF_INET;
+  addr4.sin_port = htons(port);
+  int pton4 = inet_pton(AF_INET, resolved_host.c_str(), &addr4.sin_addr);
+
+  sockaddr_in6 addr6{};
+  addr6.sin6_family = AF_INET6;
+  addr6.sin6_port = htons(port);
+  int pton6 = (pton4 == 1) ? 0 : inet_pton(AF_INET6, resolved_host.c_str(), &addr6.sin6_addr);
+
+  if (pton4 != 1 && pton6 != 1) {
+    // Unresolvable / invalid IP address: fail closed! Never default to 0.0.0.0
     return false;
   }
 
+  socket_t listen_sock = INVALID_SOCKET_VALUE;
   int opt = 1;
+
+  if (pton4 == 1) {
+    listen_sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if (listen_sock == INVALID_SOCKET_VALUE) return false;
 #if defined(_WIN32)
-  setsockopt(listen_sock, SOL_SOCKET, SO_REUSEADDR, reinterpret_cast<const char*>(&opt), sizeof(opt));
+    setsockopt(listen_sock, SOL_SOCKET, SO_REUSEADDR, reinterpret_cast<const char*>(&opt), sizeof(opt));
 #else
-  setsockopt(listen_sock, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+    setsockopt(listen_sock, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
 #endif
-
-  sockaddr_in addr{};
-  addr.sin_family = AF_INET;
-  addr.sin_port = htons(port);
-  inet_pton(AF_INET, host.c_str(), &addr.sin_addr);
-
-  if (bind(listen_sock, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0) {
-    CLOSE_SOCKET(listen_sock);
-    return false;
+    if (bind(listen_sock, reinterpret_cast<sockaddr*>(&addr4), sizeof(addr4)) != 0) {
+      CLOSE_SOCKET(listen_sock);
+      return false;
+    }
+    sockaddr_in bound_addr{};
+    socklen_t addr_len = sizeof(bound_addr);
+    if (getsockname(listen_sock, reinterpret_cast<sockaddr*>(&bound_addr), &addr_len) == 0) {
+      port_ = ntohs(bound_addr.sin_port);
+    }
+  } else {
+    listen_sock = socket(AF_INET6, SOCK_STREAM, IPPROTO_TCP);
+    if (listen_sock == INVALID_SOCKET_VALUE) return false;
+#if defined(_WIN32)
+    setsockopt(listen_sock, SOL_SOCKET, SO_REUSEADDR, reinterpret_cast<const char*>(&opt), sizeof(opt));
+#else
+    setsockopt(listen_sock, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+#endif
+    if (bind(listen_sock, reinterpret_cast<sockaddr*>(&addr6), sizeof(addr6)) != 0) {
+      CLOSE_SOCKET(listen_sock);
+      return false;
+    }
+    sockaddr_in6 bound_addr{};
+    socklen_t addr_len = sizeof(bound_addr);
+    if (getsockname(listen_sock, reinterpret_cast<sockaddr*>(&bound_addr), &addr_len) == 0) {
+      port_ = ntohs(bound_addr.sin6_port);
+    }
   }
 
   if (listen(listen_sock, 32) != 0) {
     CLOSE_SOCKET(listen_sock);
     return false;
-  }
-
-  // Retrieve assigned port if dynamic (port 0)
-  sockaddr_in bound_addr{};
-  socklen_t addr_len = sizeof(bound_addr);
-  if (getsockname(listen_sock, reinterpret_cast<sockaddr*>(&bound_addr), &addr_len) == 0) {
-    port_ = ntohs(bound_addr.sin_port);
   }
 
   listen_fd_ = static_cast<uintptr_t>(listen_sock);
@@ -231,10 +271,20 @@ void ActivationServerHttp::ServerLoop() {
     int sel = select(static_cast<int>(listen_sock + 1), &read_fds, nullptr, nullptr, &tv);
     if (sel <= 0) continue;
 
-    sockaddr_in client_addr{};
+    sockaddr_storage client_addr{};
     socklen_t client_len = sizeof(client_addr);
     socket_t client_sock = accept(listen_sock, reinterpret_cast<sockaddr*>(&client_addr), &client_len);
     if (client_sock == INVALID_SOCKET_VALUE) continue;
+
+    char ip_buf[INET6_ADDRSTRLEN] = {0};
+    if (client_addr.ss_family == AF_INET) {
+      auto* sin = reinterpret_cast<sockaddr_in*>(&client_addr);
+      inet_ntop(AF_INET, &sin->sin_addr, ip_buf, sizeof(ip_buf));
+    } else if (client_addr.ss_family == AF_INET6) {
+      auto* sin6 = reinterpret_cast<sockaddr_in6*>(&client_addr);
+      inet_ntop(AF_INET6, &sin6->sin6_addr, ip_buf, sizeof(ip_buf));
+    }
+    std::string client_ip(ip_buf);
 
     // Atomic concurrency cap check & acquisition (strictly eliminates TOCTOU overshoot)
     std::size_t curr = active_clients_.load(std::memory_order_relaxed);
@@ -261,8 +311,8 @@ void ActivationServerHttp::ServerLoop() {
     }
 
     // Spawn and track worker thread lifecycle
-    std::thread t([this, client_sock]() {
-      HandleClient(static_cast<uintptr_t>(client_sock));
+    std::thread t([this, client_sock, client_ip]() {
+      HandleClient(static_cast<uintptr_t>(client_sock), client_ip);
 
       {
         std::lock_guard<std::mutex> lock(workers_mu_);
@@ -284,12 +334,27 @@ void ActivationServerHttp::ServerLoop() {
   }
 }
 
-void ActivationServerHttp::HandleClient(uintptr_t client_sock_fd) {
+void ActivationServerHttp::HandleClient(uintptr_t client_sock_fd, const std::string& client_ip) {
   socket_t client_sock = static_cast<socket_t>(client_sock_fd);
   RegisterClientSocket(client_sock_fd);
 
   // Set 5-second socket timeout to prevent Slowloris attacks
   SetSocketTimeouts(client_sock, 5);
+
+  int retry_after = 0;
+  if (!client_ip.empty() && !ip_rate_limiter_.Allow(client_ip, 1.0, &retry_after)) {
+    const std::string busy_resp =
+        "HTTP/1.1 429 Too Many Requests\r\n"
+        "Content-Type: application/json\r\n"
+        "Retry-After: " + std::to_string(retry_after) + "\r\n"
+        "Connection: close\r\n\r\n"
+        "{\"status\":\"rate_limited\",\"error\":\"Too Many Requests\",\"retry_after\":" +
+        std::to_string(retry_after) + "}\n";
+    send(client_sock, busy_resp.data(), static_cast<int>(busy_resp.size()), 0);
+    UnregisterClientSocket(client_sock_fd);
+    CLOSE_SOCKET(client_sock);
+    return;
+  }
 
   SSL* ssl = nullptr;
   if (is_tls_ && ssl_ctx_) {

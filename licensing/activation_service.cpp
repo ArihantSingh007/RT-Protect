@@ -66,6 +66,32 @@ std::optional<std::string> ExtractJsonStringField(const std::string& json, const
   return val;
 }
 
+std::string EscapeJsonString(const std::string& input) {
+  std::string out;
+  out.reserve(input.size() + 8);
+  for (char c : input) {
+    switch (c) {
+      case '"': out += "\\\""; break;
+      case '\\': out += "\\\\"; break;
+      case '\b': out += "\\b"; break;
+      case '\f': out += "\\f"; break;
+      case '\n': out += "\\n"; break;
+      case '\r': out += "\\r"; break;
+      case '\t': out += "\\t"; break;
+      default:
+        if (static_cast<unsigned char>(c) < 0x20) {
+          char buf[8];
+          std::snprintf(buf, sizeof(buf), "\\u%04x", static_cast<unsigned char>(c));
+          out += buf;
+        } else {
+          out += c;
+        }
+        break;
+    }
+  }
+  return out;
+}
+
 std::uint64_t GetCurrentTimestamp() {
   auto now = std::chrono::system_clock::now().time_since_epoch();
   return static_cast<std::uint64_t>(
@@ -105,6 +131,13 @@ ActivateResponse ActivationService::ProcessActivate(const ActivateRequest& req, 
     return resp;
   }
 
+  int retry_after = 0;
+  if (!license_rate_limiter_.Allow(req.license_key, 1.0, &retry_after)) {
+    resp.status = ActivationStatus::kConcurrencyLimitExceeded;
+    resp.error_message = "Rate limit exceeded for license (retry after " + std::to_string(retry_after) + "s)";
+    return resp;
+  }
+
   // 1. Look up license in database
   auto lic_opt = db_.GetLicense(req.license_key);
   if (!lic_opt.has_value()) {
@@ -126,22 +159,42 @@ ActivateResponse ActivationService::ProcessActivate(const ActivateRequest& req, 
     return resp;
   }
 
-  // 2. Anti-replay check on client nonce
+  // 2. Anti-replay and validity check on client challenge nonce
+  bool nonce_is_all_zero = true;
+  for (std::uint8_t b : req.client_nonce) {
+    if (b != 0) {
+      nonce_is_all_zero = false;
+      break;
+    }
+  }
+  if (nonce_is_all_zero) {
+    resp.status = ActivationStatus::kMalformed;
+    resp.error_message = "Client challenge nonce cannot be missing or all-zero";
+    return resp;
+  }
+
+  // Check client timestamp clock drift if timestamp was supplied
+  if (req.client_timestamp > 0) {
+    std::int64_t drift = std::abs(static_cast<std::int64_t>(current_time) - static_cast<std::int64_t>(req.client_timestamp));
+    if (drift > 900) { // 15-minute maximum drift window (AWS SigV4 standard for distributed clock skew)
+      resp.status = ActivationStatus::kMalformed;
+      resp.error_message = "Client timestamp clock drift exceeds allowed 900s window";
+      return resp;
+    }
+  }
+
   std::string client_nonce_hex = BytesToHex(req.client_nonce.data(), req.client_nonce.size());
-  if (db_.IsNonceUsed(client_nonce_hex)) {
+  if (!db_.ConsumeNonceIfUnused(client_nonce_hex, current_time + 86400)) {
     resp.status = ActivationStatus::kNonceMismatch;
     resp.error_message = "Client challenge nonce has already been used (replay detected)";
     return resp;
   }
-  db_.RecordNonce(client_nonce_hex, current_time + 86400);
 
-  // 3. Concurrency / seat limit enforcement
-  auto existing_act = db_.GetActivation(req.license_key, req.device_fingerprint);
-  std::size_t active_seats = db_.GetActiveSeatCount(req.license_key);
-
-  if (!existing_act.has_value() && active_seats >= lic.max_seats) {
+  // 3. Atomic seat limit enforcement and reservation with stale lease recovery
+  auto seat_res = db_.ReserveSeatAtomic(req.license_key, req.device_fingerprint, lic.max_seats, current_time);
+  if (!seat_res.success) {
     resp.status = ActivationStatus::kConcurrencyLimitExceeded;
-    resp.error_message = "Concurrent seat limit reached (" + std::to_string(lic.max_seats) + " seats active)";
+    resp.error_message = seat_res.error;
     return resp;
   }
 
@@ -154,12 +207,12 @@ ActivateResponse ActivationService::ProcessActivate(const ActivateRequest& req, 
   token.expires_at = current_time + 14 * 86400;              // 14 days
   token.grace_expires_at = token.expires_at + 3 * 86400;     // 3 days grace
   token.vm_root = lic.vm_root;                              // Bound canonical vm_root
-  token.sequence_number = existing_act.has_value() ? (existing_act->sequence_number + 1) : 1;
+  token.sequence_number = seat_res.sequence_number;
 
   if (RAND_bytes(resp.server_nonce.data(), static_cast<int>(resp.server_nonce.size())) != 1) {
-    for (std::size_t i = 0; i < resp.server_nonce.size(); ++i) {
-      resp.server_nonce[i] = static_cast<std::uint8_t>((i * 13 + 0x5A) & 0xFF);
-    }
+    resp.status = ActivationStatus::kMalformed;
+    resp.error_message = "Cryptographic RNG failure generating server nonce";
+    return resp;
   }
   token.server_nonce = resp.server_nonce;
 
@@ -168,15 +221,6 @@ ActivateResponse ActivationService::ProcessActivate(const ActivateRequest& req, 
     resp.error_message = "Internal signing failure";
     return resp;
   }
-
-  // 5. Update database activation record
-  ActivationRecord act;
-  act.license_id = req.license_key;
-  act.device_fingerprint = req.device_fingerprint;
-  act.first_seen = existing_act.has_value() ? existing_act->first_seen : current_time;
-  act.last_seen = current_time;
-  act.sequence_number = token.sequence_number;
-  db_.RecordActivation(act);
 
   // 6. Encrypt token under ephemeral session key
   auto session_key = DeriveTransportKey(req.license_key, req.client_nonce, resp.server_nonce);
@@ -235,15 +279,49 @@ RenewResponse ActivationService::ProcessRenew(const RenewRequest& req, std::uint
     return resp;
   }
 
-  // 3. Anti-replay check on existing server_nonce
+  int retry_after = 0;
+  if (!license_rate_limiter_.Allow(token.license_id, 1.0, &retry_after)) {
+    resp.status = ActivationStatus::kConcurrencyLimitExceeded;
+    resp.error_message = "Rate limit exceeded for license (retry after " + std::to_string(retry_after) + "s)";
+    return resp;
+  }
+
+  // 3. Grace period expiration check
+  if (current_time > token.grace_expires_at) {
+    resp.status = ActivationStatus::kExpired;
+    resp.error_message = "Activation token has expired past its grace period and cannot be renewed";
+    return resp;
+  }
+
+  // 4. Anti-replay check on client nonce
+  bool client_nonce_zero = true;
+  for (std::uint8_t b : req.client_nonce) {
+    if (b != 0) {
+      client_nonce_zero = false;
+      break;
+    }
+  }
+  if (client_nonce_zero) {
+    resp.status = ActivationStatus::kMalformed;
+    resp.error_message = "Client challenge nonce cannot be missing or all-zero";
+    return resp;
+  }
+  std::string client_nonce_hex = BytesToHex(req.client_nonce.data(), req.client_nonce.size());
+  if (!db_.ConsumeNonceIfUnused(client_nonce_hex, current_time + 86400)) {
+    resp.status = ActivationStatus::kNonceMismatch;
+    resp.error_message = "Client challenge nonce has already been used (replay detected)";
+    return resp;
+  }
+
+  // 5. Atomic anti-replay check and retirement of existing token server_nonce
   std::string old_nonce_hex = BytesToHex(token.server_nonce.data(), token.server_nonce.size());
-  if (db_.IsNonceUsed(old_nonce_hex)) {
+  if (!db_.ConsumeNonceIfUnused(old_nonce_hex, current_time + 86400 * 30)) {
     resp.status = ActivationStatus::kNonceMismatch;
     resp.error_message = "Token has already been renewed (anti-replay check failed)";
     return resp;
   }
 
-  // 4. Check license status in database (checks instant revocation/chargeback)
+  // 6. Check license status in database (checks instant revocation/chargeback)
   auto lic_opt = db_.GetLicense(token.license_id);
   if (!lic_opt.has_value()) {
     resp.status = ActivationStatus::kLicenseMismatch;
@@ -257,14 +335,14 @@ RenewResponse ActivationService::ProcessRenew(const RenewRequest& req, std::uint
     return resp;
   }
 
-  // 5. Hardware fingerprint match check (supports drift tolerance)
+  // 7. Hardware fingerprint match check (supports drift tolerance)
   if (!VerifyHardwareMatch(token.device_fingerprint_hash, req.device_fingerprint, 0.75)) {
     resp.status = ActivationStatus::kHardwareMismatch;
     resp.error_message = "Device fingerprint mismatch";
     return resp;
   }
 
-  // 6. Mint renewed token with identical vm_root and bumped sequence number
+  // 8. Mint renewed token with identical vm_root and bumped sequence number
   ActivationToken renewed = token;
   renewed.issued_at = current_time;
   renewed.expires_at = current_time + 14 * 86400;
@@ -273,9 +351,9 @@ RenewResponse ActivationService::ProcessRenew(const RenewRequest& req, std::uint
   renewed.vm_root = token.vm_root; // Stable vm_root across renewals
 
   if (RAND_bytes(resp.server_nonce.data(), static_cast<int>(resp.server_nonce.size())) != 1) {
-    for (std::size_t i = 0; i < resp.server_nonce.size(); ++i) {
-      resp.server_nonce[i] = static_cast<std::uint8_t>((i * 17 + 0x7B) & 0xFF);
-    }
+    resp.status = ActivationStatus::kMalformed;
+    resp.error_message = "Cryptographic RNG failure generating server nonce";
+    return resp;
   }
   renewed.server_nonce = resp.server_nonce;
 
@@ -285,8 +363,7 @@ RenewResponse ActivationService::ProcessRenew(const RenewRequest& req, std::uint
     return resp;
   }
 
-  // 7. Update database: retire old nonce, update activation timestamp
-  db_.RecordNonce(old_nonce_hex, renewed.expires_at);
+  // 9. Update database activation record
   ActivationRecord act;
   act.license_id = token.license_id;
   act.device_fingerprint = req.device_fingerprint;
@@ -366,12 +443,19 @@ std::string ActivationService::HandleActivateJson(const std::string& json_body, 
   auto prod = ExtractJsonStringField(json_body, "product_id");
   auto ver = ExtractJsonStringField(json_body, "client_version");
   auto nonce = ExtractJsonStringField(json_body, "client_nonce");
+  auto ts = ExtractJsonStringField(json_body, "client_timestamp");
+
+  if (!nonce.has_value() || nonce->size() != 64 || !HexToBytes(*nonce, req.client_nonce.data(), req.client_nonce.size())) {
+    return "{\n  \"status\": \"malformed\",\n  \"error\": \"Missing or invalid 32-byte hexadecimal client_nonce\"\n}\n";
+  }
 
   if (lic) req.license_key = *lic;
   if (dev) req.device_fingerprint = *dev;
   if (prod) req.product_id = *prod;
   if (ver) req.client_version = *ver;
-  if (nonce) HexToBytes(*nonce, req.client_nonce.data(), req.client_nonce.size());
+  if (ts.has_value() && !ts->empty()) {
+    req.client_timestamp = std::strtoull(ts->c_str(), nullptr, 10);
+  }
 
   auto resp = ProcessActivate(req, current_time);
 
@@ -379,7 +463,7 @@ std::string ActivationService::HandleActivateJson(const std::string& json_body, 
   ss << "{\n";
   ss << "  \"status\": \"" << ToString(resp.status) << "\",\n";
   if (!resp.error_message.empty()) {
-    ss << "  \"error\": \"" << resp.error_message << "\",\n";
+    ss << "  \"error\": \"" << EscapeJsonString(resp.error_message) << "\",\n";
   }
   ss << "  \"server_nonce\": \"" << BytesToHex(resp.server_nonce.data(), resp.server_nonce.size()) << "\",\n";
   ss << "  \"encrypted_token\": \"" << resp.encrypted_token_hex << "\"\n";
@@ -393,9 +477,12 @@ std::string ActivationService::HandleRenewJson(const std::string& json_body, std
   auto dev = ExtractJsonStringField(json_body, "device_fingerprint");
   auto nonce = ExtractJsonStringField(json_body, "client_nonce");
 
+  if (!nonce.has_value() || nonce->size() != 64 || !HexToBytes(*nonce, req.client_nonce.data(), req.client_nonce.size())) {
+    return "{\n  \"status\": \"malformed\",\n  \"error\": \"Missing or invalid 32-byte hexadecimal client_nonce\"\n}\n";
+  }
+
   if (tok) req.token_hex = *tok;
   if (dev) req.device_fingerprint = *dev;
-  if (nonce) HexToBytes(*nonce, req.client_nonce.data(), req.client_nonce.size());
 
   auto resp = ProcessRenew(req, current_time);
 
@@ -403,7 +490,7 @@ std::string ActivationService::HandleRenewJson(const std::string& json_body, std
   ss << "{\n";
   ss << "  \"status\": \"" << ToString(resp.status) << "\",\n";
   if (!resp.error_message.empty()) {
-    ss << "  \"error\": \"" << resp.error_message << "\",\n";
+    ss << "  \"error\": \"" << EscapeJsonString(resp.error_message) << "\",\n";
   }
   ss << "  \"server_nonce\": \"" << BytesToHex(resp.server_nonce.data(), resp.server_nonce.size()) << "\",\n";
   ss << "  \"encrypted_token\": \"" << resp.encrypted_token_hex << "\"\n";
@@ -425,7 +512,7 @@ std::string ActivationService::HandleDeactivateJson(const std::string& json_body
   ss << "{\n";
   ss << "  \"success\": " << (resp.success ? "true" : "false") << ",\n";
   if (!resp.error_message.empty()) {
-    ss << "  \"error\": \"" << resp.error_message << "\"\n";
+    ss << "  \"error\": \"" << EscapeJsonString(resp.error_message) << "\"\n";
   } else {
     ss << "  \"status\": \"deactivated\"\n";
   }
