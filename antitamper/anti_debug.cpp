@@ -19,7 +19,18 @@
 #include <fstream>
 #include <string>
 #include <ctime>
-#include <sys/ptrace.h>
+#include <cstdlib>
+#include <cstring>
+#include <unistd.h>
+#if defined(__linux__)
+#include <link.h>
+#include <dlfcn.h>
+#include <sys/syscall.h>
+#if defined(__x86_64__) || defined(__i386__)
+#include <linux/perf_event.h>
+#include <linux/hw_breakpoint.h>
+#endif
+#endif
 #endif
 
 namespace rtprotect::antitamper {
@@ -273,6 +284,27 @@ bool CheckHardwareBreakpoints() {
   }
   return found_bp;
 #else
+  // Linux hardware breakpoint probing via perf_event_open
+  // On x86/x64, exactly 4 debug registers exist. When an interactive debugger
+  // (such as GDB or LLDB) claims hardware breakpoints on the target,
+  // perf_event_open fails with ENOSPC or EBUSY.
+#if defined(__linux__) && defined(SYS_perf_event_open)
+  struct perf_event_attr pe{};
+  pe.type = PERF_TYPE_BREAKPOINT;
+  pe.size = sizeof(struct perf_event_attr);
+  pe.bp_type = HW_BREAKPOINT_X;
+  pe.bp_addr = reinterpret_cast<uintptr_t>(&CheckHardwareBreakpoints);
+  pe.bp_len = sizeof(long);
+  pe.disabled = 1;
+
+  int fd = static_cast<int>(syscall(SYS_perf_event_open, &pe, 0, -1, -1, 0));
+  if (fd >= 0) {
+    close(fd);
+  } else if (errno == ENOSPC || errno == EBUSY) {
+    g_hw_bp_detected.store(true, std::memory_order_relaxed);
+    return true;
+  }
+#endif
   return false;
 #endif
 }
@@ -364,13 +396,67 @@ bool CheckMemoryTampered() {
     }
   }
 #else
-  // Linux: Scan /proc/self/maps for injected hooking frameworks or abnormal RWX memory segments
+  // 1. Linux standard ELF program header and loaded module inventory via dl_iterate_phdr
+#if defined(__linux__)
+  struct ModuleScanContext {
+    bool tampered = false;
+  } scan_ctx;
+
+  auto phdr_callback = [](struct dl_phdr_info* info, size_t, void* data) -> int {
+    auto* ctx = static_cast<ModuleScanContext*>(data);
+    const char* name = info->dlpi_name;
+    if (name && name[0] != '\0') {
+      static const char* const kSuspicious[] = {
+          "frida", "gadget", "substrate", "substitute", "cycript", "xposed", "libmem", "cheat"
+      };
+      for (const char* susp : kSuspicious) {
+        if (std::strstr(name, susp)) {
+          ctx->tampered = true;
+          return 1;
+        }
+      }
+    }
+    // Inspect program headers for rogue RWX segments in loaded objects
+    for (int i = 0; i < info->dlpi_phnum; ++i) {
+      const ElfW(Phdr)& ph = info->dlpi_phdr[i];
+      if (ph.p_type == PT_LOAD) {
+        bool is_w = (ph.p_flags & PF_W) != 0;
+        bool is_x = (ph.p_flags & PF_X) != 0;
+        if (is_w && is_x) {
+          ctx->tampered = true;
+          return 1;
+        }
+      }
+    }
+    return 0;
+  };
+
+  dl_iterate_phdr(phdr_callback, &scan_ctx);
+  if (scan_ctx.tampered) return true;
+
+  // 2. Check critical libc functions for inline function hooks (INT 3, JMP)
+  void* libc = dlopen("libc.so.6", RTLD_NOLOAD | RTLD_LAZY);
+  if (!libc) libc = dlopen(nullptr, RTLD_LAZY);
+  if (libc) {
+    static const char* const kCriticalApis[] = { "ptrace", "mprotect", "kill", "raise", "open" };
+    for (const char* api : kCriticalApis) {
+      const unsigned char* p = reinterpret_cast<const unsigned char*>(dlsym(libc, api));
+      if (p) {
+        if (p[0] == 0xCC || p[0] == 0xE9 || (p[0] == 0xFF && p[1] == 0x25)) {
+          return true;
+        }
+      }
+    }
+  }
+#endif
+
+  // 3. Scan /proc/self/maps for injected hooking frameworks or abnormal RWX memory segments
   std::ifstream maps("/proc/self/maps");
   std::string line;
   while (maps && std::getline(maps, line)) {
-    // 1. Detect suspicious injected hooking frameworks (Frida, Substrate, Cydia, etc.)
+    // Detect suspicious injected hooking frameworks (Frida, Substrate, Cydia, etc.)
     static const char* const kSuspiciousLibs[] = {
-        "frida", "gadget", "substrate", "substitute", "cycript", "xposed"
+        "frida", "gadget", "substrate", "substitute", "cycript", "xposed", "libmem"
     };
     for (const char* susp : kSuspiciousLibs) {
       if (line.find(susp) != std::string::npos) {
@@ -378,7 +464,7 @@ bool CheckMemoryTampered() {
       }
     }
 
-    // 2. Detect abnormal RWX (read-write-executable) memory segments indicative of hook stubs
+    // Detect abnormal RWX (read-write-executable) memory segments indicative of hook stubs
     if (line.size() > 20) {
       auto perm_start = line.find(' ');
       if (perm_start != std::string::npos && perm_start + 4 < line.size()) {
@@ -393,7 +479,7 @@ bool CheckMemoryTampered() {
     }
   }
 
-  // 3. Detect active LD_PRELOAD injection
+  // 4. Detect active LD_PRELOAD injection
   const char* ld_preload = std::getenv("LD_PRELOAD");
   if (ld_preload && ld_preload[0] != '\0') {
     return true;

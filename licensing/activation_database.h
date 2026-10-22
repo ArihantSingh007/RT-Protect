@@ -24,6 +24,29 @@ enum class LicenseRecordStatus {
 const char* ToString(LicenseRecordStatus status);
 std::optional<LicenseRecordStatus> ParseLicenseRecordStatus(const std::string& s);
 
+enum class ActivationEventType {
+  kActivationSuccess = 0,
+  kActivationFailed,
+  kSeatLimitExceeded,
+  kRenewalSuccess,
+  kRenewalFailed,
+  kDeactivation,
+  kRateLimited,
+  kReplayBlocked
+};
+
+const char* ToString(ActivationEventType type);
+std::optional<ActivationEventType> ParseActivationEventType(const std::string& s);
+
+struct ActivationEvent {
+  std::uint64_t timestamp = 0;
+  ActivationEventType type = ActivationEventType::kActivationSuccess;
+  std::string license_id;
+  std::string device_fingerprint;
+  std::string ip_address = "127.0.0.1";
+  std::string details;
+};
+
 struct LicenseRecord {
   std::string license_id;
   std::string product_id;
@@ -86,6 +109,13 @@ class ActivationDatabase {
   bool ConsumeNonceIfUnused(const std::string& nonce_hex, std::uint64_t expires_at);
   void PruneExpiredNonces(std::uint64_t current_time);
 
+  // Structured audit event logging & abuse analytics (Stage 2)
+  bool RecordEvent(const ActivationEvent& event);
+  std::vector<ActivationEvent> GetRecentEvents(const std::string& license_id = "", std::size_t limit = 100) const;
+  double ComputeSeatChurnRisk(const std::string& license_id,
+                              std::uint64_t current_time,
+                              std::uint64_t window_seconds = 7 * 86400) const;
+
   // Clear all data (for testing)
   void Clear();
 
@@ -99,6 +129,7 @@ class ActivationDatabase {
   std::unordered_map<std::string, LicenseRecord> licenses_;
   std::unordered_map<std::string, std::vector<ActivationRecord>> activations_; // license_id -> activations
   std::unordered_map<std::string, std::uint64_t> used_nonces_;                 // nonce_hex -> expires_at
+  std::vector<ActivationEvent> events_;                                        // audit event log
 };
 
 }  // namespace rtprotect::licensing

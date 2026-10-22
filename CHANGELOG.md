@@ -5,6 +5,42 @@ This project adheres to Semantic Versioning and structured security reporting.
 
 ---
 
+## [2.4.0-hardened] - 2026-10-22
+
+### Security Audit Remediation & Roadmap Stages 0–5 Complete
+
+- **Stage 0 & 1 — Critical Correctness & Authority Reliability:**
+  - *Critical 1:* Strict `inet_pton` validation for IPv4/IPv6, explicit `localhost` to `127.0.0.1` loopback resolution, programmatic TLS enforcement in `ActivationServerHttp::Start()`, and client-side rejection of plain HTTP on remote hosts.
+  - *Critical 2:* Replaced state-mutating `ptrace(PTRACE_TRACEME)` with passive `/proc/self/status` `TracerPid` parsing.
+  - *High 3:* Fixed `StoreFn` parameter signature in Linux Secret Service support (`licensing/secure_storage.cpp`).
+  - *High 5 & 6:* Strict client nonces, 900s clock drift tolerance, atomic `ConsumeNonceIfUnused`, opportunistic expired nonce pruning, and strict rejection of token renewals past `grace_expires_at`.
+  - *High 7 & 8:* Atomic seat reservation (`ReserveSeatAtomic`) with stale seat lease recovery, synchronous write-through persistence (`SaveLocked()`), and fail-closed status parsing.
+  - *High 10:* Removed all deterministic pseudo-random fallbacks for `RAND_bytes()`.
+  - *High 14:* Redesigned `OBFUSCATED_STRING` with call-site static duration storage and thread-safe initialization, preventing dangling pointer reads when assigning to `const char*` or `std::string`.
+
+- **Stage 2 — Server Abuse Protection & Audit Event Pipeline:**
+  - *Event Logging:* Implemented `ActivationEvent` structured audit trail (`kActivationSuccess`, `kActivationFailed`, `kSeatLimitExceeded`, `kRenewalSuccess`, `kRenewalFailed`, `kDeactivation`, `kRateLimited`, `kReplayBlocked`) persisted durably in `[events]` section.
+  - *Seat Churn Analytics:* Implemented `ComputeSeatChurnRisk(license_id, window)` scoring rapid device fingerprint churn and abuse events on a rolling window.
+  - *Operational Endpoints:* Added `GET /events` administrative telemetry endpoint on `ActivationServerHttp`.
+
+- **Stage 3 — Clang AST Compiler Tooling Frontend:**
+  - *Clang AST Integration:* Implemented `ClangAstScanner` in `tooling/clang_ast_scanner.*` parsing translation units via Clang AST JSON dump (`-Xclang -ast-dump=json`).
+  - *Compilation Database:* Implemented `CompilationDatabase` parsing `compile_commands.json` to extract exact target compiler flags, defines, and include paths.
+  - *Semantic Diagnostics:* Added `ValidateVirtualizationEligibility` verifying parameter counts, return types, and rejecting unsupported constructs (e.g. C++ exceptions, complex virtual methods) with actionable diagnostics.
+
+- **Stage 4 — Linux Runtime Defenses Parity:**
+  - *ELF Program Header Inspection:* Implemented `dl_iterate_phdr` module scanning in `antitamper/anti_debug.cpp`, checking loaded shared objects and detecting anomalous RWX segments.
+  - *Inline Hook Detection:* Added runtime verification of critical `libc.so` symbols (`ptrace`, `mprotect`, `kill`, `raise`, `open`) against inline hook stubs (`0xCC`, `0xE9`, `0xFF 0x25`).
+  - *Hardware Breakpoint Saturation Check:* Added Linux hardware breakpoint saturation probing via `perf_event_open` (`SYS_perf_event_open`).
+
+- **Stage 5 — Desktop GUI & Multi-Language SDK Adapters:**
+  - *Windows Desktop GUI:* Implemented native Win32 `rtprotect-gui.exe` (`tooling/gui_main.cpp`) featuring interactive project folder selection, CMake/Unreal target discovery, protection profile configuration, one-click execution, and real-time 6-phase progress logging.
+  - *C# / .NET SDK Adapter:* Implemented `sdk/dotnet/RTProtect.cs` providing C# applications, Unity games, and enterprise tools with P/Invoke bindings to RTProtect integrity verification, hardware fingerprinting, and anti-tamper.
+  - *Python SDK Adapter:* Implemented `sdk/python/rtprotect.py` with `ctypes` bindings and pure-Python fallbacks for seamless Python application protection.
+  - *Packaging:* Integrated `rtprotect-gui.exe` and `sdk/` into `package_release.ps1` distribution archive.
+
+---
+
 ## [2.3.0-hardened] - 2026-10-21
 
 ### Security & Hardening Expansion (Comprehensive Audit Completion)

@@ -80,6 +80,12 @@ if (-not (Test-Path $ServerExe)) {
 }
 if (Test-Path $ServerExe) { Copy-Item $ServerExe (Join-Path $PkgDir "bin") }
 
+$GuiExe = Join-Path $BuildDir "tooling\rtprotect-gui.exe"
+if (-not (Test-Path $GuiExe)) {
+    $GuiExe = Join-Path $BuildDir "tooling\Release\rtprotect-gui.exe"
+}
+if (Test-Path $GuiExe) { Copy-Item $GuiExe (Join-Path $PkgDir "bin") }
+
 # Include OpenSSL runtime DLL if present
 if ($OpenSslDir -and (Test-Path "$OpenSslDir\bin\libcrypto-3-x64.dll")) {
     Copy-Item "$OpenSslDir\bin\libcrypto-3-x64.dll" (Join-Path $PkgDir "bin")
@@ -107,6 +113,9 @@ Copy-Item "README.md" $PkgDir
 Copy-Item "SECURITY_AUDIT.md" $PkgDir
 Copy-Item "CHANGELOG.md" $PkgDir
 Copy-Item -Recurse "docs" $PkgDir
+if (Test-Path "sdk") {
+    Copy-Item -Recurse "sdk" $PkgDir
+}
 
 Write-Host "`n-- Verifying the packaged tool runs --"
 & (Join-Path $PkgDir "bin\rtprotect-tool.exe") --version

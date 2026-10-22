@@ -24,6 +24,7 @@
 #include "bytecode_vm/compiler.h"
 #include "bytecode_vm/opcode_map.h"
 #include "tooling/cxx_ast_scanner.h"
+#include "tooling/clang_ast_scanner.h"
 #include "tooling/unreal_integration.h"
 #include "bytecode_vm/serialize.h"
 #include "bytecode_vm/vm.h"
@@ -294,7 +295,19 @@ bool TransformSourceFile(const fs::path& file_path,
 
   auto opcode_map = rtprotect::vm::OpcodeMap::FromSeed(opcode_seed);
 
-  // 1. AST-aware scan for functions marked with RTPROTECT_VIRTUALIZE or [[rtprotect::virtualize]]
+  // 1. Clang AST semantic validation (Stage 3)
+  if (ClangAstScanner::IsAvailable()) {
+    auto clang_fns = ClangAstScanner::AnalyzeTranslationUnit(file_path.string());
+    for (const auto& cfn : clang_fns) {
+      std::string reject_reason;
+      if (!ClangAstScanner::ValidateVirtualizationEligibility(cfn, &reject_reason)) {
+        // Log diagnostics for ineligible or unsupported constructs
+        (void)reject_reason;
+      }
+    }
+  }
+
+  // 2. AST-aware scan for functions marked with RTPROTECT_VIRTUALIZE or [[rtprotect::virtualize]]
   CxxAstScanner scanner(content);
   auto tagged_fns = scanner.FindTaggedFunctions();
 

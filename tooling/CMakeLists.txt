@@ -1,6 +1,7 @@
 add_library(rtprotect_tooling STATIC
     integration_engine.cpp
     cxx_ast_scanner.cpp
+    clang_ast_scanner.cpp
     unreal_integration.cpp
 )
 target_include_directories(rtprotect_tooling PUBLIC ${CMAKE_SOURCE_DIR})
@@ -29,6 +30,18 @@ target_link_libraries(rtprotect-activation-server PRIVATE
     rtprotect_licensing_buildtools
 )
 rtprotect_strip_in_release(rtprotect-activation-server)
+
+if(WIN32)
+  add_executable(rtprotect-gui WIN32 gui_main.cpp)
+  target_include_directories(rtprotect-gui PRIVATE ${CMAKE_SOURCE_DIR})
+  target_link_libraries(rtprotect-gui PRIVATE
+      rtprotect_tooling
+      comctl32
+      shell32
+      ole32
+  )
+  rtprotect_strip_in_release(rtprotect-gui)
+endif()
 
 if(WIN32 AND EXISTS "${CMAKE_SOURCE_DIR}/third_party/openssl/bin")
   file(COPY "${CMAKE_SOURCE_DIR}/third_party/openssl/bin/libcrypto-3-x64.dll"

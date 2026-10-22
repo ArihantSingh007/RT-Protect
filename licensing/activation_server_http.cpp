@@ -460,13 +460,31 @@ void ActivationServerHttp::HandleClient(uintptr_t client_sock_fd, const std::str
     }
 
     if (path == "/activate" && method == "POST") {
-      resp_body = service_.HandleActivateJson(body);
+      resp_body = service_.HandleActivateJson(body, 0, client_ip);
     } else if (path == "/renew" && method == "POST") {
-      resp_body = service_.HandleRenewJson(body);
+      resp_body = service_.HandleRenewJson(body, 0, client_ip);
     } else if (path == "/deactivate" && method == "POST") {
-      resp_body = service_.HandleDeactivateJson(body);
+      resp_body = service_.HandleDeactivateJson(body, 0, client_ip);
     } else if (path == "/health" && method == "GET") {
       resp_body = "{\"status\":\"ok\"}\n";
+    } else if (path.rfind("/events", 0) == 0 && method == "GET") {
+      // Administrative audit event inspection
+      auto events = service_.GetRecentEvents("", 50);
+      std::ostringstream ess;
+      ess << "{\n  \"events\": [\n";
+      for (std::size_t i = 0; i < events.size(); ++i) {
+        const auto& e = events[i];
+        ess << "    {\n"
+            << "      \"timestamp\": " << e.timestamp << ",\n"
+            << "      \"type\": \"" << ToString(e.type) << "\",\n"
+            << "      \"license_id\": \"" << e.license_id << "\",\n"
+            << "      \"device_fingerprint\": \"" << e.device_fingerprint << "\",\n"
+            << "      \"ip\": \"" << e.ip_address << "\",\n"
+            << "      \"details\": \"" << e.details << "\"\n"
+            << "    }" << (i + 1 < events.size() ? "," : "") << "\n";
+      }
+      ess << "  ]\n}\n";
+      resp_body = ess.str();
     } else {
       status_line = "HTTP/1.1 404 Not Found";
       resp_body = "{\"error\":\"endpoint not found\"}\n";
