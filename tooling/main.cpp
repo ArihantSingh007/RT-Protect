@@ -150,6 +150,7 @@ void PrintUsage() {
       "      --product <id>                    Product identifier (default: com.client.protected)\n"
       "      --version <ver>                   Release version string (default: 1.0.0)\n"
       "      --activation-server <url>         Online Activation Authority URL\n"
+      "      --content-key <file>              Dedicated 32-byte content encryption master key\n"
       "      --vm-root <hex>                   Canonical 64-character hex VM root seed\n"
       "      --vm-root-file <file>             File containing 32-byte VM root seed\n"
       "      --rtprotect-root <dir>            Root path to RTProtect distribution / SDK\n"
@@ -495,6 +496,8 @@ int CmdIntegrate(int argc, char** argv) {
       options.dev_keys_dir = argv[++i];
     } else if (arg == "--activation-server" && i + 1 < argc) {
       options.activation_server_url = argv[++i];
+    } else if (arg == "--content-key" && i + 1 < argc) {
+      options.content_key_path = argv[++i];
     } else if (arg == "--vm-root" && i + 1 < argc) {
       options.vm_root_hex = argv[++i];
     } else if (arg == "--vm-root-file" && i + 1 < argc) {

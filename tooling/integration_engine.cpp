@@ -259,6 +259,32 @@ std::string FormatByteArrayLiteral(const std::uint8_t* data, std::size_t len) {
   return ss.str();
 }
 
+bool IsExcludedSourcePath(const fs::path& p, const fs::path& proj_root) {
+  std::error_code ec;
+  auto rel = fs::relative(p, proj_root, ec);
+  if (ec) return false;
+
+  for (const auto& part : rel) {
+    std::string s = part.string();
+    if (s == ".git" || s == ".rtp_backup" || s == "third_party" || s == "external" || s == "tests") {
+      return true;
+    }
+    if (s.rfind("build", 0) == 0) {
+      return true;
+    }
+  }
+
+  std::string fname = p.filename().string();
+  if (fname.rfind("rtprotect_", 0) == 0) {
+    return true;
+  }
+  if (fname == "release.manifest" || fname == "release.sig" || fname == "release.pub" || fname == "license.pub" || fname == "client.license") {
+    return true;
+  }
+
+  return false;
+}
+
 }  // namespace
 
 std::optional<crypto::Aes256Key> DeriveBuildFunctionMasterKey(
@@ -286,24 +312,24 @@ bool TransformSourceFile(const fs::path& file_path,
                          const std::string& product_id,
                          std::vector<std::string>& out_virtualized,
                          std::size_t& out_obfuscated_count,
-                         std::size_t& out_scattered_count) {
-  (void)profile;
+                         std::size_t& out_scattered_count,
+                         std::string* out_error_message) {
   auto content_opt = ReadTextFile(file_path.string());
-  if (!content_opt.has_value()) return false;
+  if (!content_opt.has_value()) {
+    if (out_error_message) *out_error_message = "Failed to read source file: " + file_path.string();
+    return false;
+  }
   std::string content = *content_opt;
   bool modified = false;
 
   auto opcode_map = rtprotect::vm::OpcodeMap::FromSeed(opcode_seed);
 
   // 1. Clang AST semantic validation (Stage 3)
+  std::unordered_map<std::string, ClangFunctionDecl> clang_decls;
   if (ClangAstScanner::IsAvailable()) {
     auto clang_fns = ClangAstScanner::AnalyzeTranslationUnit(file_path.string());
     for (const auto& cfn : clang_fns) {
-      std::string reject_reason;
-      if (!ClangAstScanner::ValidateVirtualizationEligibility(cfn, &reject_reason)) {
-        // Log diagnostics for ineligible or unsupported constructs
-        (void)reject_reason;
-      }
+      clang_decls[cfn.name] = cfn;
     }
   }
 
@@ -316,11 +342,30 @@ bool TransformSourceFile(const fs::path& file_path,
     return a.full_range.start > b.full_range.start;
   });
 
-  for (const auto& fn : tagged_fns) {
+  for (auto& fn : tagged_fns) {
     std::string fn_name = fn.name;
     const auto& arg_names = fn.arg_names;
 
-    // Compile function using CompileCSubset with seeded OpcodeMap
+    // A. Clang AST semantic validation
+    auto it = clang_decls.find(fn_name);
+    if (it != clang_decls.end()) {
+      const auto& cfn = it->second;
+      std::string reject_reason;
+      if (!ClangAstScanner::ValidateVirtualizationEligibility(cfn, &reject_reason)) {
+        if (profile == ProtectionProfile::kMaximum || profile == ProtectionProfile::kBalanced) {
+          if (out_error_message) {
+            *out_error_message = "Function '" + fn_name + "' marked for virtualization failed Clang AST semantic validation: " + reject_reason;
+          }
+          return false;
+        }
+        continue;
+      }
+      if (!cfn.return_type.empty()) {
+        fn.return_type = cfn.return_type;
+      }
+    }
+
+    // B. Compile function using CompileCSubset with seeded OpcodeMap
     std::string compile_err;
     rtprotect::vm::CompilerOptions compiler_opts;
     compiler_opts.opcode_map = &opcode_map;
@@ -330,74 +375,105 @@ bool TransformSourceFile(const fs::path& file_path,
       prog = rtprotect::vm::CompileCSubset(fn.body, &compile_err, compiler_opts);
     }
 
-    if (prog.has_value()) {
-      auto serialized = rtprotect::vm::Serialize(*prog);
-
-      std::array<std::uint8_t, 16> fn_salt{};
-      if (RAND_bytes(fn_salt.data(), static_cast<int>(fn_salt.size())) != 1) {
-        for (std::size_t k = 0; k < fn_salt.size(); ++k) fn_salt[k] = static_cast<std::uint8_t>(k ^ 0x33);
+    if (!prog.has_value()) {
+      if (profile == ProtectionProfile::kMaximum || profile == ProtectionProfile::kBalanced) {
+        if (out_error_message) {
+          *out_error_message = "Function '" + fn_name + "' marked for virtualization failed bytecode compilation: " + compile_err;
+        }
+        return false;
       }
-
-      auto master_key = DeriveBuildFunctionMasterKey(vm_root, manifest_pubkey, product_id, fn_salt.data(), fn_salt.size());
-      if (!master_key.has_value()) continue;
-
-      rtprotect::antitamper::RiskAssessment clean_risk;
-      clean_risk.risk_score = 0;
-      auto bound_key = rtprotect::antitamper::DeriveTamperBoundKey(*master_key, clean_risk, fn_name);
-      auto encrypted = rtprotect::crypto::Encrypt(bound_key, serialized.data(), serialized.size());
-      if (!encrypted.has_value()) continue;
-
-      // Extract function header signature
-      std::string header = fn.header;
-      while (!header.empty() && std::isspace(static_cast<unsigned char>(header.front()))) header.erase(0, 1);
-      while (!header.empty() && std::isspace(static_cast<unsigned char>(header.back()))) header.pop_back();
-
-      std::ostringstream rep_ss;
-      rep_ss << "// [RTProtect Bytecode-Virtualized Function: " << fn_name << "]\n";
-      rep_ss << header << " {\n";
-      rep_ss << "    static const std::uint8_t s_enc_code[] = {\n        "
-             << FormatByteArrayLiteral(encrypted->ciphertext.data(), encrypted->ciphertext.size()) << "\n    };\n";
-      rep_ss << "    static const std::uint8_t s_nonce[] = {\n        "
-             << FormatByteArrayLiteral(encrypted->nonce.bytes, sizeof(encrypted->nonce.bytes)) << "\n    };\n";
-      rep_ss << "    static const std::uint8_t s_tag[] = {\n        "
-             << FormatByteArrayLiteral(encrypted->tag, sizeof(encrypted->tag)) << "\n    };\n";
-      rep_ss << "    static const std::uint8_t s_fn_salt[] = {\n        "
-             << FormatByteArrayLiteral(fn_salt.data(), fn_salt.size()) << "\n    };\n";
-      rep_ss << "    static std::uint64_t s_tamper_accum = 0;\n";
-      rep_ss << "    rtprotect::antitamper::ScatterTamperCheck(\"" << fn_name << "_entry\", &s_tamper_accum);\n";
-      rep_ss << "    auto s_risk = rtprotect::antitamper::AssessFastEnvironmentRisk();\n";
-      rep_ss << "    if (s_tamper_accum != 0) s_risk.risk_score = 100;\n";
-      rep_ss << "    auto s_fn_key = rtprotect_client::GetFunctionMasterKey(s_fn_salt, sizeof(s_fn_salt));\n";
-      rep_ss << "    if (!s_fn_key.has_value()) return 0;\n";
-      rep_ss << "    auto s_bound_key = rtprotect::antitamper::DeriveTamperBoundKey(*s_fn_key, s_risk, \"" << fn_name << "\");\n";
-      rep_ss << "    rtprotect::crypto::EncryptedMessage s_msg;\n";
-      rep_ss << "    std::memcpy(s_msg.nonce.bytes, s_nonce, sizeof(s_nonce));\n";
-      rep_ss << "    s_msg.ciphertext.assign(s_enc_code, s_enc_code + sizeof(s_enc_code));\n";
-      rep_ss << "    std::memcpy(s_msg.tag, s_tag, sizeof(s_tag));\n";
-      rep_ss << "    auto s_plain = rtprotect::crypto::Decrypt(s_bound_key, s_msg, nullptr, 0, nullptr);\n";
-      rep_ss << "    if (!s_plain.has_value()) return 0;\n";
-      rep_ss << "    auto s_prog = rtprotect::vm::Deserialize(s_plain->data(), s_plain->size());\n";
-      rep_ss << "    if (!s_prog.has_value()) return 0;\n";
-      rep_ss << "    std::vector<std::int64_t> s_args = {";
-      for (std::size_t k = 0; k < arg_names.size(); ++k) {
-        if (k > 0) rep_ss << ", ";
-        rep_ss << "static_cast<std::int64_t>(" << arg_names[k] << ")";
-      }
-      rep_ss << "};\n";
-      rep_ss << "    rtprotect::vm::MemoryContext s_mem_ctx(65536);\n";
-      rep_ss << "    auto s_res = rtprotect::vm::Run(*s_prog, s_args, &rtprotect_client::GetBuildOpcodeMap(), &s_mem_ctx);\n";
-      rep_ss << "    if (s_res.error != rtprotect::vm::VmError::kNone) {\n";
-      rep_ss << "        s_tamper_accum ^= (0xDEADBEEF00000000ULL | static_cast<std::uint64_t>(s_res.error));\n";
-      rep_ss << "        rtprotect::antitamper::ScatterTamperCheck(\"" << fn_name << "_fault\", &s_tamper_accum);\n";
-      rep_ss << "        return 0;\n";
-      rep_ss << "    }\n";
-      rep_ss << "    return s_res.value;\n";
-      rep_ss << "}";
-
-      content.replace(fn.full_range.start, fn.full_range.end - fn.full_range.start, rep_ss.str());
-      out_virtualized.push_back(fn_name);
-      modified = true;
+      continue;
     }
+
+    auto serialized = rtprotect::vm::Serialize(*prog);
+
+    // C. Function salt generation without deterministic fallback
+    std::array<std::uint8_t, 16> fn_salt{};
+    if (RAND_bytes(fn_salt.data(), static_cast<int>(fn_salt.size())) != 1) {
+      if (out_error_message) {
+        *out_error_message = "Cryptographic RNG failure (RAND_bytes) while generating salt for function '" + fn_name + "'";
+      }
+      return false;
+    }
+
+    auto master_key = DeriveBuildFunctionMasterKey(vm_root, manifest_pubkey, product_id, fn_salt.data(), fn_salt.size());
+    if (!master_key.has_value()) {
+      if (out_error_message) {
+        *out_error_message = "Failed to derive function master key for function '" + fn_name + "'";
+      }
+      return false;
+    }
+
+    rtprotect::antitamper::RiskAssessment clean_risk;
+    clean_risk.risk_score = 0;
+    auto bound_key = rtprotect::antitamper::DeriveTamperBoundKey(*master_key, clean_risk, fn_name);
+    auto encrypted = rtprotect::crypto::Encrypt(bound_key, serialized.data(), serialized.size());
+    if (!encrypted.has_value()) {
+      if (out_error_message) {
+        *out_error_message = "Encryption failed for virtualized function '" + fn_name + "'";
+      }
+      return false;
+    }
+
+    // D. Extract function header signature & determine return type
+    std::string header = fn.header;
+    while (!header.empty() && std::isspace(static_cast<unsigned char>(header.front()))) header.erase(0, 1);
+    while (!header.empty() && std::isspace(static_cast<unsigned char>(header.back()))) header.pop_back();
+
+    std::string ret_type = fn.return_type;
+    while (!ret_type.empty() && std::isspace(static_cast<unsigned char>(ret_type.front()))) ret_type.erase(0, 1);
+    while (!ret_type.empty() && std::isspace(static_cast<unsigned char>(ret_type.back()))) ret_type.pop_back();
+    if (ret_type.empty()) ret_type = "int";
+
+    bool is_void = (ret_type == "void");
+    std::string fail_stmt = is_void ? "return;" : ("return static_cast<" + ret_type + ">(0);");
+    std::string ok_stmt = is_void ? "return;" : ("return static_cast<" + ret_type + ">(s_res.value);");
+
+    std::ostringstream rep_ss;
+    rep_ss << "// [RTProtect Bytecode-Virtualized Function: " << fn_name << "]\n";
+    rep_ss << header << " {\n";
+    rep_ss << "    static const std::uint8_t s_enc_code[] = {\n        "
+           << FormatByteArrayLiteral(encrypted->ciphertext.data(), encrypted->ciphertext.size()) << "\n    };\n";
+    rep_ss << "    static const std::uint8_t s_nonce[] = {\n        "
+           << FormatByteArrayLiteral(encrypted->nonce.bytes, sizeof(encrypted->nonce.bytes)) << "\n    };\n";
+    rep_ss << "    static const std::uint8_t s_tag[] = {\n        "
+           << FormatByteArrayLiteral(encrypted->tag, sizeof(encrypted->tag)) << "\n    };\n";
+    rep_ss << "    static const std::uint8_t s_fn_salt[] = {\n        "
+           << FormatByteArrayLiteral(fn_salt.data(), fn_salt.size()) << "\n    };\n";
+    rep_ss << "    static std::uint64_t s_tamper_accum = 0;\n";
+    rep_ss << "    rtprotect::antitamper::ScatterTamperCheck(\"" << fn_name << "_entry\", &s_tamper_accum);\n";
+    rep_ss << "    auto s_risk = rtprotect::antitamper::AssessFastEnvironmentRisk();\n";
+    rep_ss << "    if (s_tamper_accum != 0) s_risk.risk_score = 100;\n";
+    rep_ss << "    auto s_fn_key = rtprotect_client::GetFunctionMasterKey(s_fn_salt, sizeof(s_fn_salt));\n";
+    rep_ss << "    if (!s_fn_key.has_value()) " << fail_stmt << "\n";
+    rep_ss << "    auto s_bound_key = rtprotect::antitamper::DeriveTamperBoundKey(*s_fn_key, s_risk, \"" << fn_name << "\");\n";
+    rep_ss << "    rtprotect::crypto::EncryptedMessage s_msg;\n";
+    rep_ss << "    std::memcpy(s_msg.nonce.bytes, s_nonce, sizeof(s_nonce));\n";
+    rep_ss << "    s_msg.ciphertext.assign(s_enc_code, s_enc_code + sizeof(s_enc_code));\n";
+    rep_ss << "    std::memcpy(s_msg.tag, s_tag, sizeof(s_tag));\n";
+    rep_ss << "    auto s_plain = rtprotect::crypto::Decrypt(s_bound_key, s_msg, nullptr, 0, nullptr);\n";
+    rep_ss << "    if (!s_plain.has_value()) " << fail_stmt << "\n";
+    rep_ss << "    auto s_prog = rtprotect::vm::Deserialize(s_plain->data(), s_plain->size());\n";
+    rep_ss << "    if (!s_prog.has_value()) " << fail_stmt << "\n";
+    rep_ss << "    std::vector<std::int64_t> s_args = {";
+    for (std::size_t k = 0; k < arg_names.size(); ++k) {
+      if (k > 0) rep_ss << ", ";
+      rep_ss << "static_cast<std::int64_t>(" << arg_names[k] << ")";
+    }
+    rep_ss << "};\n";
+    rep_ss << "    rtprotect::vm::MemoryContext s_mem_ctx(65536);\n";
+    rep_ss << "    auto s_res = rtprotect::vm::Run(*s_prog, s_args, &rtprotect_client::GetBuildOpcodeMap(), &s_mem_ctx);\n";
+    rep_ss << "    if (s_res.error != rtprotect::vm::VmError::kNone) {\n";
+    rep_ss << "        s_tamper_accum ^= (0xDEADBEEF00000000ULL | static_cast<std::uint64_t>(s_res.error));\n";
+    rep_ss << "        rtprotect::antitamper::ScatterTamperCheck(\"" << fn_name << "_fault\", &s_tamper_accum);\n";
+    rep_ss << "        " << fail_stmt << "\n";
+    rep_ss << "    }\n";
+    rep_ss << "    " << ok_stmt << "\n";
+    rep_ss << "}";
+
+    content.replace(fn.full_range.start, fn.full_range.end - fn.full_range.start, rep_ss.str());
+    out_virtualized.push_back(fn_name);
+    modified = true;
   }
 
   // 2. Translation-unit string obfuscation (Step 5)
@@ -595,18 +671,42 @@ ChangePlan PlanIntegration(const IntegrationOptions& options) {
     return plan;
   }
 
-  // Scan sources
+  // Scan sources (filtering out build, test, third_party, and non-C++ files)
   for (const auto& entry : fs::recursive_directory_iterator(proj_path, ec)) {
     if (entry.is_regular_file()) {
+      if (IsExcludedSourcePath(entry.path(), proj_path)) {
+        continue;
+      }
       auto ext = entry.path().extension().string();
-      if (ext == ".cpp" || ext == ".cc" || ext == ".cxx" || ext == ".c") {
+      if (ext == ".cpp" || ext == ".cc" || ext == ".cxx") {
         plan.detected_sources.push_back(entry.path().string());
       }
     }
   }
 
   if (plan.detected_sources.empty()) {
-    plan.warnings.push_back("No C/C++ source files found in target directory");
+    plan.warnings.push_back("No C++ source files found in target directory");
+  }
+
+  // Determine candidate source files that will actually be modified
+  for (const auto& src_path_str : plan.detected_sources) {
+    auto file_content = ReadTextFile(src_path_str);
+    if (!file_content.has_value()) continue;
+    bool will_modify = false;
+    if (file_content->find("RTPROTECT_VIRTUALIZE") != std::string::npos ||
+        file_content->find("[[rtprotect::virtualize]]") != std::string::npos ||
+        file_content->find("RTPROTECT_STRING") != std::string::npos) {
+      will_modify = true;
+    } else if (options.profile == ProtectionProfile::kMaximum || options.profile == ProtectionProfile::kBalanced) {
+      CxxAstScanner scan(*file_content);
+      auto lits = scan.FindAllStringLiterals();
+      if (!lits.empty()) {
+        will_modify = true;
+      }
+    }
+    if (will_modify) {
+      plan.files_to_modify.push_back(src_path_str);
+    }
   }
 
   plan.files_to_create.push_back((proj_path / "rtprotect_config.h").string());
@@ -915,7 +1015,10 @@ IntegrationReport ExecuteIntegration(const IntegrationOptions& options) {
   // 5. Generate rtprotect_config.h
   std::uint32_t opcode_seed = 0;
   if (RAND_bytes(reinterpret_cast<unsigned char*>(&opcode_seed), sizeof(opcode_seed)) != 1 || opcode_seed == 0) {
-    opcode_seed = 0x51A7F93Du;
+    report.success = false;
+    report.state = IntegrationState::kFailed;
+    report.error_message = "Cryptographic RNG failure (RAND_bytes) while generating VM opcode seed";
+    return report;
   }
   report.opcode_seed = opcode_seed;
 
@@ -935,34 +1038,33 @@ IntegrationReport ExecuteIntegration(const IntegrationOptions& options) {
   std::array<std::uint8_t, 32> vm_root{};
   bool vm_root_set = false;
 
-  // 1. Explicit VM root provided via options (file or hex string)
-  if (!options.vm_root_file.empty()) {
+  // 1. Dedicated content key path (Cryptographic key separation from signing keys)
+  if (!options.content_key_path.empty()) {
+    auto file_bytes = ReadFile(options.content_key_path);
+    if (!file_bytes.has_value() || file_bytes->size() < 32) {
+      report.success = false;
+      report.state = IntegrationState::kFailed;
+      report.error_message = "Failed to load dedicated content key from " + options.content_key_path;
+      return report;
+    }
+    std::memcpy(vm_root.data(), file_bytes->data(), 32);
+    vm_root_set = true;
+  }
+
+  // 2. Explicit VM root provided via options (file or hex string)
+  if (!vm_root_set && !options.vm_root_file.empty()) {
     auto file_bytes = ReadFile(options.vm_root_file);
     if (file_bytes.has_value() && file_bytes->size() >= 32) {
       std::memcpy(vm_root.data(), file_bytes->data(), 32);
       vm_root_set = true;
     }
-  } else if (!options.vm_root_hex.empty() && options.vm_root_hex.size() == 64) {
+  } else if (!vm_root_set && !options.vm_root_hex.empty() && options.vm_root_hex.size() == 64) {
     for (std::size_t i = 0; i < 32; ++i) {
       unsigned int byte_val = 0;
       std::sscanf(options.vm_root_hex.c_str() + i * 2, "%02x", &byte_val);
       vm_root[i] = static_cast<std::uint8_t>(byte_val);
     }
     vm_root_set = true;
-  }
-
-  // 2. Deterministic derivation from vendor manifest signing key (Production Release)
-  if (!vm_root_set && !options.sign_manifest_key_path.empty()) {
-    auto priv_data = ReadFile(options.sign_manifest_key_path);
-    if (priv_data.has_value() && priv_data->size() == 64) {
-      crypto::SecureBuffer sec_priv(priv_data->data(), priv_data->size());
-      std::vector<std::uint8_t> salt(options.product_id.begin(), options.product_id.end());
-      auto derived = crypto::Hkdf::DeriveKey(sec_priv, salt, "rtprotect/vm_root/v1", 32);
-      if (derived.has_value() && derived->size() == 32) {
-        std::memcpy(vm_root.data(), derived->data(), 32);
-        vm_root_set = true;
-      }
-    }
   }
 
   // 3. Online Activation Authority provisioning at build time (if server URL is configured)
@@ -977,21 +1079,31 @@ IntegrationReport ExecuteIntegration(const IntegrationOptions& options) {
     }
   }
 
-  // 4. Local dev token fallback (stored in OS secure storage & external dev_keys_dir)
-  if (!vm_root_set) {
+  // 4. In development or staging mode: local dev token fallback (stored in OS secure storage & external dev_keys_dir)
+  if (!vm_root_set && (options.use_dev_keys || options.staging_only)) {
     rtprotect::licensing::ActivationToken dev_token;
     if (rtprotect::licensing::LoadOrCreateDevToken(options.product_id, dev_lic_id, &dev_token)) {
       vm_root = dev_token.vm_root;
       vm_root_set = true;
     } else {
       if (RAND_bytes(dev_token.vm_root.data(), static_cast<int>(dev_token.vm_root.size())) != 1) {
-        for (std::size_t i = 0; i < dev_token.vm_root.size(); ++i) {
-          dev_token.vm_root[i] = static_cast<std::uint8_t>((i * 7 + 0x3C) & 0xFF);
-        }
+        report.success = false;
+        report.state = IntegrationState::kFailed;
+        report.error_message = "Cryptographic RNG failure (RAND_bytes) while generating dev vm_root";
+        return report;
       }
       vm_root = dev_token.vm_root;
       vm_root_set = true;
+      rtprotect::licensing::SaveActivationToken(options.product_id, dev_token);
     }
+  }
+
+  // 5. In production mode: enforce cryptographic key separation
+  if (!vm_root_set) {
+    report.success = false;
+    report.state = IntegrationState::kFailed;
+    report.error_message = "Production release requires dedicated content protection key separation. Please supply --content-key, --vm-root-file, --vm-root-hex, or --activation-server-url.";
+    return report;
   }
 
   fs::path config_header_path = proj_path / "rtprotect_config.h";
@@ -1305,11 +1417,24 @@ IntegrationReport ExecuteIntegration(const IntegrationOptions& options) {
 
   // 6b. Transform Client Sources (Function Virtualization, String Obfuscation, Anti-Tamper)
   for (const auto& src_file : plan.detected_sources) {
-    if (TransformSourceFile(src_file, options.profile, opcode_seed,
+    std::string transform_err;
+    bool transformed = TransformSourceFile(src_file, options.profile, opcode_seed,
                             vm_root, manifest_pubkey, options.product_id,
                             report.virtualized_functions,
                             report.obfuscated_string_count,
-                            report.scattered_check_count)) {
+                            report.scattered_check_count,
+                            &transform_err);
+    if (!transform_err.empty()) {
+      if (options.profile == ProtectionProfile::kMaximum || options.profile == ProtectionProfile::kBalanced) {
+        report.success = false;
+        report.state = IntegrationState::kFailed;
+        report.error_message = "Transformation failed for " + src_file + ": " + transform_err;
+        return report;
+      } else {
+        report.warnings.push_back("Transformation warning for " + src_file + ": " + transform_err);
+      }
+    }
+    if (transformed) {
       if (std::find(report.modified_files.begin(), report.modified_files.end(), src_file) == report.modified_files.end()) {
         report.modified_files.push_back(src_file);
       }

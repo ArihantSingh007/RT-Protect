@@ -5,6 +5,40 @@ This project adheres to Semantic Versioning and structured security reporting.
 
 ---
 
+## [2.5.0-hardened] - 2026-10-22
+
+### RTProtect WIP(5) Security Audit Remediations & Production Hardening
+
+- **Finding A — Authoritative Clang AST Tooling & Portable Executable Discovery:**
+  - Resolved Linux `$PATH` parsing in `ClangAstScanner::GetClangBinaryPath` by splitting POSIX path lists on `:` and Windows on `;`, eliminating relative `"clang"` resolution and unconditional `where.exe` invocations.
+  - Connected `ClangAstScanner` semantic declarations to function virtualization in `TransformSourceFile`, leveraging Clang AST parameter validation and return type metadata.
+
+- **Finding B — Target-Scoped Source Discovery & Scoped Modification Plan:**
+  - Implemented `IsExcludedSourcePath` in `PlanIntegration` to strictly exclude `.git`, `build*`, `third_party`, `external`, `tests`, `.rtp_backup`, and generated `rtprotect_*` artifacts from scanning.
+  - Restricted source discovery exclusively to C++ translation units (`.cpp`, `.cc`, `.cxx`), rejecting `.c` files to prevent C++ header and template injection into pure C modules.
+  - Narrowed `plan.files_to_modify` to display only files that will actually be modified (CMakeLists.txt and candidate C++ source files containing virtualization annotations or string literals).
+
+- **Finding C — Strict Virtualization Eligibility Contract & Type-Safe Wrappers:**
+  - Enforced strict fail-closed behavior in Maximum and Balanced profiles: if any function tagged with `RTPROTECT_VIRTUALIZE` fails AST eligibility checks or bytecode compilation, integration fails immediately with actionable diagnostics rather than silently skipping native code.
+  - Implemented type-safe wrapper generation: correctly distinguishes `void` return types (emitting clean `return;` on error and fault paths) and applies explicit `static_cast<ReturnType>(s_res.value)` for non-void types, eliminating syntax errors on void functions and type truncation warnings.
+
+- **Finding D — Production Release GUI Workflow & Thread Safety:**
+  - Separated `rtprotect-gui.exe` into explicit Development/Test Mode (ephemeral dev keys and local tokens) and Production Release Mode (requiring configured vendor verification keys).
+  - Conditioned complete success reporting on `rep.success && rep.state == kValidated && rep.build_succeeded && rep.validation_succeeded`, clearly displaying intermediate stages in diagnostic logs.
+  - Managed background worker threads via `std::thread g_worker_thread` and custom Win32 messages (`WM_APP_APPEND_LOG`, `WM_APP_SET_PROGRESS`, `WM_APP_WORK_DONE`), with atomic cancellation (`g_worker_cancelling`) and orderly join on `WM_CLOSE`, eliminating control crashes on window close.
+
+- **Finding E — Cryptographic Randomness Hardening & Key Separation:**
+  - Eliminated deterministic fallbacks for `RAND_bytes()` across opcode seed generation, per-function salt generation, and development VM root generation; cryptographic RNG failures now fail closed immediately.
+  - Enforced key separation: added `--content-key <path>` to `rtprotect-tool`, allowing dedicated content protection master keys to be managed independently from Ed25519 manifest and license signing keys.
+
+- **Finding F — Activation Service Reliability & Rate Limiter Bounding:**
+  - Bounded `RateLimiter` storage capacity (`max_entries_ = 10000`) with stale bucket pruning (>60s idle at full capacity), validated positive finite refill rates and capacities, and safely mapped empty keys to `"<anonymous>"`.
+  - Resolved worker thread registration race in `ActivationServerHttp` by synchronizing thread insertion within `workers_mu_` before dispatch.
+  - Hardened database persistence by escaping delimiter characters (`|`, `\n`, `\r`, `\\`), verifying `SaveLocked()` return values on all mutations, and rolling back memory state on disk failures.
+  - Redacted plaintext `vm_root` values in server provisioning logs.
+
+---
+
 ## [2.4.0-hardened] - 2026-10-22
 
 ### Security Audit Remediation & Roadmap Stages 0–5 Complete

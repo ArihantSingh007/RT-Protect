@@ -19,22 +19,39 @@ class RateLimiter {
  public:
   // refill_rate_per_sec: tokens added per second
   // max_tokens: maximum bucket capacity (burst limit)
-  RateLimiter(double refill_rate_per_sec = 2.0, double max_tokens = 20.0)
-      : refill_rate_(refill_rate_per_sec), max_tokens_(max_tokens) {}
+  // max_entries: maximum active tracked keys to prevent unbounded memory growth
+  RateLimiter(double refill_rate_per_sec = 2.0, double max_tokens = 20.0, std::size_t max_entries = 10000)
+      : max_entries_(max_entries) {
+    Configure(refill_rate_per_sec, max_tokens);
+  }
 
   void Configure(double refill_rate_per_sec, double max_tokens) {
     std::lock_guard<std::mutex> lock(mu_);
+    if (!std::isfinite(refill_rate_per_sec) || refill_rate_per_sec <= 0.0) {
+      refill_rate_per_sec = 1.0;
+    }
+    if (!std::isfinite(max_tokens) || max_tokens <= 0.0) {
+      max_tokens = 1.0;
+    }
     refill_rate_ = refill_rate_per_sec;
     max_tokens_ = max_tokens;
     buckets_.clear();
   }
 
   bool Allow(const std::string& key, double cost = 1.0, int* retry_after_seconds = nullptr) {
-    if (key.empty()) return true;
+    std::string safe_key = key.empty() ? "<anonymous>" : key;
     std::lock_guard<std::mutex> lock(mu_);
     auto now = std::chrono::steady_clock::now();
 
-    auto& bucket = buckets_[key];
+    // Capacity bounding: prune stale buckets when reaching maximum entries limit
+    if (buckets_.size() >= max_entries_ && buckets_.find(safe_key) == buckets_.end()) {
+      PruneStaleLocked(now);
+      if (buckets_.size() >= max_entries_) {
+        buckets_.erase(buckets_.begin()); // Guarantee strict bounded capacity
+      }
+    }
+
+    auto& bucket = buckets_[safe_key];
     if (bucket.last_refill == std::chrono::steady_clock::time_point{}) {
       bucket.tokens = max_tokens_;
       bucket.last_refill = now;
@@ -58,13 +75,19 @@ class RateLimiter {
   }
 
   void Reset(const std::string& key) {
+    std::string safe_key = key.empty() ? "<anonymous>" : key;
     std::lock_guard<std::mutex> lock(mu_);
-    buckets_.erase(key);
+    buckets_.erase(safe_key);
   }
 
   void Clear() {
     std::lock_guard<std::mutex> lock(mu_);
     buckets_.clear();
+  }
+
+  std::size_t active_buckets_count() const {
+    std::lock_guard<std::mutex> lock(mu_);
+    return buckets_.size();
   }
 
  private:
@@ -73,9 +96,23 @@ class RateLimiter {
     std::chrono::steady_clock::time_point last_refill{};
   };
 
+  void PruneStaleLocked(std::chrono::steady_clock::time_point now) {
+    // Prune entries that have reached full token capacity and have been idle > 60s
+    for (auto it = buckets_.begin(); it != buckets_.end(); ) {
+      double elapsed = std::chrono::duration<double>(now - it->second.last_refill).count();
+      double current_tokens = it->second.tokens + elapsed * refill_rate_;
+      if (current_tokens >= max_tokens_ && elapsed > 60.0) {
+        it = buckets_.erase(it);
+      } else {
+        ++it;
+      }
+    }
+  }
+
   mutable std::mutex mu_;
-  double refill_rate_;
-  double max_tokens_;
+  double refill_rate_ = 2.0;
+  double max_tokens_ = 20.0;
+  std::size_t max_entries_ = 10000;
   std::unordered_map<std::string, Bucket> buckets_;
 };
 

@@ -62,6 +62,7 @@ struct IntegrationOptions {
   std::string license_file_path;     // Optional pre-issued client.license to deploy
   std::string dev_keys_dir;          // Output directory for dev keys (must be outside client project)
   std::string activation_server_url; // Online Activation Authority URL (e.g. "https://license.vendor.com")
+  std::string content_key_path;      // Dedicated content encryption master key (separated from signing key)
   std::string vm_root_file;          // Optional explicit binary file for release VM root
   std::string vm_root_hex;           // Optional explicit 64-char hex string for release VM root
 };
@@ -149,6 +150,7 @@ bool TransformSourceFile(const std::filesystem::path& file_path,
                          const std::string& product_id,
                          std::vector<std::string>& out_virtualized,
                          std::size_t& out_obfuscated_count,
-                         std::size_t& out_scattered_count);
+                         std::size_t& out_scattered_count,
+                         std::string* out_error_message = nullptr);
 
 }  // namespace rtprotect::tooling
