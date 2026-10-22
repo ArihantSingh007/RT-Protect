@@ -7,6 +7,7 @@
 #pragma once
 
 #include <cstdint>
+#include <memory>
 #include <mutex>
 #include <unordered_map>
 
@@ -17,7 +18,7 @@ namespace rtprotect::vm {
 class ProgramRegistry {
  public:
   static void Register(std::uint16_t id, Program program);
-  static const Program* Get(std::uint16_t id);
+  static std::shared_ptr<const Program> Get(std::uint16_t id);
   static void Clear();
 };
 

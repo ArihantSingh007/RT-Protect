@@ -824,4 +824,72 @@ MT_TEST(Vm_RegisterThreadedEngine_Parity) {
   }
 }
 
+MT_TEST(Vm_CrossProgramCall_RecursionDepthLimit) {
+  // Program 200 recursively calls itself
+  ProgramBuilder b_rec(1);
+  b_rec.PushLocal(0);
+  b_rec.CallProgram(200);
+  b_rec.Ret();
+  ProgramRegistry::Register(200, b_rec.Build());
+
+  ProgramBuilder b_main(0);
+  b_main.PushConst(1);
+  b_main.CallProgram(200);
+  b_main.Ret();
+
+  auto r_stack = Run(b_main.Build(), {}, nullptr, nullptr, VmEngineFlavor::kStackBased);
+  MT_CHECK(r_stack.error == VmError::kCallStackOverflow);
+
+  auto r_reg = Run(b_main.Build(), {}, nullptr, nullptr, VmEngineFlavor::kRegisterThreaded);
+  MT_CHECK(r_reg.error == VmError::kCallStackOverflow);
+
+  ProgramRegistry::Clear();
+}
+
+MT_TEST(Vm_CrossProgramCall_StackUnderflowOnMissingArgs) {
+  // Program 201 expects 2 locals (arguments)
+  ProgramBuilder b_callee(2);
+  b_callee.PushLocal(0);
+  b_callee.PushLocal(1);
+  b_callee.Add();
+  b_callee.Ret();
+  ProgramRegistry::Register(201, b_callee.Build());
+
+  // Caller stack only provides 1 value before calling Program 201
+  ProgramBuilder b_caller(0);
+  b_caller.PushConst(42);
+  b_caller.CallProgram(201);
+  b_caller.Ret();
+
+  auto r_stack = Run(b_caller.Build(), {}, nullptr, nullptr, VmEngineFlavor::kStackBased);
+  MT_CHECK(r_stack.error == VmError::kStackUnderflow);
+
+  auto r_reg = Run(b_caller.Build(), {}, nullptr, nullptr, VmEngineFlavor::kRegisterThreaded);
+  MT_CHECK(r_reg.error == VmError::kStackUnderflow);
+
+  ProgramRegistry::Clear();
+}
+
+MT_TEST(Vm_CrossProgramCall_RegistryLifetimeSafety) {
+  // Program 202 computes x + 10
+  ProgramBuilder b(1);
+  b.PushLocal(0);
+  b.PushConst(10);
+  b.Add();
+  b.Ret();
+  ProgramRegistry::Register(202, b.Build());
+
+  auto prog = ProgramRegistry::Get(202);
+  MT_CHECK(prog != nullptr);
+
+  // Clear or re-register concurrently while holding shared_ptr to prog
+  ProgramRegistry::Clear();
+  MT_CHECK(ProgramRegistry::Get(202) == nullptr);
+
+  // The retained shared_ptr remains fully valid and executable
+  auto r = Run(*prog, {5});
+  MT_CHECK(r.error == VmError::kNone);
+  MT_CHECK(r.value == 15);
+}
+
 MT_MAIN()

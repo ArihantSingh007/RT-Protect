@@ -23,6 +23,7 @@ namespace rtprotect::vm {
 // (verifier.cpp needs it too, and including vm.h from verifier.cpp would
 // be circular since vm.h already includes verifier.h).
 inline constexpr std::uint64_t kMaxExecutedInstructions = 100000;
+inline constexpr std::size_t kMaxProgramRecursionDepth = 64;
 
 enum class VmError {
   kNone = 0,
@@ -85,11 +86,13 @@ RunResult Run(const Program& program,
               const std::vector<std::int64_t>& args,
               const OpcodeMap* opcode_map = nullptr,
               MemoryContext* mem_ctx = nullptr,
-              VmEngineFlavor flavor = VmEngineFlavor::kStackBased);
+              VmEngineFlavor flavor = VmEngineFlavor::kStackBased,
+              std::size_t recursion_depth = 0);
 
 RunResult RunRegisterThreaded(const Program& program,
                               const std::vector<std::int64_t>& args,
                               const OpcodeMap* opcode_map = nullptr,
-                              MemoryContext* mem_ctx = nullptr);
+                              MemoryContext* mem_ctx = nullptr,
+                              std::size_t recursion_depth = 0);
 
 }  // namespace rtprotect::vm

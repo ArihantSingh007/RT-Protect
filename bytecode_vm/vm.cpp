@@ -1,6 +1,7 @@
 #include "bytecode_vm/vm.h"
 
 #include <cstring>
+#include <memory>
 #include "bytecode_vm/checked_arith.h"
 #include "bytecode_vm/opcode.h"
 #include "bytecode_vm/opcode_map.h"
@@ -49,12 +50,17 @@ RunResult Run(const Program& program,
               const std::vector<std::int64_t>& args,
               const OpcodeMap* opcode_map,
               MemoryContext* mem_ctx,
-              VmEngineFlavor flavor) {
+              VmEngineFlavor flavor,
+              std::size_t recursion_depth) {
   if (flavor == VmEngineFlavor::kRegisterThreaded) {
-    return RunRegisterThreaded(program, args, opcode_map, mem_ctx);
+    return RunRegisterThreaded(program, args, opcode_map, mem_ctx, recursion_depth);
   }
 
   RunResult result;
+  if (recursion_depth >= kMaxProgramRecursionDepth) {
+    result.error = VmError::kCallStackOverflow;
+    return result;
+  }
 
   VerifyError verr = VerifyError::kNone;
   auto instruction_starts = VerifyProgram(program, &verr, opcode_map);
@@ -424,8 +430,13 @@ RunResult Run(const Program& program,
         break;
       }
       case Opcode::kCallProgram: {
+        if (recursion_depth >= kMaxProgramRecursionDepth) {
+          result.error = VmError::kCallStackOverflow;
+          result.instructions_executed = executed;
+          return result;
+        }
         std::uint16_t prog_id = ReadU16(operand);
-        const Program* callee = ProgramRegistry::Get(prog_id);
+        std::shared_ptr<const Program> callee = ProgramRegistry::Get(prog_id);
         if (!callee) {
           result.error = VmError::kVerificationFailed;
           result.instructions_executed = executed;
@@ -434,11 +445,14 @@ RunResult Run(const Program& program,
         std::vector<std::int64_t> callee_args(callee->num_locals, 0);
         for (int k = static_cast<int>(callee->num_locals) - 1; k >= 0; --k) {
           std::int64_t arg_val = 0;
-          if (pop(&arg_val)) {
-            callee_args[k] = arg_val;
+          if (!pop(&arg_val)) {
+            result.error = VmError::kStackUnderflow;
+            result.instructions_executed = executed;
+            return result;
           }
+          callee_args[k] = arg_val;
         }
-        auto sub_res = Run(*callee, callee_args, opcode_map, mem_ctx, flavor);
+        auto sub_res = Run(*callee, callee_args, opcode_map, mem_ctx, flavor, recursion_depth + 1);
         if (sub_res.error != VmError::kNone) {
           result.error = sub_res.error;
           result.instructions_executed = executed + sub_res.instructions_executed;
@@ -603,12 +617,17 @@ RunResult Run(const Program& program,
 RunResult RunRegisterThreaded(const Program& program,
                               const std::vector<std::int64_t>& args,
                               const OpcodeMap* opcode_map,
-                              MemoryContext* mem_ctx) {
+                              MemoryContext* mem_ctx,
+                              std::size_t recursion_depth) {
   // Register-Threaded Engine (Flavor 2):
   // Uses an internal 8-slot register window (R0..R7) and accumulator (acc)
   // with threaded execution semantics, creating completely different
   // execution traces and memory signatures from the stack engine.
   RunResult result;
+  if (recursion_depth >= kMaxProgramRecursionDepth) {
+    result.error = VmError::kCallStackOverflow;
+    return result;
+  }
 
   VerifyError verr = VerifyError::kNone;
   auto instruction_starts = VerifyProgram(program, &verr, opcode_map);
@@ -908,8 +927,13 @@ RunResult RunRegisterThreaded(const Program& program,
         break;
       }
       case Opcode::kCallProgram: {
+        if (recursion_depth >= kMaxProgramRecursionDepth) {
+          result.error = VmError::kCallStackOverflow;
+          result.instructions_executed = executed;
+          return result;
+        }
         std::uint16_t prog_id = ReadU16(operand);
-        const Program* callee = ProgramRegistry::Get(prog_id);
+        std::shared_ptr<const Program> callee = ProgramRegistry::Get(prog_id);
         if (!callee) {
           result.error = VmError::kVerificationFailed;
           result.instructions_executed = executed;
@@ -918,9 +942,14 @@ RunResult RunRegisterThreaded(const Program& program,
         std::vector<std::int64_t> callee_args(callee->num_locals, 0);
         for (int k = static_cast<int>(callee->num_locals) - 1; k >= 0; --k) {
           std::int64_t arg_val = 0;
-          if (reg_pop(&arg_val)) callee_args[k] = arg_val;
+          if (!reg_pop(&arg_val)) {
+            result.error = VmError::kStackUnderflow;
+            result.instructions_executed = executed;
+            return result;
+          }
+          callee_args[k] = arg_val;
         }
-        auto sub_res = RunRegisterThreaded(*callee, callee_args, opcode_map, mem_ctx);
+        auto sub_res = RunRegisterThreaded(*callee, callee_args, opcode_map, mem_ctx, recursion_depth + 1);
         if (sub_res.error != VmError::kNone) {
           result.error = sub_res.error;
           result.instructions_executed = executed + sub_res.instructions_executed;

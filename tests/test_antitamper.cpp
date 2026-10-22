@@ -187,4 +187,32 @@ MT_TEST(AntiTamper_AntiDump_EphemeralExecutionGuard_ExecuteAndCleanse) {
   MT_CHECK(!guard.IsAllocated());
 }
 
+MT_TEST(AntiTamper_RiskAssessment_WiresAntiDumpChecks) {
+  RiskAssessment r_env = AssessEnvironmentRisk();
+  RiskAssessment r_fast = AssessFastEnvironmentRisk();
+
+  // Flags must be populated consistently
+  MT_CHECK(r_env.memory_dump_detected == DetectMemoryDumper());
+  MT_CHECK(r_env.memory_probing_detected == DetectMemoryProbing());
+  MT_CHECK(r_fast.memory_dump_detected == DetectMemoryDumper());
+  MT_CHECK(r_fast.memory_probing_detected == DetectMemoryProbing());
+
+  // Synthetic validation: memory dump and probing detection poison risk salt
+  RiskAssessment clean;
+  clean.risk_score = 0;
+  auto clean_salt = DeriveRiskSalt(clean);
+
+  RiskAssessment dump_detected = clean;
+  dump_detected.memory_dump_detected = true;
+  dump_detected.risk_score = 40;
+  auto dump_salt = DeriveRiskSalt(dump_detected);
+  MT_CHECK(clean_salt != dump_salt);
+
+  RiskAssessment probe_detected = clean;
+  probe_detected.memory_probing_detected = true;
+  probe_detected.risk_score = 30;
+  auto probe_salt = DeriveRiskSalt(probe_detected);
+  MT_CHECK(clean_salt != probe_salt);
+}
+
 MT_MAIN()
