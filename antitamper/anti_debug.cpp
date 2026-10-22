@@ -1,4 +1,13 @@
 // antitamper/anti_debug.cpp
+//
+// Windows Anti-Debugging & Runtime Tamper Detection Subsystem.
+// Implements multi-layered, unhookable Windows protection checks:
+// - Direct PEB inspection (BeingDebugged and NtGlobalFlag) via gs:0x60/fs:0x30
+// - Direct NT kernel queries via NtQueryInformationProcess (ProcessDebugPort & ProcessDebugObjectHandle)
+// - Dynamic hashed API resolution for IsDebuggerPresent and CheckRemoteDebuggerPresent
+// - Multi-threaded Hardware Breakpoint detection via debug registers (DR0..DR3)
+// - Execution timing anomaly detection via QueryPerformanceCounter
+// - Inline hook and software breakpoint detection (INT 3, JMP detours)
 
 #include "antitamper/anti_debug.h"
 #include "antitamper/dynamic_import.h"
@@ -8,29 +17,10 @@
 #include <cstdint>
 #include <mutex>
 #include <thread>
-
-#if defined(_WIN32)
 #include <windows.h>
 #include <tlhelp32.h>
 #if defined(_MSC_VER)
 #include <intrin.h>
-#endif
-#else
-#include <fstream>
-#include <string>
-#include <ctime>
-#include <cstdlib>
-#include <cstring>
-#include <unistd.h>
-#if defined(__linux__)
-#include <link.h>
-#include <dlfcn.h>
-#include <sys/syscall.h>
-#if defined(__x86_64__) || defined(__i386__)
-#include <linux/perf_event.h>
-#include <linux/hw_breakpoint.h>
-#endif
-#endif
 #endif
 
 namespace rtprotect::antitamper {
@@ -40,84 +30,117 @@ std::atomic<bool> g_hw_bp_detected{false};
 std::atomic<bool> g_watchdog_running{false};
 std::thread g_watchdog_thread;
 std::mutex g_watchdog_mu;
+
+// Direct unhookable PEB inspection
+bool CheckDirectPebDebugFlags() {
+#if defined(_M_X64) || defined(__x86_64__)
+  const unsigned char* pPeb = nullptr;
+#if defined(_MSC_VER)
+  pPeb = reinterpret_cast<const unsigned char*>(__readgsqword(0x60));
+#elif defined(__GNUC__) || defined(__clang__)
+  __asm__ __volatile__("movq %%gs:0x60, %0" : "=r"(pPeb));
+#endif
+  if (!pPeb) return false;
+
+  // BeingDebugged flag is located at offset 0x02 in PEB
+  if (pPeb[2] != 0) return true;
+
+  // NtGlobalFlag is located at offset 0xBC in 64-bit PEB
+  // Flags: FLG_HEAP_ENABLE_TAIL_CHECK (0x10) | FLG_HEAP_ENABLE_FREE_CHECK (0x20) | FLG_HEAP_VALIDATE_PARAMETERS (0x40)
+  std::uint32_t ntGlobalFlag = *reinterpret_cast<const std::uint32_t*>(pPeb + 0xBC);
+  if ((ntGlobalFlag & 0x70) == 0x70) return true;
+
+#elif defined(_M_IX86) || defined(__i386__)
+  const unsigned char* pPeb = nullptr;
+#if defined(_MSC_VER)
+  pPeb = reinterpret_cast<const unsigned char*>(__readfsdword(0x30));
+#elif defined(__GNUC__) || defined(__clang__)
+  __asm__ __volatile__("movl %%fs:0x30, %0" : "=r"(pPeb));
+#endif
+  if (!pPeb) return false;
+
+  if (pPeb[2] != 0) return true;
+
+  std::uint32_t ntGlobalFlag = *reinterpret_cast<const std::uint32_t*>(pPeb + 0x68);
+  if ((ntGlobalFlag & 0x70) == 0x70) return true;
+#endif
+
+  return false;
+}
+
+// Direct NT kernel query via NtQueryInformationProcess
+bool CheckNtQueryProcessDebug() {
+  typedef NTSTATUS(NTAPI *pfnNtQueryInformationProcess)(
+      HANDLE ProcessHandle,
+      ULONG ProcessInformationClass,
+      PVOID ProcessInformation,
+      ULONG ProcessInformationLength,
+      PULONG ReturnLength);
+
+  void* hNtdll = GetLoadedModuleBaseByHash(kHashNtdll);
+  if (!hNtdll) return false;
+
+  auto fnNtQuery = reinterpret_cast<pfnNtQueryInformationProcess>(
+      ResolveExportByHash(hNtdll, kHashNtQueryInformationProcess));
+  if (!fnNtQuery) return false;
+
+  // ProcessDebugPort = 7
+  DWORD_PTR debug_port = 0;
+  NTSTATUS status = fnNtQuery(::GetCurrentProcess(), 7, &debug_port, sizeof(debug_port), nullptr);
+  if (status == 0 && debug_port != 0) return true;
+
+  // ProcessDebugObjectHandle = 30
+  HANDLE debug_obj = nullptr;
+  status = fnNtQuery(::GetCurrentProcess(), 30, &debug_obj, sizeof(debug_obj), nullptr);
+  if (status == 0 && debug_obj != nullptr) {
+    ::CloseHandle(debug_obj);
+    return true;
+  }
+
+  return false;
+}
+
+static bool ScanProcessThreadsForHardwareBreakpoints() {
+  DWORD pid = ::GetCurrentProcessId();
+  DWORD self_tid = ::GetCurrentThreadId();
+  HANDLE snap = ::CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+  if (snap == INVALID_HANDLE_VALUE) {
+    return false;
+  }
+  THREADENTRY32 te{};
+  te.dwSize = sizeof(te);
+  bool found = false;
+  if (::Thread32First(snap, &te)) {
+    do {
+      if (te.th32OwnerProcessID == pid && te.th32ThreadID != self_tid) {
+        HANDLE th = ::OpenThread(THREAD_GET_CONTEXT | THREAD_SUSPEND_RESUME, FALSE, te.th32ThreadID);
+        if (th) {
+          ::SuspendThread(th);
+          CONTEXT ctx{};
+          ctx.ContextFlags = CONTEXT_DEBUG_REGISTERS;
+          if (::GetThreadContext(th, &ctx)) {
+            if (ctx.Dr0 != 0 || ctx.Dr1 != 0 || ctx.Dr2 != 0 || ctx.Dr3 != 0) {
+              found = true;
+            }
+          }
+          ::ResumeThread(th);
+          ::CloseHandle(th);
+          if (found) break;
+        }
+      }
+    } while (::Thread32Next(snap, &te));
+  }
+  ::CloseHandle(snap);
+  return found;
+}
+
 }  // namespace
 
 bool IsHardwareBreakpointDetected() {
   return g_hw_bp_detected.load(std::memory_order_relaxed);
 }
 
-#if defined(_WIN32)
-namespace {
-
-const unsigned char* GetPebAddress() {
-#if defined(_M_X64) || defined(__x86_64__)
-  const unsigned char* peb = nullptr;
-  #if defined(__GNUC__) || defined(__clang__)
-  __asm__("movq %%gs:0x60, %0" : "=r"(peb));
-  #elif defined(_MSC_VER)
-  peb = reinterpret_cast<const unsigned char*>(__readgsqword(0x60));
-  #endif
-  return peb;
-#elif defined(_M_IX86) || defined(__i386__)
-  const unsigned char* peb = nullptr;
-  #if defined(__GNUC__) || defined(__clang__)
-  __asm__("movl %%fs:0x30, %0" : "=r"(peb));
-  #elif defined(_MSC_VER)
-  peb = reinterpret_cast<const unsigned char*>(__readfsdword(0x30));
-  #endif
-  return peb;
-#else
-  return nullptr;
-#endif
-}
-
-bool CheckDirectPebDebugFlags() {
-  const unsigned char* peb = GetPebAddress();
-  if (!peb) return false;
-
-  // BeingDebugged byte is at offset 2
-  if (peb[2] != 0) return true;
-
-#if defined(_M_X64) || defined(__x86_64__)
-  // NtGlobalFlag dword is at offset 0xBC on x64
-  std::uint32_t nt_global_flag = *reinterpret_cast<const std::uint32_t*>(peb + 0xBC);
-  if ((nt_global_flag & 0x70) != 0) return true;
-#elif defined(_M_IX86) || defined(__i386__)
-  // NtGlobalFlag dword is at offset 0x68 on x86
-  std::uint32_t nt_global_flag = *reinterpret_cast<const std::uint32_t*>(peb + 0x68);
-  if ((nt_global_flag & 0x70) != 0) return true;
-#endif
-
-  return false;
-}
-
-bool CheckNtQueryProcessDebug() {
-  typedef LONG (NTAPI *pfnNtQueryInformationProcess)(
-      HANDLE, ULONG, PVOID, ULONG, PULONG);
-  auto pNtQIP = ResolveApi<pfnNtQueryInformationProcess>(kHashNtdll, kHashNtQueryInformationProcess);
-  if (!pNtQIP) return false;
-
-  // Class 7 = ProcessDebugPort
-  DWORD_PTR debug_port = 0;
-  ULONG ret_len = 0;
-  if (pNtQIP(::GetCurrentProcess(), 7, &debug_port, sizeof(debug_port), &ret_len) == 0) {
-    if (debug_port != 0) return true;
-  }
-
-  // Class 0x1E (30) = ProcessDebugObjectHandle
-  HANDLE debug_obj = nullptr;
-  if (pNtQIP(::GetCurrentProcess(), 30, &debug_obj, sizeof(debug_obj), &ret_len) == 0) {
-    if (debug_obj != nullptr) return true;
-  }
-
-  return false;
-}
-
-}  // namespace
-#endif
-
 bool CheckDebuggerPresent() {
-#if defined(_WIN32)
   // 1. Direct unhookable PEB inspection
   if (CheckDirectPebDebugFlags()) return true;
 
@@ -134,42 +157,9 @@ bool CheckDebuggerPresent() {
     return true;
   }
   return false;
-#else
-  // Layer 1: Check TracerPid and State in /proc/self/status
-  std::ifstream f("/proc/self/status");
-  std::string line;
-  while (f && std::getline(f, line)) {
-    if (line.rfind("TracerPid:", 0) == 0) {
-      try {
-        long pid = std::stol(line.substr(10));
-        if (pid > 0) return true;
-      } catch (...) {}
-    } else if (line.rfind("State:", 0) == 0) {
-      // Check for 'T' (stopped) or 't' (tracing stop)
-      if (line.find("(tracing stop)") != std::string::npos ||
-          line.find(" T ") != std::string::npos ||
-          line.find(" t ") != std::string::npos) {
-        return true;
-      }
-    }
-  }
-
-  // Layer 2: Check /proc/self/wchan for ptrace_stop / do_signal_stop
-  std::ifstream wchan("/proc/self/wchan");
-  std::string wchan_str;
-  if (wchan >> wchan_str) {
-    if (wchan_str.find("ptrace") != std::string::npos ||
-        wchan_str.find("signal_stop") != std::string::npos) {
-      return true;
-    }
-  }
-
-  return false;
-#endif
 }
 
 bool CheckRemoteDebugger() {
-#if defined(_WIN32)
   typedef BOOL (WINAPI *pfnCheckRemoteDebuggerPresent)(HANDLE, PBOOL);
   auto fnCheckRemoteDebugger = ResolveApi<pfnCheckRemoteDebuggerPresent>(
       kHashKernel32, kHashCheckRemoteDebuggerPresent);
@@ -184,93 +174,49 @@ bool CheckRemoteDebugger() {
     }
   }
   return false;
-#else
-  // Passive external debugger / tracer check on Linux:
-  // Inspect /proc/self/status for non-zero TracerPid without mutating
-  // process tracing state via ptrace(PTRACE_TRACEME).
-  std::ifstream f("/proc/self/status");
-  std::string line;
-  while (f && std::getline(f, line)) {
-    if (line.rfind("TracerPid:", 0) == 0) {
-      const char* p = line.c_str() + 10;
-      while (*p == ' ' || *p == '\t') ++p;
-      char* end = nullptr;
-      long pid = std::strtol(p, &end, 10);
-      if (end != p && pid > 0) {
-        return true;
-      }
-      return false;
-    }
-  }
-  return false;
-#endif
 }
-
-#if defined(_WIN32)
-static bool ScanProcessThreadsForHardwareBreakpoints() {
-  DWORD pid = ::GetCurrentProcessId();
-  DWORD self_tid = ::GetCurrentThreadId();
-  HANDLE snap = ::CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
-  if (snap == INVALID_HANDLE_VALUE) {
-    return false;
-  }
-  THREADENTRY32 te{};
-  te.dwSize = sizeof(te);
-  bool found = false;
-  if (::Thread32First(snap, &te)) {
-    do {
-      if (te.th32OwnerProcessID == pid && te.th32ThreadID != self_tid) {
-        HANDLE th = ::OpenThread(THREAD_GET_CONTEXT | THREAD_SUSPEND_RESUME, FALSE, te.th32ThreadID);
-        if (th) {
-          if (::SuspendThread(th) != static_cast<DWORD>(-1)) {
-            CONTEXT ctx{};
-            ctx.ContextFlags = CONTEXT_DEBUG_REGISTERS;
-            if (::GetThreadContext(th, &ctx)) {
-              if (ctx.Dr0 != 0 || ctx.Dr1 != 0 || ctx.Dr2 != 0 || ctx.Dr3 != 0) {
-                found = true;
-              }
-            }
-            ::ResumeThread(th);
-          }
-          ::CloseHandle(th);
-          if (found) break;
-        }
-      }
-    } while (::Thread32Next(snap, &te));
-  }
-  ::CloseHandle(snap);
-  return found;
-}
-#endif
 
 bool CheckHardwareBreakpoints() {
   if (g_hw_bp_detected.load(std::memory_order_relaxed)) {
     return true;
   }
 
-#if defined(_WIN32)
-  DWORD current_tid = ::GetCurrentThreadId();
-  bool found_bp = false;
-  HANDLE helper = ::CreateThread(nullptr, 0, [](LPVOID param) -> DWORD {
-    DWORD target_tid = *reinterpret_cast<DWORD*>(param);
-    HANDLE target = ::OpenThread(THREAD_GET_CONTEXT | THREAD_SUSPEND_RESUME, FALSE, target_tid);
-    if (!target) return 0;
-    if (::SuspendThread(target) != static_cast<DWORD>(-1)) {
-      CONTEXT ctx{};
-      ctx.ContextFlags = CONTEXT_DEBUG_REGISTERS;
-      if (::GetThreadContext(target, &ctx)) {
-        if (ctx.Dr0 != 0 || ctx.Dr1 != 0 || ctx.Dr2 != 0 || ctx.Dr3 != 0) {
-          ::ResumeThread(target);
-          ::CloseHandle(target);
-          return 1;
-        }
-      }
-      ::ResumeThread(target);
-    }
-    ::CloseHandle(target);
-    return 0;
-  }, &current_tid, 0, nullptr);
+  // Scan existing application threads via snapshot
+  if (ScanProcessThreadsForHardwareBreakpoints()) {
+    g_hw_bp_detected.store(true, std::memory_order_relaxed);
+    return true;
+  }
 
+  // Check calling thread registers via a temporary helper thread
+  struct HelperParam {
+    HANDLE target_thread = nullptr;
+    bool found_bp = false;
+  } param;
+
+  HANDLE cur_thread = ::GetCurrentThread();
+  HANDLE dup_thread = nullptr;
+  if (!::DuplicateHandle(::GetCurrentProcess(), cur_thread, ::GetCurrentProcess(),
+                         &dup_thread, THREAD_GET_CONTEXT | THREAD_SUSPEND_RESUME,
+                         FALSE, 0)) {
+    return false;
+  }
+  param.target_thread = dup_thread;
+
+  HANDLE helper = ::CreateThread(nullptr, 0, [](LPVOID p) -> DWORD {
+    auto* hp = static_cast<HelperParam*>(p);
+    ::SuspendThread(hp->target_thread);
+    CONTEXT ctx{};
+    ctx.ContextFlags = CONTEXT_DEBUG_REGISTERS;
+    if (::GetThreadContext(hp->target_thread, &ctx)) {
+      if (ctx.Dr0 != 0 || ctx.Dr1 != 0 || ctx.Dr2 != 0 || ctx.Dr3 != 0) {
+        hp->found_bp = true;
+      }
+    }
+    ::ResumeThread(hp->target_thread);
+    return hp->found_bp ? 1 : 0;
+  }, &param, 0, nullptr);
+
+  bool found_bp = false;
   if (helper) {
     ::WaitForSingleObject(helper, 100);
     DWORD exit_code = 0;
@@ -279,34 +225,12 @@ bool CheckHardwareBreakpoints() {
     }
     ::CloseHandle(helper);
   }
+  ::CloseHandle(dup_thread);
+
   if (found_bp) {
     g_hw_bp_detected.store(true, std::memory_order_relaxed);
   }
   return found_bp;
-#else
-  // Linux hardware breakpoint probing via perf_event_open
-  // On x86/x64, exactly 4 debug registers exist. When an interactive debugger
-  // (such as GDB or LLDB) claims hardware breakpoints on the target,
-  // perf_event_open fails with ENOSPC or EBUSY.
-#if defined(__linux__) && defined(SYS_perf_event_open)
-  struct perf_event_attr pe{};
-  pe.type = PERF_TYPE_BREAKPOINT;
-  pe.size = sizeof(struct perf_event_attr);
-  pe.bp_type = HW_BREAKPOINT_X;
-  pe.bp_addr = reinterpret_cast<uintptr_t>(&CheckHardwareBreakpoints);
-  pe.bp_len = sizeof(long);
-  pe.disabled = 1;
-
-  int fd = static_cast<int>(syscall(SYS_perf_event_open, &pe, 0, -1, -1, 0));
-  if (fd >= 0) {
-    close(fd);
-  } else if (errno == ENOSPC || errno == EBUSY) {
-    g_hw_bp_detected.store(true, std::memory_order_relaxed);
-    return true;
-  }
-#endif
-  return false;
-#endif
 }
 
 void StartHardwareBreakpointWatchdog(std::uint32_t interval_ms) {
@@ -315,12 +239,10 @@ void StartHardwareBreakpointWatchdog(std::uint32_t interval_ms) {
   g_watchdog_running.store(true);
   g_watchdog_thread = std::thread([interval_ms]() {
     while (g_watchdog_running.load()) {
-#if defined(_WIN32)
       if (ScanProcessThreadsForHardwareBreakpoints()) {
         g_hw_bp_detected.store(true, std::memory_order_relaxed);
         break;
       }
-#endif
       std::this_thread::sleep_for(std::chrono::milliseconds(interval_ms));
     }
   });
@@ -336,9 +258,6 @@ void StopHardwareBreakpointWatchdog() {
 }
 
 bool CheckExecutionTimingAnomaly() {
-  // Measures whether a tiny deterministic computational loop takes an
-  // abnormally long time (characteristic of an interactive debugger breakpoint or step).
-#if defined(_WIN32)
   LARGE_INTEGER freq, start, end;
   if (!::QueryPerformanceFrequency(&freq) || !::QueryPerformanceCounter(&start)) {
     return false;
@@ -351,25 +270,10 @@ bool CheckExecutionTimingAnomaly() {
 
   ::QueryPerformanceCounter(&end);
   double elapsed_seconds = static_cast<double>(end.QuadPart - start.QuadPart) / static_cast<double>(freq.QuadPart);
-  // 5000 iterations takes microseconds. > 0.25 seconds indicates pausing/stepping.
   return elapsed_seconds > 0.25;
-#else
-  struct timespec start{}, end{};
-  clock_gettime(CLOCK_MONOTONIC, &start);
-
-  volatile std::uint64_t dummy = 0;
-  for (int i = 0; i < 5000; ++i) {
-    dummy += (i * 3) ^ (dummy >> 2);
-  }
-
-  clock_gettime(CLOCK_MONOTONIC, &end);
-  double elapsed = (end.tv_sec - start.tv_sec) + (end.tv_nsec - start.tv_nsec) * 1e-9;
-  return elapsed > 0.25;
-#endif
 }
 
 bool CheckMemoryTampered() {
-#if defined(_WIN32)
   static const std::uint32_t kCheckedApiHashes[] = {
       kHashIsDebuggerPresent,
       kHashCheckRemoteDebuggerPresent,
@@ -395,96 +299,6 @@ bool CheckMemoryTampered() {
       if (p[0] == 0xFF && p[1] == 0x25) return true;
     }
   }
-#else
-  // 1. Linux standard ELF program header and loaded module inventory via dl_iterate_phdr
-#if defined(__linux__)
-  struct ModuleScanContext {
-    bool tampered = false;
-  } scan_ctx;
-
-  auto phdr_callback = [](struct dl_phdr_info* info, size_t, void* data) -> int {
-    auto* ctx = static_cast<ModuleScanContext*>(data);
-    const char* name = info->dlpi_name;
-    if (name && name[0] != '\0') {
-      static const char* const kSuspicious[] = {
-          "frida", "gadget", "substrate", "substitute", "cycript", "xposed", "libmem", "cheat"
-      };
-      for (const char* susp : kSuspicious) {
-        if (std::strstr(name, susp)) {
-          ctx->tampered = true;
-          return 1;
-        }
-      }
-    }
-    // Inspect program headers for rogue RWX segments in loaded objects
-    for (int i = 0; i < info->dlpi_phnum; ++i) {
-      const ElfW(Phdr)& ph = info->dlpi_phdr[i];
-      if (ph.p_type == PT_LOAD) {
-        bool is_w = (ph.p_flags & PF_W) != 0;
-        bool is_x = (ph.p_flags & PF_X) != 0;
-        if (is_w && is_x) {
-          ctx->tampered = true;
-          return 1;
-        }
-      }
-    }
-    return 0;
-  };
-
-  dl_iterate_phdr(phdr_callback, &scan_ctx);
-  if (scan_ctx.tampered) return true;
-
-  // 2. Check critical libc functions for inline function hooks (INT 3, JMP)
-  void* libc = dlopen("libc.so.6", RTLD_NOLOAD | RTLD_LAZY);
-  if (!libc) libc = dlopen(nullptr, RTLD_LAZY);
-  if (libc) {
-    static const char* const kCriticalApis[] = { "ptrace", "mprotect", "kill", "raise", "open" };
-    for (const char* api : kCriticalApis) {
-      const unsigned char* p = reinterpret_cast<const unsigned char*>(dlsym(libc, api));
-      if (p) {
-        if (p[0] == 0xCC || p[0] == 0xE9 || (p[0] == 0xFF && p[1] == 0x25)) {
-          return true;
-        }
-      }
-    }
-  }
-#endif
-
-  // 3. Scan /proc/self/maps for injected hooking frameworks or abnormal RWX memory segments
-  std::ifstream maps("/proc/self/maps");
-  std::string line;
-  while (maps && std::getline(maps, line)) {
-    // Detect suspicious injected hooking frameworks (Frida, Substrate, Cydia, etc.)
-    static const char* const kSuspiciousLibs[] = {
-        "frida", "gadget", "substrate", "substitute", "cycript", "xposed", "libmem"
-    };
-    for (const char* susp : kSuspiciousLibs) {
-      if (line.find(susp) != std::string::npos) {
-        return true;
-      }
-    }
-
-    // Detect abnormal RWX (read-write-executable) memory segments indicative of hook stubs
-    if (line.size() > 20) {
-      auto perm_start = line.find(' ');
-      if (perm_start != std::string::npos && perm_start + 4 < line.size()) {
-        std::string perms = line.substr(perm_start + 1, 4);
-        if (perms.size() >= 3 && perms[0] == 'r' && perms[1] == 'w' && perms[2] == 'x') {
-          // Exclude stack / vsyscall if present
-          if (line.find("[stack") == std::string::npos) {
-            return true;
-          }
-        }
-      }
-    }
-  }
-
-  // 4. Detect active LD_PRELOAD injection
-  const char* ld_preload = std::getenv("LD_PRELOAD");
-  if (ld_preload && ld_preload[0] != '\0') {
-    return true;
-  }
-#endif
   return false;
 }
 

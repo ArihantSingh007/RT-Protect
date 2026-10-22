@@ -13,13 +13,7 @@
 #include "tooling/file_io.h"
 #include "tooling/simple_json.h"
 
-#if defined(_WIN32)
 #include <windows.h>
-#else
-#include <sys/types.h>
-#include <sys/wait.h>
-#include <unistd.h>
-#endif
 
 namespace fs = std::filesystem;
 
@@ -41,7 +35,6 @@ std::string NormalizePath(const std::string& p) {
 bool RunProcessCaptureOutput(const std::string& exe,
                              const std::vector<std::string>& args,
                              std::string* out_stdout) {
-#if defined(_WIN32)
   // Build properly MSVC-escaped command line using standard backslash/quote rules
   std::string cmd_line = "\"" + exe + "\"";
   for (const auto& a : args) {
@@ -141,49 +134,6 @@ bool RunProcessCaptureOutput(const std::string& exe,
 
   if (out_stdout) *out_stdout = std::move(output);
   return (exit_code == 0);
-#else
-  // POSIX: pipe() + fork() + execvp() -- NEVER invoke /bin/sh or popen()
-  int pipefd[2];
-  if (pipe(pipefd) < 0) return false;
-
-  pid_t pid = fork();
-  if (pid < 0) {
-    close(pipefd[0]);
-    close(pipefd[1]);
-    return false;
-  }
-
-  if (pid == 0) {
-    close(pipefd[0]);
-    dup2(pipefd[1], STDOUT_FILENO);
-    dup2(pipefd[1], STDERR_FILENO);
-    close(pipefd[1]);
-
-    std::vector<char*> argv_ptrs;
-    argv_ptrs.push_back(const_cast<char*>(exe.c_str()));
-    for (const auto& a : args) {
-      argv_ptrs.push_back(const_cast<char*>(a.c_str()));
-    }
-    argv_ptrs.push_back(nullptr);
-
-    execvp(exe.c_str(), argv_ptrs.data());
-    _exit(127);
-  }
-
-  close(pipefd[1]);
-  std::string output;
-  char buf[4096];
-  ssize_t bytes = 0;
-  while ((bytes = read(pipefd[0], buf, sizeof(buf))) > 0) {
-    output.append(buf, static_cast<std::size_t>(bytes));
-  }
-  close(pipefd[0]);
-
-  int status = 0;
-  waitpid(pid, &status, 0);
-  if (out_stdout) *out_stdout = std::move(output);
-  return (WIFEXITED(status) && WEXITSTATUS(status) == 0);
-#endif
 }
 
 }  // namespace
@@ -286,40 +236,23 @@ bool ClangAstScanner::IsAvailable() {
 }
 
 std::string ClangAstScanner::GetClangBinaryPath() {
-#if defined(_WIN32)
   static const char* const kKnownPaths[] = {
       "C:\\Program Files\\LLVM\\bin\\clang.exe",
       "C:\\msys64\\mingw64\\bin\\clang.exe",
       "C:\\msys64\\ucrt64\\bin\\clang.exe"
   };
-#else
-  static const char* const kKnownPaths[] = {
-      "/usr/bin/clang",
-      "/usr/local/bin/clang",
-      "/usr/lib/llvm-18/bin/clang",
-      "/usr/lib/llvm-17/bin/clang",
-      "/usr/lib/llvm-16/bin/clang",
-      "/usr/lib/llvm-15/bin/clang",
-      "/usr/lib/llvm-14/bin/clang"
-  };
-#endif
 
   std::error_code ec;
   for (const char* path : kKnownPaths) {
     if (fs::exists(path, ec) && !fs::is_directory(path, ec)) return path;
   }
 
-  // Search system PATH environment variable portably
+  // Search system PATH environment variable
   const char* env_path = std::getenv("PATH");
   if (env_path) {
     std::string path_str(env_path);
-#if defined(_WIN32)
     char delimiter = ';';
     std::string binary_name = "clang.exe";
-#else
-    char delimiter = ':';
-    std::string binary_name = "clang";
-#endif
     std::size_t start = 0;
     while (start < path_str.size()) {
       auto end = path_str.find(delimiter, start);
@@ -335,7 +268,6 @@ std::string ClangAstScanner::GetClangBinaryPath() {
     }
   }
 
-#if defined(_WIN32)
   // Win32 where.exe fallback without shell interpolation
   std::string out;
   if (RunProcessCaptureOutput("where.exe", { "clang.exe" }, &out) && !out.empty()) {
@@ -344,7 +276,6 @@ std::string ClangAstScanner::GetClangBinaryPath() {
     while (!out.empty() && (out.back() == '\r' || out.back() == ' ')) out.pop_back();
     if (fs::exists(out, ec) && !fs::is_directory(out, ec)) return out;
   }
-#endif
 
   return "";
 }

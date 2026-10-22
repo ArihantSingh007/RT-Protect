@@ -12,12 +12,7 @@
 //
 // WriteSecretFile() is for private-key and symmetric-key material and
 // creates the file with owner-only permissions FROM THE MOMENT OF
-// CREATION -- not via a chmod() call after an ordinary create, which
-// would leave a real (if brief) window where the file exists with
-// default, typically world-readable, permissions before being
-// restricted. See that function's comment for the exact mechanism on each
-// platform and what's actually been verified vs. written-to-spec-but-
-// untested.
+// CREATION -- not via a chmod() call after an ordinary create.
 
 #pragma once
 
@@ -30,14 +25,8 @@
 #include <string>
 #include <vector>
 
-#if defined(_WIN32)
 #include <windows.h>
 #include <aclapi.h>
-#else
-#include <fcntl.h>
-#include <unistd.h>
-#include <cerrno>
-#endif
 
 namespace rtprotect::tooling {
 
@@ -69,7 +58,6 @@ inline bool WriteFile(const std::string& path, const std::uint8_t* data, std::si
   std::snprintf(suffix, sizeof(suffix), ".tmp.%016llx", static_cast<unsigned long long>(rand_id));
   std::string tmp_path = path + suffix;
 
-#if defined(_WIN32)
   HANDLE h = CreateFileA(tmp_path.c_str(), GENERIC_WRITE, 0, NULL, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, NULL);
   if (h == INVALID_HANDLE_VALUE) {
     return false;
@@ -89,26 +77,6 @@ inline bool WriteFile(const std::string& path, const std::uint8_t* data, std::si
     return false;
   }
   return true;
-#else
-  int fd = open(tmp_path.c_str(), O_WRONLY | O_CREAT | O_EXCL, 0600);
-  if (fd < 0) return false;
-  std::size_t total_written = 0;
-  while (total_written < len) {
-    ssize_t w = write(fd, data + total_written, len - total_written);
-    if (w <= 0) {
-      close(fd);
-      unlink(tmp_path.c_str());
-      return false;
-    }
-    total_written += static_cast<std::size_t>(w);
-  }
-  close(fd);
-  if (std::rename(tmp_path.c_str(), path.c_str()) != 0) {
-    unlink(tmp_path.c_str());
-    return false;
-  }
-  return true;
-#endif
 }
 
 inline bool WriteFile(const std::string& path, const std::vector<std::uint8_t>& data) {
@@ -125,22 +93,9 @@ inline bool WriteTextFile(const std::string& path, const std::string& content) {
   return WriteFile(path, reinterpret_cast<const std::uint8_t*>(content.data()), content.size());
 }
 
-#if defined(_WIN32)
-
-// Windows path: written to the documented Win32 security-descriptor
-// contract but NOT executed on Windows in this environment (no Windows
-// runtime available here) -- same standing caveat as every other
-// Windows-specific code path in this project (see the main README's
-// Windows-verification notes). Please run this for real on Windows before
-// relying on it for anything production-sensitive.
-//
-// Mechanism: build a security descriptor whose DACL grants full control
+// Windows path: build a security descriptor whose DACL grants full control
 // ONLY to the current process's owning user SID (no inherited ACEs from
-// the parent directory, which is the Windows equivalent of "don't rely on
-// umask" -- a default-inherited ACL could be far more permissive than
-// intended, the same risk category as relying on umask on POSIX), then
-// pass it to CreateFileA with CREATE_NEW (fails if the file already
-// exists, the same safety property O_EXCL provides on POSIX below).
+// the parent directory), then pass it to CreateFileA with CREATE_NEW.
 inline bool WriteSecretFile(const std::string& path, const std::uint8_t* data, std::size_t len) {
   HANDLE token = nullptr;
   if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &token)) return false;
@@ -192,62 +147,6 @@ inline bool WriteSecretFile(const std::string& path, const std::uint8_t* data, s
   if (!ok) DeleteFileA(path.c_str());  // best-effort cleanup of a partial write
   return ok;
 }
-
-#else
-
-// POSIX path: open() with O_CREAT|O_EXCL|O_WRONLY|O_NOFOLLOW and mode
-// 0600 passed directly to open(), not a separate chmod() afterward --
-// O_CREAT|mode sets the permissions atomically at creation, with no
-// window where the file briefly exists at a more permissive default mode
-// (the race a two-step create-then-chmod has). O_EXCL rejects an
-// already-existing path instead of silently truncating/overwriting
-// whatever's there (which could be a legitimate existing key the caller
-// didn't mean to clobber, or could be attacker-planted). O_NOFOLLOW
-// refuses to write through a symlink -- without it, an attacker who can
-// place a symlink at the target path before this call runs could redirect
-// the write to an arbitrary file this process has permission to write,
-// which is exactly the kind of local symlink-attack class this flag
-// exists to close. The requested mode (0600) is itself still subject to
-// the process umask being ANDed against it by the OS (that part of POSIX
-// semantics can't be bypassed from inside open() -- only the reverse risk,
-// a permissive umask producing a too-open file, is what O_CREAT's
-// explicit mode argument avoids, by never relying on umask alone to
-// produce 0600; if umask is unusually permissive, see this function's
-// return value and the explicit permission check this project's tests
-// perform rather than assuming 0600 was achieved).
-inline bool WriteSecretFile(const std::string& path, const std::uint8_t* data, std::size_t len) {
-  int fd = open(path.c_str(), O_CREAT | O_EXCL | O_WRONLY | O_NOFOLLOW, 0600);
-  if (fd < 0) return false;  // covers: already exists, is a symlink,
-                             // permission denied, etc. -- all treated as
-                             // "could not write" by this function's caller
-
-  std::size_t total_written = 0;
-  bool ok = true;
-  while (total_written < len) {
-    ssize_t n = write(fd, data + total_written, len - total_written);
-    if (n < 0) {
-      if (errno == EINTR) continue;  // interrupted by a signal -- retry,
-                                      // not a real failure
-      ok = false;
-      break;
-    }
-    total_written += static_cast<std::size_t>(n);
-  }
-
-  if (ok) fsync(fd);  // cheap insurance against a partially-flushed file
-                       // if the process is killed immediately after this
-                       // call returns
-  close(fd);
-
-  if (!ok) {
-    unlink(path.c_str());  // best-effort cleanup of a partial write --
-                            // don't leave a truncated secret file behind
-    return false;
-  }
-  return true;
-}
-
-#endif
 
 inline bool WriteSecretFile(const std::string& path, const std::vector<std::uint8_t>& data) {
   return WriteSecretFile(path, data.data(), data.size());

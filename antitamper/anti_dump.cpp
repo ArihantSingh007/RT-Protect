@@ -1,4 +1,9 @@
 // antitamper/anti_dump.cpp
+//
+// Windows Anti-Memory Dumping & PE Header Stripping Subsystem.
+// Implements active detection of user-mode memory dumpers (dbghelp, procdump, scylla, cheatengine),
+// dynamic API hook verification on memory query routines, in-memory DOS/NT PE header erasure,
+// and hardware-enforced ephemeral payload execution via VirtualAlloc/VirtualProtect.
 
 #include "antitamper/anti_dump.h"
 #include "antitamper/dynamic_import.h"
@@ -6,22 +11,13 @@
 #include <algorithm>
 #include <cstring>
 #include <vector>
+#include <windows.h>
 
 #include <openssl/crypto.h>
-
-#if defined(_WIN32)
-#include <windows.h>
-#else
-#include <fstream>
-#include <string>
-#include <sys/mman.h>
-#include <unistd.h>
-#endif
 
 namespace rtprotect::antitamper {
 
 bool DetectMemoryDumper() {
-#if defined(_WIN32)
   // 1. Detect dbghelp.dll which is required for MiniDumpWriteDump
   void* dbghelp_base = GetLoadedModuleBaseByHash(kHashDbgHelp);
   if (dbghelp_base != nullptr) {
@@ -44,26 +40,9 @@ bool DetectMemoryDumper() {
   }
 
   return false;
-#else
-  // Linux: inspect /proc/self/maps for dumper frameworks
-  std::ifstream maps("/proc/self/maps");
-  std::string line;
-  while (maps && std::getline(maps, line)) {
-    static const char* const kDumperKeywords[] = {
-        "scylla", "procdump", "gcore", "cheatengine"
-    };
-    for (const char* kw : kDumperKeywords) {
-      if (line.find(kw) != std::string::npos) {
-        return true;
-      }
-    }
-  }
-  return false;
-#endif
 }
 
 bool DetectMemoryProbing() {
-#if defined(_WIN32)
   // Resolve VirtualQuery export via dynamic hashed lookup to inspect hook status
   auto pVirtualQuery = ResolveApi<const unsigned char*>(kHashKernel32, kHashVirtualQuery);
   if (!pVirtualQuery) {
@@ -84,13 +63,9 @@ bool DetectMemoryProbing() {
   }
 
   return false;
-#else
-  return false;
-#endif
 }
 
 bool EraseProcessHeaders() {
-#if defined(_WIN32)
   auto* base = reinterpret_cast<std::uint8_t*>(::GetModuleHandleA(nullptr));
   if (!base) return false;
 
@@ -122,9 +97,6 @@ bool EraseProcessHeaders() {
   // Set to PAGE_READONLY or PAGE_NOACCESS to prevent dumping
   fnVirtualProtect(base, kHeaderPageSize, PAGE_READONLY, &old_prot);
   return true;
-#else
-  return true;
-#endif
 }
 
 EphemeralExecutionGuard::EphemeralExecutionGuard() = default;
@@ -152,7 +124,6 @@ EphemeralExecutionGuard& EphemeralExecutionGuard::operator=(EphemeralExecutionGu
 
 void EphemeralExecutionGuard::Cleanup() {
   if (memory_ && allocated_size_ > 0) {
-#if defined(_WIN32)
     DWORD old_prot = 0;
     typedef BOOL (WINAPI *pfnVirtualProtect)(LPVOID, SIZE_T, DWORD, PDWORD);
     typedef BOOL (WINAPI *pfnVirtualFree)(LPVOID, SIZE_T, DWORD);
@@ -169,11 +140,6 @@ void EphemeralExecutionGuard::Cleanup() {
     } else {
       ::VirtualFree(memory_, 0, MEM_RELEASE);
     }
-#else
-    mprotect(memory_, allocated_size_, PROT_READ | PROT_WRITE);
-    OPENSSL_cleanse(memory_, allocated_size_);
-    munmap(memory_, allocated_size_);
-#endif
     memory_ = nullptr;
     allocated_size_ = 0;
   }
@@ -189,7 +155,6 @@ bool EphemeralExecutionGuard::ExecuteEphemeral(const std::uint8_t* code_bytes,
 
   Cleanup();
 
-#if defined(_WIN32)
   typedef LPVOID (WINAPI *pfnVirtualAlloc)(LPVOID, SIZE_T, DWORD, DWORD);
   typedef BOOL (WINAPI *pfnVirtualProtect)(LPVOID, SIZE_T, DWORD, PDWORD);
   typedef BOOL (WINAPI *pfnFlushInstructionCache)(HANDLE, LPCVOID, SIZE_T);
@@ -232,34 +197,6 @@ bool EphemeralExecutionGuard::ExecuteEphemeral(const std::uint8_t* code_bytes,
   // Immediately wipe and release ephemeral memory upon completion
   Cleanup();
   return true;
-
-#else
-  std::size_t page_size = static_cast<std::size_t>(sysconf(_SC_PAGESIZE));
-  std::size_t alloc_size = (code_size + page_size - 1) & ~(page_size - 1);
-
-  void* mem = mmap(nullptr, alloc_size, PROT_READ | PROT_WRITE,
-                   MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-  if (mem == MAP_FAILED) {
-    return false;
-  }
-
-  memory_ = mem;
-  allocated_size_ = alloc_size;
-
-  std::memcpy(memory_, code_bytes, code_size);
-
-  if (mprotect(memory_, allocated_size_, PROT_READ | PROT_EXEC) != 0) {
-    Cleanup();
-    return false;
-  }
-
-  typedef std::int64_t (*PayloadFunc)(std::int64_t);
-  auto func = reinterpret_cast<PayloadFunc>(memory_);
-  *out_result = func(arg);
-
-  Cleanup();
-  return true;
-#endif
 }
 
 }  // namespace rtprotect::antitamper

@@ -1122,7 +1122,7 @@ void TestIntegration_OnlineActivationPipeline_EndToEndRoundTrip() {
   assert(net_token->license_id == "lic-online-e2e-100");
   assert(net_token->vm_root == canonical_vm_root); // Critical: Server issued the exact canonical vm_root!
 
-  // Save the server-issued token into OS SecureStorage (Windows DPAPI / Keychain / Secret Service)
+  // Save the server-issued token into OS SecureStorage (Windows DPAPI)
   assert(licensing::SaveActivationToken("com.vendor.e2eapp", *net_token));
 
   // Verify that subsequent retrieval from local SecureStorage loads the exact same token

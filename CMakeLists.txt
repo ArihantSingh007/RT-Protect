@@ -1,6 +1,10 @@
 cmake_minimum_required(VERSION 3.20)
 project(rtprotect LANGUAGES CXX)
 
+if(NOT WIN32)
+  message(FATAL_ERROR "RTProtect is supported exclusively on Windows platforms.")
+endif()
+
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
@@ -22,12 +26,13 @@ option(RTPROTECT_ENABLE_EXPERIMENTAL_RUNTIME_RECONSTRUCTION
 # ---------------------------------------------------------------------------
 # Toolchain notes
 #
-# Primary target toolchain: MSVC (Visual Studio 2022), Windows 10/11 x64.
-# This CMakeLists also builds cleanly on Linux/GCC/Clang so the cryptographic
-# core can be developed and unit-tested in CI without a Windows machine.
-# Nothing in this project is Windows-specific yet; no module has introduced
-# Win32-specific code behind #ifdef _WIN32 (none has needed to).
+# Target platform: Windows 10/11 x64 (MSVC Visual Studio 2022 or MinGW-W64).
+# RTProtect is built exclusively for Windows environments.
 # ---------------------------------------------------------------------------
+
+if(NOT DEFINED OPENSSL_ROOT_DIR AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/third_party/openssl")
+  set(OPENSSL_ROOT_DIR "${CMAKE_CURRENT_SOURCE_DIR}/third_party/openssl")
+endif()
 
 find_package(OpenSSL 3.0 REQUIRED COMPONENTS Crypto SSL)
 
@@ -76,12 +81,7 @@ if(MSVC)
 else()
   add_compile_options(-Wall -Wextra -Wpedantic -fstack-protector-strong)
   # Position-independent executable: required for ASLR to randomize the
-  # main executable's own load address on Linux (shared libraries are
-  # already relocatable; the main binary isn't, by default, unless built
-  # as a PIE). Most modern distro toolchains default this on already, but
-  # -- same reasoning as the MSVC linker flags above -- set explicitly so
-  # it's a documented, audited property of this build rather than an
-  # assumed distro default.
+  # main executable's own load address (MinGW / Clang on Windows).
   add_compile_options(-fPIE)
   add_link_options(-pie)
   if(RTPROTECT_HARDEN_RELEASE)

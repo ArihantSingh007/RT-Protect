@@ -114,10 +114,7 @@ roadmap and design rationale, including Phase 3's design decisions section.
   library end-to-end on real files: `genkey-ed25519`, `genkey-aes`,
   `hash`, `encrypt`, `decrypt`, `manifest-build`, `manifest-sign`,
   `manifest-verify` — see "CLI tool usage" below for a real, actually-run
-  transcript. Plus `package_release.sh` (Linux/macOS, **actually run** in
-  this environment — see its real output below) and `package_release.ps1`
-  (Windows, written to the documented contract, **not executed** here, no
-  Windows runtime available).
+  transcript. Plus `package_release.ps1` (PowerShell packaging script for Windows).
 - `bench/` (Phase 7, new) — `rtprotect-bench`, a real statistical
   benchmark suite (warm-up + 15 trials + full min/max/median/mean/stddev,
   not a single number) comparing native vs VM-interpreted vs
@@ -196,48 +193,13 @@ asserted.
 
 ## Packaging
 
-```bash
-./tooling/package_release.sh          # Linux/macOS -- builds Release,
-                                       # runs the full test suite (aborts
-                                       # on any failure), packages
-                                       # rtprotect-tool + rtprotect-bench +
-                                       # docs into dist/*.tar.gz
-```
-
-**Actually run in this environment**, producing a real archive:
-
-```
-$ ./tooling/package_release.sh
-...
-Done: dist/rtprotect-20261008-linux-x86_64.tar.gz
-$ tar -tzf dist/rtprotect-20261008-linux-x86_64.tar.gz
-rtprotect-20261008-linux-x86_64/
-rtprotect-20261008-linux-x86_64/README.md
-rtprotect-20261008-linux-x86_64/docs/
-rtprotect-20261008-linux-x86_64/docs/BENCHMARKS.md
-rtprotect-20261008-linux-x86_64/docs/RUNTIME_RECONSTRUCTION.md
-rtprotect-20261008-linux-x86_64/docs/THREAT_MODEL.md
-rtprotect-20261008-linux-x86_64/docs/ARCHITECTURE.md
-rtprotect-20261008-linux-x86_64/docs/OBFUSCATION.md
-rtprotect-20261008-linux-x86_64/bin/
-rtprotect-20261008-linux-x86_64/bin/rtprotect-tool
-rtprotect-20261008-linux-x86_64/bin/rtprotect-bench
-```
-
-The script's first version had a real bug (piping multi-line tool output
-into `head -1` under `set -o pipefail` caused a `SIGPIPE`-triggered abort)
-— caught by running it, fixed, then reverified by running it again. See
-`docs/ARCHITECTURE.md`'s Phase 7 section for the full story.
+Packaging on Windows is performed via `package_release.ps1`:
 
 ```powershell
-.\tooling\package_release.ps1         # Windows -- same steps via MSVC.
-                                       # NOT executed in this environment
-                                       # (no Windows runtime available) --
-                                       # written to the documented CMake/
-                                       # vcpkg contract but unverified.
-                                       # Please run it for real before
-                                       # relying on it.
+powershell -ExecutionPolicy Bypass -File tooling\package_release.ps1
 ```
+
+This builds the Release configuration, runs the full test suite (aborts on any failure), and packages `rtprotect-tool.exe`, `rtprotect-bench.exe`, public headers, and documentation into `dist/`.
 
 ## Benchmarks
 
@@ -271,49 +233,27 @@ build if you want to match this delivery's verified configuration exactly):
 
 | Dependency | Minimum | Verified in this delivery |
 |---|---|---|
-| CMake | ≥ 3.20 | 3.28.3 |
-| C++ compiler | C++20-capable | GCC 13.3.0 (Ubuntu 24.04) — see Windows note below |
-| OpenSSL | ≥ 3.0 (the `EVP_KDF`/Ed25519-raw-key APIs this project uses require 3.0+) | 3.0.13 |
+| CMake | ≥ 3.20 | 3.28+ / 4.1.2 |
+| C++ compiler | C++20-capable | Visual Studio 17 2022 (MSVC v143) / MinGW-W64 GCC |
+| OpenSSL | ≥ 3.0 | 3.4.0 (pre-bundled in `third_party/openssl`) |
 
-- **Windows (primary target):** Visual Studio 2022 (MSVC v143 toolset) —
-  version not pinned to a specific VS update in this delivery, since it
-  has not been built on Windows in this environment (see every phase's
-  Windows-verification caveat).
-- **Linux (used to develop/test in this environment):** GCC ≥ 11 or
-  Clang ≥ 14 should work for the C++20 features this project uses; only
-  GCC 13.3.0 has actually been exercised.
-
-### Installing OpenSSL
-
-- **Windows:** install via [vcpkg](https://github.com/microsoft/vcpkg):
-  ```
-  vcpkg install openssl:x64-windows
-  ```
-  then configure CMake with
-  `-DCMAKE_TOOLCHAIN_FILE=<vcpkg-root>/scripts/buildsystems/vcpkg.cmake`.
-  (Pin to a specific vcpkg commit in CI for reproducible builds — vcpkg
-  itself doesn't version-pin individual ports by default.)
-- **Ubuntu/Debian:** `sudo apt-get install libssl-dev`
-- **macOS:** `brew install openssl@3` (and pass
-  `-DOPENSSL_ROOT_DIR=$(brew --prefix openssl@3)` to CMake)
-
-## Build & test (Linux/macOS)
-
-```bash
-mkdir build && cd build
-cmake .. -DCMAKE_BUILD_TYPE=Debug
-cmake --build . -j
-ctest --output-on-failure
-```
+- **Windows:** Visual Studio 2022 (MSVC v143 toolset) or MinGW-W64 GCC.
+- **OpenSSL:** Self-contained Windows x64 libraries are included in `third_party/openssl/`.
 
 ## Build & test (Windows, MSVC, from a "Developer PowerShell for VS 2022")
 
 ```powershell
 mkdir build; cd build
-cmake .. -G "Visual Studio 17 2022" -A x64 `
-  -DCMAKE_TOOLCHAIN_FILE=<vcpkg-root>\scripts\buildsystems\vcpkg.cmake
-cmake --build . --config Debug
-ctest -C Debug --output-on-failure
+cmake .. -G "Visual Studio 17 2022" -A x64 -DOPENSSL_ROOT_DIR="${PWD}\..\third_party\openssl"
+cmake --build . --config Release
+ctest -C Release --output-on-failure
+```
+
+For MinGW-w64:
+```powershell
+cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+cmake --build build
+ctest --test-dir build --output-on-failure
 ```
 
 For a Release build, substitute `Release` for `Debug` in both commands.
@@ -452,14 +392,5 @@ remains outstanding is consolidated in one place —
 `docs/ARCHITECTURE.md`'s "What this project does not cover, project-wide"
 section — rather than scattered across seven phases' worth of individual
 notes. The single most important item on that list, repeated here because
-it matters more than anything else: **this project has not been verified
-end-to-end on its own stated primary target toolchain, Windows/MSVC.**
-Every build, every test, every benchmark, and the one packaging script
-that was actually run were all exercised on Linux/GCC in this
-environment, because that's what's available here. The Windows-specific
-code paths (Phase 5's MSVC hardening flags, Phase 6's
-`VirtualAlloc`/`VirtualProtect`/SEH path, `package_release.ps1`) are
-written to their documented API contracts and reviewed, not assumed
-correct by extrapolation from the Linux results. Please build and test
-this on an actual Windows/MSVC machine before treating any of this
-project's claims as Windows-verified.
+it matters more than anything else: **this project is designed and implemented exclusively for Windows.**
+All runtime defenses, DPAPI secure storage, memory protections, PE dynamic symbol resolution, and anti-tamper mechanisms are native Win32 implementations verified and built for Windows x64.

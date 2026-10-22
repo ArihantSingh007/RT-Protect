@@ -6,18 +6,12 @@
 #include <cstring>
 #include <string>
 
-#if defined(_WIN32)
 #include <windows.h>
 #if defined(_MSC_VER)
 #include <intrin.h>
 #endif
-#else
-#include <dlfcn.h>
-#endif
 
 namespace rtprotect::antitamper {
-
-#if defined(_WIN32)
 
 namespace {
 
@@ -182,39 +176,5 @@ void* ResolveExportByHash(std::uint32_t module_hash, std::uint32_t function_hash
   }
   return ResolveExportByHash(mod_base, function_hash);
 }
-
-#else
-
-// POSIX / Linux Fallback: uses dlsym table matching to achieve identical security contract
-void* GetLoadedModuleBaseByHash(std::uint32_t module_hash) {
-  (void)module_hash;
-  return dlopen(nullptr, RTLD_NOW);
-}
-
-void* ResolveExportByHash(void* module_base, std::uint32_t function_hash) {
-  (void)module_base;
-  // Fallback table of hashed exports for test/POSIX compatibility
-  static const struct {
-    std::uint32_t hash;
-    const char* name;
-  } kKnownTable[] = {
-      {kHashIsDebuggerPresent, "IsDebuggerPresent"},
-      {kHashVirtualProtect, "mprotect"},
-  };
-
-  for (const auto& item : kKnownTable) {
-    if (item.hash == function_hash) {
-      return dlsym(RTLD_DEFAULT, item.name);
-    }
-  }
-  return nullptr;
-}
-
-void* ResolveExportByHash(std::uint32_t module_hash, std::uint32_t function_hash) {
-  (void)module_hash;
-  return ResolveExportByHash(nullptr, function_hash);
-}
-
-#endif
 
 }  // namespace rtprotect::antitamper

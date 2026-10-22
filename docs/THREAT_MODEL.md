@@ -1,7 +1,7 @@
 # RTProtect Comprehensive Threat Model & Security Posture
 
 **Document Version:** 2.0.0  
-**Target Systems:** Windows 10/11 x64 (Primary), Linux x86-64 (Cross-platform Core)  
+**Target Systems:** Windows 10/11 x64 (Exclusively Windows)  
 **Security Reference:** Commercial Protection Architectures (Denuvo-style Layered Defense-in-Depth)  
 
 ---

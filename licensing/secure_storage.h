@@ -1,9 +1,8 @@
 // licensing/secure_storage.h
 //
-// Platform-native secure storage for sensitive cryptographic credentials and activation tokens.
-// Uses Windows DPAPI (CryptProtectData/CryptUnprotectData) on Windows,
-// macOS Keychain Services on Apple platforms, libsecret on desktop Linux,
-// and hardware-bound AEAD authenticated encryption as headless/container fallback.
+// Platform-native Windows secure storage for sensitive cryptographic credentials and activation tokens.
+// Uses Windows DPAPI (CryptProtectData/CryptUnprotectData) bound to current user logon credentials,
+// and hardware-bound AEAD authenticated encryption as fallback.
 
 #pragma once
 
@@ -16,9 +15,7 @@ namespace rtprotect::licensing {
 
 enum class SecureStorageBackend : std::uint8_t {
   kWindowsDpapi = 1,
-  kMacKeychain = 2,
-  kLinuxLibsecret = 3,
-  kFallbackHwBoundEncryptedFile = 4
+  kFallbackHwBoundEncryptedFile = 2
 };
 
 class SecureStorage {
@@ -34,7 +31,7 @@ class SecureStorage {
   static std::optional<std::vector<std::uint8_t>> Load(const std::string& key_name);
 
   // Deletes the stored credential/file for key_name.
-  // Returns true if removed (or already absent), false on filesystem/vault error.
+  // Returns true if removed (or already absent), false on filesystem error.
   static bool Delete(const std::string& key_name);
 
   // Returns the active secure storage backend on this platform/environment.
