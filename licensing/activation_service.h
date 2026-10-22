@@ -71,8 +71,8 @@ class ActivationService {
                     const integrity::Ed25519PublicKey& verification_key);
 
   // In-process business logic
-  ActivateResponse ProcessActivate(const ActivateRequest& req, std::uint64_t current_time = 0);
-  RenewResponse ProcessRenew(const RenewRequest& req, std::uint64_t current_time = 0);
+  ActivateResponse ProcessActivate(const ActivateRequest& req, std::uint64_t current_time = 0, bool check_rate_limit = true);
+  RenewResponse ProcessRenew(const RenewRequest& req, std::uint64_t current_time = 0, bool check_rate_limit = true);
   DeactivateResponse ProcessDeactivate(const DeactivateRequest& req, std::uint64_t current_time = 0);
 
   // JSON REST handlers (for HTTP daemon)
@@ -92,12 +92,16 @@ class ActivationService {
 
   const integrity::Ed25519PublicKey& public_key() const { return verification_key_; }
   RateLimiter& license_rate_limiter() { return license_rate_limiter_; }
+  const RateLimiter& license_rate_limiter() const { return license_rate_limiter_; }
+  RateLimiter& ip_rate_limiter() { return ip_rate_limiter_; }
+  const RateLimiter& ip_rate_limiter() const { return ip_rate_limiter_; }
 
  private:
   ActivationDatabase& db_;
   integrity::Ed25519PrivateKey signing_key_;
   integrity::Ed25519PublicKey verification_key_;
   RateLimiter license_rate_limiter_{1.0, 10.0}; // 1 req/sec, burst 10 requests per license
+  RateLimiter ip_rate_limiter_{5.0, 20.0};      // 5 req/sec, burst 20 requests per IP
 };
 
 }  // namespace rtprotect::licensing

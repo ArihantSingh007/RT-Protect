@@ -48,6 +48,7 @@ void PrintUsage() {
             << "  --tls-cert <path>              TLS server certificate PEM file\n"
             << "  --tls-key <path>               TLS server private key PEM file\n"
             << "  --insecure-dev-only            Allow non-loopback binding without TLS (insecure)\n"
+            << "  --admin-token <token>          Shared secret token for administrative /events endpoint\n"
             << "  --register-license <id> <prod> <seats> [vm_root_hex]\n"
             << "                                 Register a license and exit\n"
             << "  --revoke-license <id>          Revoke a license and exit\n"
@@ -84,6 +85,7 @@ int main(int argc, char* argv[]) {
   std::string key_path;
   std::string tls_cert_path;
   std::string tls_key_path;
+  std::string admin_token;
   bool insecure_dev_only = false;
 
   std::string reg_lic_id;
@@ -115,6 +117,8 @@ int main(int argc, char* argv[]) {
       tls_key_path = argv[++i];
     } else if (arg == "--insecure-dev-only") {
       insecure_dev_only = true;
+    } else if (arg == "--admin-token" && i + 1 < argc) {
+      admin_token = argv[++i];
     } else if (arg == "--register-license" && i + 3 < argc) {
       reg_lic_id = argv[++i];
       reg_prod_id = argv[++i];
@@ -220,6 +224,9 @@ int main(int argc, char* argv[]) {
   ActivationService service(db, std::move(key_pair->private_key), key_pair->public_key);
   ActivationServerHttp server(service);
   server.SetAllowInsecureNonLoopback(insecure_dev_only);
+  if (!admin_token.empty()) {
+    server.SetAdminAuthToken(admin_token);
+  }
 
   if (!tls_cert_path.empty() || !tls_key_path.empty()) {
     if (tls_cert_path.empty() || tls_key_path.empty()) {
@@ -249,7 +256,8 @@ int main(int argc, char* argv[]) {
   std::signal(SIGTERM, SignalHandler);
 
   std::cout << "RTProtect Activation Server running at " << server.base_url() << "\n"
-            << "Public Key: " << BytesToHex(key_pair->public_key.data(), key_pair->public_key.size()) << "\n"
+            << "Public Key:  " << BytesToHex(key_pair->public_key.data(), key_pair->public_key.size()) << "\n"
+            << "Admin Token: " << server.admin_auth_token() << "\n"
             << "Press Ctrl+C to terminate.\n";
 
   while (!g_stop_requested.load()) {

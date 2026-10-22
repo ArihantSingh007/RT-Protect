@@ -11,6 +11,16 @@
 #include <filesystem>
 #include <string>
 
+#if defined(_WIN32)
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#else
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
+#include <unistd.h>
+#endif
+
 #include <openssl/rand.h>
 
 #include "crypto/aead.h"
@@ -41,6 +51,48 @@ std::string MakeTempDbPath() {
   auto now = std::chrono::system_clock::now().time_since_epoch();
   auto ts = std::chrono::duration_cast<std::chrono::microseconds>(now).count();
   return (std::filesystem::temp_directory_path() / ("test_activations_" + std::to_string(ts) + ".db")).string();
+}
+
+std::string SendRawHttpRequest(std::uint16_t port, const std::string& request) {
+#if defined(_WIN32)
+  SOCKET sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+  if (sock == INVALID_SOCKET) return "";
+#else
+  int sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+  if (sock < 0) return "";
+#endif
+
+  sockaddr_in addr{};
+  addr.sin_family = AF_INET;
+  addr.sin_port = htons(port);
+  inet_pton(AF_INET, "127.0.0.1", &addr.sin_addr);
+
+  if (connect(sock, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0) {
+#if defined(_WIN32)
+    closesocket(sock);
+#else
+    close(sock);
+#endif
+    return "";
+  }
+
+  send(sock, request.data(), static_cast<int>(request.size()), 0);
+
+  std::string response;
+  char buf[4096];
+  while (true) {
+    int bytes = recv(sock, buf, sizeof(buf), 0);
+    if (bytes <= 0) break;
+    response.append(buf, bytes);
+  }
+
+#if defined(_WIN32)
+  closesocket(sock);
+#else
+  close(sock);
+#endif
+
+  return response;
 }
 
 }  // namespace
@@ -660,6 +712,159 @@ MT_TEST(Service_AuditEvents_And_SeatChurnRisk) {
   MT_CHECK(events[1].type == ActivationEventType::kActivationSuccess);
   MT_CHECK(events[2].type == ActivationEventType::kActivationSuccess);
 
+  std::filesystem::remove(db_path, ec);
+}
+
+MT_TEST(Service_RateLimiting_HandleActivateJson_PerIpAndLicense) {
+  std::string db_path = MakeTempDbPath();
+  std::error_code ec;
+  std::filesystem::remove(db_path, ec);
+
+  auto kp = MakeKeyPair();
+  ActivationDatabase db(db_path);
+
+  LicenseRecord lic;
+  lic.license_id = "lic-json-ratelimit";
+  lic.product_id = "com.vendor.jsonrate";
+  lic.max_seats = 10;
+  lic.created_at = 1700000000;
+  lic.vm_root.fill(0x55);
+  MT_CHECK(db.RegisterLicense(lic));
+
+  ActivationService service(db, std::move(kp.private_key), kp.public_key);
+
+  // Configure IP rate limiter to burst 2, 0.1 tokens/sec
+  service.ip_rate_limiter().Configure(0.1, 2.0);
+
+  std::string body1 = "{\n"
+                      "  \"license_key\": \"lic-json-ratelimit\",\n"
+                      "  \"device_fingerprint\": \"DEV-1\",\n"
+                      "  \"product_id\": \"com.vendor.jsonrate\",\n"
+                      "  \"client_nonce\": \"0101010101010101010101010101010101010101010101010101010101010101\"\n"
+                      "}";
+
+  // Request 1 from 192.168.1.100 -> OK
+  auto resp1 = service.HandleActivateJson(body1, 1700000000, "192.168.1.100");
+  MT_CHECK(resp1.find("\"status\": \"Valid\"") != std::string::npos);
+
+  // Request 2 from 192.168.1.100 (new nonce) -> OK
+  std::string body2 = "{\n"
+                      "  \"license_key\": \"lic-json-ratelimit\",\n"
+                      "  \"device_fingerprint\": \"DEV-1\",\n"
+                      "  \"product_id\": \"com.vendor.jsonrate\",\n"
+                      "  \"client_nonce\": \"0202020202020202020202020202020202020202020202020202020202020202\"\n"
+                      "}";
+  auto resp2 = service.HandleActivateJson(body2, 1700000000, "192.168.1.100");
+  MT_CHECK(resp2.find("\"status\": \"Valid\"") != std::string::npos);
+
+  // Request 3 from 192.168.1.100 -> Rate limited by IP
+  std::string body3 = "{\n"
+                      "  \"license_key\": \"lic-json-ratelimit\",\n"
+                      "  \"device_fingerprint\": \"DEV-1\",\n"
+                      "  \"product_id\": \"com.vendor.jsonrate\",\n"
+                      "  \"client_nonce\": \"0303030303030303030303030303030303030303030303030303030303030303\"\n"
+                      "}";
+  auto resp3 = service.HandleActivateJson(body3, 1700000000, "192.168.1.100");
+  MT_CHECK(resp3.find("\"status\": \"rate_limited\"") != std::string::npos);
+  MT_CHECK(resp3.find("\"retry_after\":") != std::string::npos);
+
+  // Now test License rate limiting: request from DIFFERENT IP (192.168.1.200), configure license rate limiter to burst 1
+  service.license_rate_limiter().Configure(0.1, 1.0);
+  auto resp_lic1 = service.HandleActivateJson(body3, 1700000000, "192.168.1.200");
+  MT_CHECK(resp_lic1.find("\"status\": \"Valid\"") != std::string::npos);
+
+  std::string body4 = "{\n"
+                      "  \"license_key\": \"lic-json-ratelimit\",\n"
+                      "  \"device_fingerprint\": \"DEV-1\",\n"
+                      "  \"product_id\": \"com.vendor.jsonrate\",\n"
+                      "  \"client_nonce\": \"0404040404040404040404040404040404040404040404040404040404040404\"\n"
+                      "}";
+  auto resp_lic2 = service.HandleActivateJson(body4, 1700000000, "192.168.1.200");
+  MT_CHECK(resp_lic2.find("\"status\": \"rate_limited\"") != std::string::npos);
+  MT_CHECK(resp_lic2.find("Rate limit exceeded for license key") != std::string::npos);
+
+  std::filesystem::remove(db_path, ec);
+}
+
+MT_TEST(HttpServer_Events_AdminAuthRequired) {
+  std::string db_path = MakeTempDbPath();
+  std::error_code ec;
+  std::filesystem::remove(db_path, ec);
+
+  auto kp = MakeKeyPair();
+  ActivationDatabase db(db_path);
+  ActivationService service(db, std::move(kp.private_key), kp.public_key);
+  ActivationServerHttp server(service);
+
+  server.SetAdminAuthToken("super-secret-token-test-12345");
+  MT_CHECK(server.Start(0, "127.0.0.1"));
+  std::uint16_t port = server.port();
+
+  // 1. GET /events without auth header -> 401 Unauthorized
+  std::string req_no_auth = "GET /events HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n";
+  std::string resp_no_auth = SendRawHttpRequest(port, req_no_auth);
+  MT_CHECK(resp_no_auth.find("HTTP/1.1 401 Unauthorized") != std::string::npos);
+  MT_CHECK(resp_no_auth.find("WWW-Authenticate: Bearer") != std::string::npos);
+
+  // 2. GET /events with invalid X-Admin-Key -> 401 Unauthorized
+  std::string req_bad_key = "GET /events HTTP/1.1\r\nHost: 127.0.0.1\r\nX-Admin-Key: invalid-key\r\nConnection: close\r\n\r\n";
+  std::string resp_bad_key = SendRawHttpRequest(port, req_bad_key);
+  MT_CHECK(resp_bad_key.find("HTTP/1.1 401 Unauthorized") != std::string::npos);
+
+  // 3. GET /events with valid X-Admin-Key -> 200 OK
+  std::string req_good_key = "GET /events HTTP/1.1\r\nHost: 127.0.0.1\r\nX-Admin-Key: super-secret-token-test-12345\r\nConnection: close\r\n\r\n";
+  std::string resp_good_key = SendRawHttpRequest(port, req_good_key);
+  MT_CHECK(resp_good_key.find("HTTP/1.1 200 OK") != std::string::npos);
+  MT_CHECK(resp_good_key.find("\"events\":") != std::string::npos);
+
+  // 4. GET /events with valid Authorization: Bearer -> 200 OK
+  std::string req_bearer = "GET /events HTTP/1.1\r\nHost: 127.0.0.1\r\nAuthorization: Bearer super-secret-token-test-12345\r\nConnection: close\r\n\r\n";
+  std::string resp_bearer = SendRawHttpRequest(port, req_bearer);
+  MT_CHECK(resp_bearer.find("HTTP/1.1 200 OK") != std::string::npos);
+  MT_CHECK(resp_bearer.find("\"events\":") != std::string::npos);
+
+  server.Stop();
+  std::filesystem::remove(db_path, ec);
+}
+
+MT_TEST(HttpServer_RateLimiting_ReturnsHttp429) {
+  std::string db_path = MakeTempDbPath();
+  std::error_code ec;
+  std::filesystem::remove(db_path, ec);
+
+  auto kp = MakeKeyPair();
+  ActivationDatabase db(db_path);
+
+  LicenseRecord lic;
+  lic.license_id = "lic-http-429";
+  lic.product_id = "com.vendor.http429";
+  lic.max_seats = 10;
+  lic.created_at = 1700000000;
+  lic.vm_root.fill(0x66);
+  MT_CHECK(db.RegisterLicense(lic));
+
+  ActivationService service(db, std::move(kp.private_key), kp.public_key);
+  ActivationServerHttp server(service);
+
+  // Strict limiter: burst 1 token
+  service.license_rate_limiter().Configure(0.1, 1.0);
+
+  MT_CHECK(server.Start(0, "127.0.0.1"));
+  std::uint16_t port = server.port();
+
+  std::string body1 = "{\"license_key\":\"lic-http-429\",\"device_fingerprint\":\"D1\",\"product_id\":\"com.vendor.http429\",\"client_nonce\":\"0101010101010101010101010101010101010101010101010101010101010101\"}";
+  std::string req1 = "POST /activate HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: " + std::to_string(body1.size()) + "\r\nConnection: close\r\n\r\n" + body1;
+  std::string resp1 = SendRawHttpRequest(port, req1);
+  MT_CHECK(resp1.find("HTTP/1.1 200 OK") != std::string::npos);
+
+  std::string body2 = "{\"license_key\":\"lic-http-429\",\"device_fingerprint\":\"D1\",\"product_id\":\"com.vendor.http429\",\"client_nonce\":\"0202020202020202020202020202020202020202020202020202020202020202\"}";
+  std::string req2 = "POST /activate HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: " + std::to_string(body2.size()) + "\r\nConnection: close\r\n\r\n" + body2;
+  std::string resp2 = SendRawHttpRequest(port, req2);
+  MT_CHECK(resp2.find("HTTP/1.1 429 Too Many Requests") != std::string::npos);
+  MT_CHECK(resp2.find("Retry-After:") != std::string::npos);
+  MT_CHECK(resp2.find("\"status\": \"rate_limited\"") != std::string::npos);
+
+  server.Stop();
   std::filesystem::remove(db_path, ec);
 }
 

@@ -19,12 +19,14 @@ This project adheres to Semantic Versioning and structured security reporting.
   - *High 14:* Redesigned `OBFUSCATED_STRING` with call-site static duration storage and thread-safe initialization, preventing dangling pointer reads when assigning to `const char*` or `std::string`.
 
 - **Stage 2 — Server Abuse Protection & Audit Event Pipeline:**
+  - *RateLimiter Enforcement:* Wired `RateLimiter::Allow` directly into `ActivationService::HandleActivateJson` and `HandleRenewJson` for both client IP and license ID; throttled requests return machine-readable `"status": "rate_limited"` and `ActivationServerHttp` returns `HTTP/1.1 429 Too Many Requests` with standard `Retry-After` header.
+  - *Admin Endpoint Authentication:* Secured `GET /events` administrative telemetry endpoint with shared-secret token authentication (`X-Admin-Key` / `Authorization: Bearer <token>`) using constant-time comparison (`CRYPTO_memcmp`), defaulting to auto-generated 32-byte tokens and returning `HTTP/1.1 401 Unauthorized` with `WWW-Authenticate: Bearer` on unauthorized requests. Added `--admin-token` CLI argument to `rtprotect-activation-server`.
   - *Event Logging:* Implemented `ActivationEvent` structured audit trail (`kActivationSuccess`, `kActivationFailed`, `kSeatLimitExceeded`, `kRenewalSuccess`, `kRenewalFailed`, `kDeactivation`, `kRateLimited`, `kReplayBlocked`) persisted durably in `[events]` section.
   - *Seat Churn Analytics:* Implemented `ComputeSeatChurnRisk(license_id, window)` scoring rapid device fingerprint churn and abuse events on a rolling window.
-  - *Operational Endpoints:* Added `GET /events` administrative telemetry endpoint on `ActivationServerHttp`.
 
 - **Stage 3 — Clang AST Compiler Tooling Frontend:**
-  - *Clang AST Integration:* Implemented `ClangAstScanner` in `tooling/clang_ast_scanner.*` parsing translation units via Clang AST JSON dump (`-Xclang -ast-dump=json`).
+  - *Safe Process Execution:* Replaced shell string concatenation and `popen()` in `ClangAstScanner::AnalyzeTranslationUnit` with direct argv-array process execution (`RunProcessCaptureOutput`) using Win32 argument escaping and POSIX `pipe()` + `fork()` + `execvp()`, completely eliminating shell command injection risks from untrusted `compile_commands.json` files.
+  - *Robust JSON Parsing:* Integrated standards-compliant `JsonValue` parser (`tooling/simple_json.h`), replacing substring search heuristics and safely handling escaped characters and quotes in Clang AST dumps.
   - *Compilation Database:* Implemented `CompilationDatabase` parsing `compile_commands.json` to extract exact target compiler flags, defines, and include paths.
   - *Semantic Diagnostics:* Added `ValidateVirtualizationEligibility` verifying parameter counts, return types, and rejecting unsupported constructs (e.g. C++ exceptions, complex virtual methods) with actionable diagnostics.
 
