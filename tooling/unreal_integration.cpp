@@ -2,6 +2,7 @@
 
 #include "tooling/unreal_integration.h"
 #include "tooling/cxx_ast_scanner.h"
+#include "tooling/file_io.h"
 
 #include <algorithm>
 #include <fstream>
@@ -15,18 +16,13 @@ namespace rtprotect::tooling {
 namespace {
 
 std::string ReadFileToString(const fs::path& path) {
-  std::ifstream f(path, std::ios::binary);
-  if (!f) return {};
-  std::ostringstream ss;
-  ss << f.rdbuf();
-  return ss.str();
+  auto text = tooling::ReadTextFile(path.string());
+  if (text.has_value()) return *text;
+  return {};
 }
 
 bool WriteStringToFile(const fs::path& path, const std::string& content) {
-  std::ofstream f(path, std::ios::binary | std::ios::trunc);
-  if (!f) return false;
-  f << content;
-  return f.good();
+  return tooling::WriteTextFile(path.string(), content);
 }
 
 }  // namespace

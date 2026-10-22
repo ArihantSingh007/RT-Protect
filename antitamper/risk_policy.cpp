@@ -2,6 +2,7 @@
 
 #include "antitamper/risk_policy.h"
 #include "antitamper/anti_debug.h"
+#include "antitamper/anti_dump.h"
 #include "antitamper/env_detect.h"
 #include "crypto/kdf.h"
 #include "integrity/sha256.h"
@@ -21,6 +22,8 @@ RiskAssessment AssessEnvironmentRisk() {
   r.timing_anomaly_detected = CheckExecutionTimingAnomaly();
   r.hypervisor_detected = CheckHypervisorPresent();
   r.memory_tampered = CheckMemoryTampered();
+  r.memory_dump_detected = DetectMemoryDumper();
+  r.memory_probing_detected = DetectMemoryProbing();
   if (r.hypervisor_detected) {
     r.hypervisor_vendor = GetHypervisorVendor();
   }
@@ -36,6 +39,8 @@ RiskAssessment AssessEnvironmentRisk() {
   if (r.hardware_breakpoints_detected) score += 50;
   if (r.timing_anomaly_detected) score += 30;
   if (r.memory_tampered) score += 40;
+  if (r.memory_dump_detected) score += 40;
+  if (r.memory_probing_detected) score += 30;
   if (r.hypervisor_detected) score += 15; // Low risk by itself to avoid penalizing legitimate VMs
 
   if (score > 100) score = 100;
@@ -51,6 +56,8 @@ RiskAssessment AssessFastEnvironmentRisk() {
   r.timing_anomaly_detected = CheckExecutionTimingAnomaly();
   r.hypervisor_detected = CheckHypervisorPresent();
   r.memory_tampered = CheckMemoryTampered();
+  r.memory_dump_detected = DetectMemoryDumper();
+  r.memory_probing_detected = DetectMemoryProbing();
   if (r.hypervisor_detected) {
     r.hypervisor_vendor = GetHypervisorVendor();
   }
@@ -65,6 +72,8 @@ RiskAssessment AssessFastEnvironmentRisk() {
   if (r.hardware_breakpoints_detected) score += 50;
   if (r.timing_anomaly_detected) score += 30;
   if (r.memory_tampered) score += 40;
+  if (r.memory_dump_detected) score += 40;
+  if (r.memory_probing_detected) score += 30;
   if (r.hypervisor_detected) score += 15;
 
   if (score > 100) score = 100;
@@ -96,7 +105,9 @@ std::vector<std::uint8_t> DeriveRiskSalt(const RiskAssessment& assessment) {
                    !assessment.remote_debugger_present &&
                    !assessment.hardware_breakpoints_detected &&
                    !assessment.timing_anomaly_detected &&
-                   !assessment.memory_tampered);
+                   !assessment.memory_tampered &&
+                   !assessment.memory_dump_detected &&
+                   !assessment.memory_probing_detected);
 
   if (is_clean) {
     ss << "RTProtect-AntiTamper-Baseline-Clean-Salt-v2";
@@ -108,7 +119,9 @@ std::vector<std::uint8_t> DeriveRiskSalt(const RiskAssessment& assessment) {
        << ":rdbg=" << (assessment.remote_debugger_present ? 1 : 0)
        << ":hwbp=" << (assessment.hardware_breakpoints_detected ? 1 : 0)
        << ":time=" << (assessment.timing_anomaly_detected ? 1 : 0)
-       << ":mem=" << (assessment.memory_tampered ? 1 : 0);
+       << ":mem=" << (assessment.memory_tampered ? 1 : 0)
+       << ":dump=" << (assessment.memory_dump_detected ? 1 : 0)
+       << ":probe=" << (assessment.memory_probing_detected ? 1 : 0);
   }
 
   std::string s = ss.str();
@@ -143,7 +156,10 @@ std::uint64_t DeriveTamperPerturbation(const RiskAssessment& assessment) {
       !assessment.debugger_present &&
       !assessment.remote_debugger_present &&
       !assessment.hardware_breakpoints_detected &&
-      !assessment.timing_anomaly_detected) {
+      !assessment.timing_anomaly_detected &&
+      !assessment.memory_tampered &&
+      !assessment.memory_dump_detected &&
+      !assessment.memory_probing_detected) {
     return 0;
   }
 
@@ -161,8 +177,10 @@ void ScatterTamperCheck(const char* checkpoint_name, std::uint64_t* inout_state_
   bool mem = CheckMemoryTampered();
   bool timing = CheckExecutionTimingAnomaly();
   bool hw_bp = IsHardwareBreakpointDetected();
+  bool dumper = DetectMemoryDumper();
+  bool probing = DetectMemoryProbing();
 
-  if (dbg || mem || timing || hw_bp) {
+  if (dbg || mem || timing || hw_bp || dumper || probing) {
     // Fold non-zero poison into accumulator
     std::uint64_t poison = 0x9E3779B97F4A7C15ULL;
     if (checkpoint_name) {

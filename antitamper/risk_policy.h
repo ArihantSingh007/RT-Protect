@@ -39,6 +39,8 @@ struct RiskAssessment {
   bool hypervisor_detected = false;
   std::string hypervisor_vendor;
   bool memory_tampered = false;
+  bool memory_dump_detected = false;
+  bool memory_probing_detected = false;
 
   int risk_score = 0;  // 0 (clean) to 100 (high risk)
 
