@@ -290,28 +290,61 @@ std::string ClangAstScanner::GetClangBinaryPath() {
   static const char* const kKnownPaths[] = {
       "C:\\Program Files\\LLVM\\bin\\clang.exe",
       "C:\\msys64\\mingw64\\bin\\clang.exe",
-      "clang.exe"
+      "C:\\msys64\\ucrt64\\bin\\clang.exe"
   };
 #else
   static const char* const kKnownPaths[] = {
       "/usr/bin/clang",
       "/usr/local/bin/clang",
-      "clang"
+      "/usr/lib/llvm-18/bin/clang",
+      "/usr/lib/llvm-17/bin/clang",
+      "/usr/lib/llvm-16/bin/clang",
+      "/usr/lib/llvm-15/bin/clang",
+      "/usr/lib/llvm-14/bin/clang"
   };
 #endif
 
+  std::error_code ec;
   for (const char* path : kKnownPaths) {
-    if (fs::exists(path)) return path;
+    if (fs::exists(path, ec) && !fs::is_directory(path, ec)) return path;
   }
 
-  // Check PATH without shell expansion
+  // Search system PATH environment variable portably
+  const char* env_path = std::getenv("PATH");
+  if (env_path) {
+    std::string path_str(env_path);
+#if defined(_WIN32)
+    char delimiter = ';';
+    std::string binary_name = "clang.exe";
+#else
+    char delimiter = ':';
+    std::string binary_name = "clang";
+#endif
+    std::size_t start = 0;
+    while (start < path_str.size()) {
+      auto end = path_str.find(delimiter, start);
+      if (end == std::string::npos) end = path_str.size();
+      std::string dir = path_str.substr(start, end - start);
+      if (!dir.empty()) {
+        fs::path candidate = fs::path(dir) / binary_name;
+        if (fs::exists(candidate, ec) && !fs::is_directory(candidate, ec)) {
+          return candidate.string();
+        }
+      }
+      start = end + 1;
+    }
+  }
+
+#if defined(_WIN32)
+  // Win32 where.exe fallback without shell interpolation
   std::string out;
   if (RunProcessCaptureOutput("where.exe", { "clang.exe" }, &out) && !out.empty()) {
     auto nl = out.find('\n');
     if (nl != std::string::npos) out = out.substr(0, nl);
     while (!out.empty() && (out.back() == '\r' || out.back() == ' ')) out.pop_back();
-    if (fs::exists(out)) return out;
+    if (fs::exists(out, ec) && !fs::is_directory(out, ec)) return out;
   }
+#endif
 
   return "";
 }

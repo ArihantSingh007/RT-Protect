@@ -163,7 +163,7 @@ int main(int argc, char* argv[]) {
     std::cout << "Registered license " << rec.license_id
               << " for product " << rec.product_id
               << " with " << rec.max_seats << " seats.\n"
-              << "Canonical vm_root: " << BytesToHex(rec.vm_root.data(), rec.vm_root.size()) << "\n";
+              << "Canonical vm_root: [PROVISIONED: " << BytesToHex(rec.vm_root.data(), 4) << "...redacted]\n";
     return 0;
   }
 

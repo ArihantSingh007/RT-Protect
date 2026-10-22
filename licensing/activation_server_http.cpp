@@ -358,25 +358,26 @@ void ActivationServerHttp::ServerLoop() {
       continue;
     }
 
-    // Spawn and track worker thread lifecycle
-    std::thread t([this, client_sock, client_ip]() {
-      HandleClient(static_cast<uintptr_t>(client_sock), client_ip);
-
-      {
-        std::lock_guard<std::mutex> lock(workers_mu_);
-        auto it = active_workers_.find(std::this_thread::get_id());
-        if (it != active_workers_.end()) {
-          finished_workers_.push_back(std::move(it->second));
-          active_workers_.erase(it);
-        }
-        active_clients_.fetch_sub(1, std::memory_order_release);
-      }
-      workers_cv_.notify_all();
-    });
-
-    std::thread::id tid = t.get_id();
+    // Spawn and track worker thread lifecycle with atomic registration under lock
+    // Prevents lifecycle race where worker completes before insertion into active_workers_
     {
-      std::lock_guard<std::mutex> lock(workers_mu_);
+      std::unique_lock<std::mutex> lock(workers_mu_);
+      std::thread t([this, client_sock, client_ip]() {
+        HandleClient(static_cast<uintptr_t>(client_sock), client_ip);
+
+        {
+          std::lock_guard<std::mutex> inner_lock(workers_mu_);
+          auto it = active_workers_.find(std::this_thread::get_id());
+          if (it != active_workers_.end()) {
+            finished_workers_.push_back(std::move(it->second));
+            active_workers_.erase(it);
+          }
+          active_clients_.fetch_sub(1, std::memory_order_release);
+        }
+        workers_cv_.notify_all();
+      });
+
+      std::thread::id tid = t.get_id();
       active_workers_[tid] = std::move(t);
     }
   }
@@ -419,25 +420,6 @@ void ActivationServerHttp::HandleClient(uintptr_t client_sock_fd, const std::str
     }
     return send(client_sock, buf, len, 0);
   };
-
-  int retry_after = 0;
-  if (!client_ip.empty() && !ip_rate_limiter_.Allow(client_ip, 1.0, &retry_after)) {
-    const std::string busy_resp =
-        "HTTP/1.1 429 Too Many Requests\r\n"
-        "Content-Type: application/json\r\n"
-        "Retry-After: " + std::to_string(retry_after) + "\r\n"
-        "Connection: close\r\n\r\n"
-        "{\"status\":\"rate_limited\",\"error\":\"Too Many Requests\",\"retry_after\":" +
-        std::to_string(retry_after) + "}\n";
-    raw_write(busy_resp.data(), static_cast<int>(busy_resp.size()));
-    if (ssl) {
-      SSL_shutdown(ssl);
-      SSL_free(ssl);
-    }
-    UnregisterClientSocket(client_sock_fd);
-    CLOSE_SOCKET(client_sock);
-    return;
-  }
 
   std::string raw_req;
   char buf[4096];

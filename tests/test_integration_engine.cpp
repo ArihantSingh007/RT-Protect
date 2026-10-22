@@ -1263,6 +1263,105 @@ void TestClangAstScannerAndCompilationDatabase() {
   std::printf("  PASSED: Clang AST compiler tooling and compilation database verified.\n");
 }
 
+void TestTargetScopedSourceDiscoveryAndFailClosedVirtualization() {
+  std::printf("Running TestTargetScopedSourceDiscoveryAndFailClosedVirtualization...\n");
+
+  fs::path test_dir = "temp_test_scoped_discovery";
+  CleanDir(test_dir);
+  fs::create_directories(test_dir);
+
+  // Create project structure
+  fs::create_directories(test_dir / ".git");
+  fs::create_directories(test_dir / "build_output");
+  fs::create_directories(test_dir / "third_party" / "libfoo");
+  fs::create_directories(test_dir / "external");
+  fs::create_directories(test_dir / "tests");
+  fs::create_directories(test_dir / ".rtp_backup");
+  fs::create_directories(test_dir / "src");
+
+  // Valid C++ source
+  WriteTextFile((test_dir / "src" / "app.cpp").string(),
+                "int compute(int x) { return x + 1; }\n");
+  // C source (must be excluded from C++ virtualization)
+  WriteTextFile((test_dir / "src" / "legacy.c").string(),
+                "int legacy_c(void) { return 42; }\n");
+  // Excluded directories sources
+  WriteTextFile((test_dir / ".git" / "dummy.cpp").string(), "int git() { return 0; }\n");
+  WriteTextFile((test_dir / "build_output" / "gen.cpp").string(), "int gen() { return 0; }\n");
+  WriteTextFile((test_dir / "third_party" / "libfoo" / "foo.cpp").string(), "int foo() { return 0; }\n");
+  WriteTextFile((test_dir / "external" / "ext.cpp").string(), "int ext() { return 0; }\n");
+  WriteTextFile((test_dir / "tests" / "test_main.cpp").string(), "int test() { return 0; }\n");
+  WriteTextFile((test_dir / ".rtp_backup" / "bak.cpp").string(), "int bak() { return 0; }\n");
+  WriteTextFile((test_dir / "rtprotect_config.h").string(), "// generated\n");
+
+  std::string cmake_text = "cmake_minimum_required(VERSION 3.20)\nproject(App)\nadd_executable(app src/app.cpp)\n";
+  WriteTextFile((test_dir / "CMakeLists.txt").string(), cmake_text);
+
+  IntegrationOptions opts;
+  opts.target_project_path = test_dir.string();
+  opts.profile = ProtectionProfile::kMaximum;
+
+  auto plan = PlanIntegration(opts);
+  assert(plan.is_supported);
+
+  // 1. Verify detected_sources includes ONLY src/app.cpp
+  assert(plan.detected_sources.size() == 1);
+  assert(plan.detected_sources[0].find("app.cpp") != std::string::npos);
+
+  // 2. Fail-closed virtualization on invalid syntax in kMaximum profile
+  std::string bad_cpp =
+      "RTPROTECT_VIRTUALIZE\n"
+      "int broken_func(int a) {\n"
+      "    SYNTAX ERROR HERE !!!;\n"
+      "    return a;\n"
+      "}\n";
+  fs::path bad_file = test_dir / "src" / "bad.cpp";
+  WriteTextFile(bad_file.string(), bad_cpp);
+
+  std::vector<std::string> virt;
+  std::size_t obf = 0, scatt = 0;
+  std::string err_msg;
+  std::array<std::uint8_t, 32> vm_root{};
+  vm_root.fill(0x42);
+  auto kp = integrity::GenerateEd25519KeyPair();
+  assert(kp.has_value());
+
+  bool ok = TransformSourceFile(bad_file, ProtectionProfile::kMaximum, 12345, vm_root,
+                                kp->public_key, "com.test.failclosed", virt, obf, scatt, &err_msg);
+  assert(!ok);
+  assert(!err_msg.empty());
+  assert(err_msg.find("failed bytecode compilation") != std::string::npos);
+
+  // Remove bad file so clean integration with content key can be verified
+  fs::remove(bad_file);
+
+  // 3. Dedicated content key (--content-key) test with key separation
+  fs::path content_key_file = test_dir / "master_content.key";
+  std::array<std::uint8_t, 32> content_key_bytes{};
+  content_key_bytes.fill(0x99);
+  WriteFile(content_key_file.string(), content_key_bytes.data(), content_key_bytes.size());
+
+  fs::path man_pub_file = test_dir / "man.pub";
+  fs::path lic_pub_file = test_dir / "lic.pub";
+  WriteFile(man_pub_file.string(), kp->public_key.data(), kp->public_key.size());
+  WriteFile(lic_pub_file.string(), kp->public_key.data(), kp->public_key.size());
+
+  IntegrationOptions prod_opts;
+  prod_opts.target_project_path = test_dir.string();
+  prod_opts.manifest_pubkey_path = man_pub_file.string();
+  prod_opts.license_pubkey_path = lic_pub_file.string();
+  prod_opts.content_key_path = content_key_file.string();
+  prod_opts.use_dev_keys = false;
+  prod_opts.staging_only = true;
+  prod_opts.run_build = false;
+
+  auto prod_rep = ExecuteIntegration(prod_opts);
+  assert(prod_rep.success);
+
+  CleanDir(test_dir);
+  std::printf("  PASSED: Scoped source discovery, fail-closed virtualization, and key separation verified.\n");
+}
+
 }  // namespace
 
 int main() {
@@ -1288,6 +1387,7 @@ int main() {
   TestAstScannerRawStringsAndTranslationUnitObfuscation();
   TestIntegration_OnlineActivationPipeline_EndToEndRoundTrip();
   TestClangAstScannerAndCompilationDatabase();
+  TestTargetScopedSourceDiscoveryAndFailClosedVirtualization();
   std::printf("ALL INTEGRATION ENGINE TESTS PASSED.\n");
   return 0;
 }
