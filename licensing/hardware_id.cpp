@@ -12,24 +12,17 @@
 #include <sstream>
 #include <vector>
 
-#include <openssl/rand.h>
-
-#include "integrity/sha256.h"
-#include "tooling/file_io.h"
-
-#if defined(_WIN32)
 #include <windows.h>
 #if defined(_MSC_VER)
 #include <intrin.h>
 #else
 #include <cpuid.h>
 #endif
-#else
-#include <unistd.h>
-#if defined(__x86_64__) || defined(__i386__)
-#include <cpuid.h>
-#endif
-#endif
+
+#include <openssl/rand.h>
+
+#include "integrity/sha256.h"
+#include "tooling/file_io.h"
 
 namespace rtprotect::licensing {
 
@@ -46,7 +39,6 @@ std::string DigestToHex(const integrity::Sha256Digest& d) {
 
 std::string GetDeviceSeedPath() {
   namespace fs = std::filesystem;
-#if defined(_WIN32)
   const char* local_app_data = std::getenv("LOCALAPPDATA");
   if (local_app_data && *local_app_data) {
     fs::path dir = fs::path(local_app_data) / "RTProtect";
@@ -62,16 +54,6 @@ std::string GetDeviceSeedPath() {
     return (dir / "device.seed").string();
   }
   return (fs::temp_directory_path() / ".rtprotect_device.seed").string();
-#else
-  const char* home = std::getenv("HOME");
-  if (home && *home) {
-    fs::path dir = fs::path(home) / ".config" / "rtprotect";
-    std::error_code ec;
-    fs::create_directories(dir, ec);
-    return (dir / "device.seed").string();
-  }
-  return "/tmp/.rtprotect_device.seed";
-#endif
 }
 
 std::vector<std::uint8_t> GetOrCreateDeviceSeed() {
@@ -94,19 +76,12 @@ std::vector<std::uint8_t> GetOrCreateDeviceSeed() {
     // If unwritable and unreadable (e.g. read-only filesystem), derive a stable
     // deterministic seed from non-volatile OS identity so the fallback does not drift
     std::string stable_info = "RTProtect-StaticSeed:";
-#if defined(_WIN32)
     const char* comp = std::getenv("COMPUTERNAME");
     const char* user = std::getenv("USERNAME");
     const char* sysroot = std::getenv("SystemRoot");
     stable_info += (comp ? comp : "Comp") + std::string(":") +
                    (user ? user : "User") + std::string(":") +
                    (sysroot ? sysroot : "C:\\Windows");
-#else
-    const char* host = std::getenv("HOSTNAME");
-    const char* user = std::getenv("USER");
-    stable_info += (host ? host : "Host") + std::string(":") +
-                   (user ? user : "User");
-#endif
     auto digest = integrity::Sha256(reinterpret_cast<const std::uint8_t*>(stable_info.data()), stable_info.size());
     if (digest.has_value()) {
       return std::vector<std::uint8_t>(digest->begin(), digest->end());
@@ -142,7 +117,6 @@ std::string HashString(const std::string& input) {
 std::string GetCpuInfo(bool* out_success) {
   std::ostringstream ss;
   bool success = false;
-#if defined(_WIN32)
   int cpu_info[4] = {0};
 #if defined(_MSC_VER)
   __cpuid(cpu_info, 0);
@@ -162,20 +136,6 @@ std::string GetCpuInfo(bool* out_success) {
 #endif
   ss << ":" << cpu_info[0] << ":" << cpu_info[3];
   success = true;
-#elif defined(__x86_64__) || defined(__i386__)
-  unsigned int eax = 0, ebx = 0, ecx = 0, edx = 0;
-  if (__get_cpuid(0, &eax, &ebx, &ecx, &edx)) {
-    char vendor[13] = {0};
-    std::memcpy(vendor, &ebx, 4);
-    std::memcpy(vendor + 4, &edx, 4);
-    std::memcpy(vendor + 8, &ecx, 4);
-    ss << vendor;
-    success = true;
-  }
-  if (__get_cpuid(1, &eax, &ebx, &ecx, &edx)) {
-    ss << ":" << eax << ":" << edx;
-  }
-#endif
 
   if (out_success) *out_success = success;
   if (!success) {
@@ -187,20 +147,11 @@ std::string GetCpuInfo(bool* out_success) {
 std::string GetStorageInfo(bool* out_success) {
   std::ostringstream ss;
   bool success = false;
-#if defined(_WIN32)
   DWORD serial = 0;
   if (GetVolumeInformationA("C:\\", nullptr, 0, &serial, nullptr, nullptr, nullptr, 0) && serial != 0) {
     ss << "VolSerial:" << serial;
     success = true;
   }
-#else
-  std::ifstream f("/etc/fstab");
-  std::string line;
-  if (f && std::getline(f, line) && !line.empty()) {
-    ss << line;
-    success = true;
-  }
-#endif
 
   if (out_success) *out_success = success;
   if (!success) {
@@ -212,7 +163,6 @@ std::string GetStorageInfo(bool* out_success) {
 std::string GetSystemInfo(bool* out_success) {
   std::ostringstream ss;
   bool success = false;
-#if defined(_WIN32)
   HKEY hKey = nullptr;
   if (RegOpenKeyExA(HKEY_LOCAL_MACHINE, "SOFTWARE\\Microsoft\\Cryptography", 0, KEY_READ | KEY_WOW64_64KEY, &hKey) == ERROR_SUCCESS) {
     char guid[128] = {0};
@@ -223,20 +173,6 @@ std::string GetSystemInfo(bool* out_success) {
     }
     RegCloseKey(hKey);
   }
-#else
-  std::ifstream f("/etc/machine-id");
-  std::string mid;
-  if (f && std::getline(f, mid) && !mid.empty()) {
-    ss << mid;
-    success = true;
-  } else {
-    std::ifstream f2("/var/lib/dbus/machine-id");
-    if (f2 && std::getline(f2, mid) && !mid.empty()) {
-      ss << mid;
-      success = true;
-    }
-  }
-#endif
 
   if (out_success) *out_success = success;
   if (!success) {
@@ -247,18 +183,11 @@ std::string GetSystemInfo(bool* out_success) {
 
 std::string GetHostInfo(bool* out_success) {
   char name[256] = {0};
-#if defined(_WIN32)
   DWORD len = sizeof(name) - 1;
   if (GetComputerNameA(name, &len) && len > 0) {
     if (out_success) *out_success = true;
     return std::string(name);
   }
-#else
-  if (gethostname(name, sizeof(name) - 1) == 0 && name[0] != '\0') {
-    if (out_success) *out_success = true;
-    return std::string(name);
-  }
-#endif
 
   if (out_success) *out_success = false;
   return GenerateProbeFallbackEntropy("Host");

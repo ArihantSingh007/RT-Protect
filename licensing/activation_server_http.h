@@ -70,7 +70,7 @@ class ActivationServerHttp {
   std::atomic<std::size_t> active_clients_{0};
   std::uint16_t port_{0};
   std::string host_{"127.0.0.1"};
-  uintptr_t listen_fd_{~0ULL}; // SOCKET on Win32, int on POSIX
+  uintptr_t listen_fd_{~0ULL}; // SOCKET on Win32
   std::thread accept_thread_;
 
   // Worker thread lifecycle tracking to prevent shutdown use-after-free

@@ -10,6 +10,11 @@
 #include <sstream>
 #include <vector>
 
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#include <windows.h>
+#include <winhttp.h>
+
 #include <openssl/rand.h>
 #include <openssl/ssl.h>
 #include <openssl/err.h>
@@ -19,19 +24,6 @@
 #include "crypto/kdf.h"
 #include "licensing/hardware_id.h"
 #include "licensing/trusted_time.h"
-
-#if defined(_WIN32)
-#include <winsock2.h>
-#include <ws2tcpip.h>
-#include <windows.h>
-#include <winhttp.h>
-#else
-#include <arpa/inet.h>
-#include <netdb.h>
-#include <netinet/in.h>
-#include <sys/socket.h>
-#include <unistd.h>
-#endif
 
 namespace rtprotect::licensing {
 
@@ -135,7 +127,6 @@ ParsedUrl ParseUrl(const std::string& url_str) {
   return res;
 }
 
-#if defined(_WIN32)
 std::optional<std::string> HttpPostWinHttp(const ParsedUrl& url, const std::string& path, const std::string& json_body, std::string* error_out) {
   HINTERNET hSession = WinHttpOpen(L"RTProtect-Activation-Client/2.0",
                                    WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
@@ -217,10 +208,8 @@ std::optional<std::string> HttpPostWinHttp(const ParsedUrl& url, const std::stri
   WinHttpCloseHandle(hSession);
   return response_body;
 }
-#endif
 
 std::optional<std::string> HttpPostSocket(const ParsedUrl& url, const std::string& path, const std::string& json_body, std::string* error_out) {
-#if defined(_WIN32)
   SOCKET s = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
   if (s == INVALID_SOCKET) {
     if (error_out) *error_out = "Failed to create socket";
@@ -229,32 +218,14 @@ std::optional<std::string> HttpPostSocket(const ParsedUrl& url, const std::strin
   DWORD tv_ms = 8000;
   setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&tv_ms), sizeof(tv_ms));
   setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, reinterpret_cast<const char*>(&tv_ms), sizeof(tv_ms));
-#else
-  int s = socket(AF_INET, SOCK_STREAM, 0);
-  if (s < 0) {
-    if (error_out) *error_out = "Failed to create socket";
-    return std::nullopt;
-  }
-  struct timeval tv { 8, 0 };
-  setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-  setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
-#endif
 
   sockaddr_in server_addr{};
   server_addr.sin_family = AF_INET;
   server_addr.sin_port = htons(url.port);
-#if defined(_WIN32)
   inet_pton(AF_INET, url.host.c_str(), &server_addr.sin_addr);
-#else
-  inet_pton(AF_INET, url.host.c_str(), &server_addr.sin_addr);
-#endif
 
   if (connect(s, reinterpret_cast<sockaddr*>(&server_addr), sizeof(server_addr)) != 0) {
-#if defined(_WIN32)
     closesocket(s);
-#else
-    close(s);
-#endif
     if (error_out) *error_out = "Socket connection failed to " + url.host + ":" + std::to_string(url.port);
     return std::nullopt;
   }
@@ -288,11 +259,7 @@ std::optional<std::string> HttpPostSocket(const ParsedUrl& url, const std::strin
     resp.append(buf, bytes);
   }
 
-#if defined(_WIN32)
   closesocket(s);
-#else
-  close(s);
-#endif
 
   auto body_pos = resp.find("\r\n\r\n");
   if (body_pos == std::string::npos) {
@@ -305,7 +272,6 @@ std::optional<std::string> HttpPostSocket(const ParsedUrl& url, const std::strin
 
 // Native OpenSSL TLS HTTP client with strict certificate verification
 std::optional<std::string> HttpPostTls(const ParsedUrl& url, const std::string& path, const std::string& json_body, std::string* error_out) {
-#if defined(_WIN32)
   SOCKET s = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
   if (s == INVALID_SOCKET) {
     if (error_out) *error_out = "Failed to create socket for TLS";
@@ -314,38 +280,20 @@ std::optional<std::string> HttpPostTls(const ParsedUrl& url, const std::string& 
   DWORD tv_ms = 10000;
   setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&tv_ms), sizeof(tv_ms));
   setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, reinterpret_cast<const char*>(&tv_ms), sizeof(tv_ms));
-#else
-  int s = socket(AF_INET, SOCK_STREAM, 0);
-  if (s < 0) {
-    if (error_out) *error_out = "Failed to create socket for TLS";
-    return std::nullopt;
-  }
-  struct timeval tv { 10, 0 };
-  setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-  setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
-#endif
 
   struct addrinfo hints{}, *res = nullptr;
   hints.ai_family = AF_INET;
   hints.ai_socktype = SOCK_STREAM;
   std::string port_str = std::to_string(url.port == 0 ? 443 : url.port);
   if (getaddrinfo(url.host.c_str(), port_str.c_str(), &hints, &res) != 0 || !res) {
-#if defined(_WIN32)
     closesocket(s);
-#else
-    close(s);
-#endif
     if (error_out) *error_out = "Failed to resolve TLS host: " + url.host;
     return std::nullopt;
   }
 
   if (connect(s, res->ai_addr, static_cast<int>(res->ai_addrlen)) != 0) {
     freeaddrinfo(res);
-#if defined(_WIN32)
     closesocket(s);
-#else
-    close(s);
-#endif
     if (error_out) *error_out = "TLS socket connection failed to " + url.host + ":" + port_str;
     return std::nullopt;
   }
@@ -354,11 +302,7 @@ std::optional<std::string> HttpPostTls(const ParsedUrl& url, const std::string& 
   const SSL_METHOD* method = TLS_client_method();
   SSL_CTX* ctx = SSL_CTX_new(method);
   if (!ctx) {
-#if defined(_WIN32)
     closesocket(s);
-#else
-    close(s);
-#endif
     if (error_out) *error_out = "Failed to initialize SSL_CTX";
     return std::nullopt;
   }
@@ -370,11 +314,7 @@ std::optional<std::string> HttpPostTls(const ParsedUrl& url, const std::string& 
   SSL* ssl = SSL_new(ctx);
   if (!ssl) {
     SSL_CTX_free(ctx);
-#if defined(_WIN32)
     closesocket(s);
-#else
-    close(s);
-#endif
     if (error_out) *error_out = "Failed to create SSL instance";
     return std::nullopt;
   }
@@ -391,11 +331,7 @@ std::optional<std::string> HttpPostTls(const ParsedUrl& url, const std::string& 
     }
     SSL_free(ssl);
     SSL_CTX_free(ctx);
-#if defined(_WIN32)
     closesocket(s);
-#else
-    close(s);
-#endif
     if (error_out) *error_out = err_desc;
     return std::nullopt;
   }
@@ -404,11 +340,7 @@ std::optional<std::string> HttpPostTls(const ParsedUrl& url, const std::string& 
     SSL_shutdown(ssl);
     SSL_free(ssl);
     SSL_CTX_free(ctx);
-#if defined(_WIN32)
     closesocket(s);
-#else
-    close(s);
-#endif
     if (error_out) *error_out = "TLS peer certificate verification failed";
     return std::nullopt;
   }
@@ -436,11 +368,7 @@ std::optional<std::string> HttpPostTls(const ParsedUrl& url, const std::string& 
     SSL_shutdown(ssl);
     SSL_free(ssl);
     SSL_CTX_free(ctx);
-#if defined(_WIN32)
     closesocket(s);
-#else
-    close(s);
-#endif
     if (error_out) *error_out = "Failed to send request over TLS";
     return std::nullopt;
   }
@@ -456,11 +384,7 @@ std::optional<std::string> HttpPostTls(const ParsedUrl& url, const std::string& 
   SSL_shutdown(ssl);
   SSL_free(ssl);
   SSL_CTX_free(ctx);
-#if defined(_WIN32)
   closesocket(s);
-#else
-  close(s);
-#endif
 
   auto body_pos = resp.find("\r\n\r\n");
   if (body_pos == std::string::npos) {
@@ -474,13 +398,11 @@ std::optional<std::string> HttpPostTls(const ParsedUrl& url, const std::string& 
 std::optional<std::string> DispatchHttpPost(const std::string& base_url, const std::string& endpoint, const std::string& body, std::string* error_out) {
   ParsedUrl url = ParseUrl(base_url);
   if (url.is_https) {
-#if defined(_WIN32)
     auto winhttp_res = HttpPostWinHttp(url, endpoint, body, error_out);
     if (winhttp_res.has_value()) {
       return winhttp_res;
     }
-#endif
-    // Native OpenSSL TLS with strict peer certificate verification
+    // Native OpenSSL TLS with strict peer certificate verification fallback
     return HttpPostTls(url, endpoint, body, error_out);
   }
 

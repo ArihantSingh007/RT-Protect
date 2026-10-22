@@ -78,11 +78,7 @@ inline constexpr std::array<std::uint8_t, 6> kPayloadMsx64 = {
     0xc3,                          // ret
 };
 
-#if defined(_WIN32)
 inline constexpr const std::array<std::uint8_t, 6>& kPayload = kPayloadMsx64;
-#else
-inline constexpr const std::array<std::uint8_t, 6>& kPayload = kPayloadSysV;
-#endif
 
 // Intel's UD2 instruction (0x0F 0x0B), architecturally guaranteed to raise
 // an invalid-opcode fault whenever executed, on any x86/x86-64 CPU,

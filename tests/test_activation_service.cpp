@@ -11,15 +11,8 @@
 #include <filesystem>
 #include <string>
 
-#if defined(_WIN32)
 #include <winsock2.h>
 #include <ws2tcpip.h>
-#else
-#include <arpa/inet.h>
-#include <netinet/in.h>
-#include <sys/socket.h>
-#include <unistd.h>
-#endif
 
 #include <openssl/rand.h>
 
@@ -54,13 +47,8 @@ std::string MakeTempDbPath() {
 }
 
 std::string SendRawHttpRequest(std::uint16_t port, const std::string& request) {
-#if defined(_WIN32)
   SOCKET sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
   if (sock == INVALID_SOCKET) return "";
-#else
-  int sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-  if (sock < 0) return "";
-#endif
 
   sockaddr_in addr{};
   addr.sin_family = AF_INET;
@@ -68,11 +56,7 @@ std::string SendRawHttpRequest(std::uint16_t port, const std::string& request) {
   inet_pton(AF_INET, "127.0.0.1", &addr.sin_addr);
 
   if (connect(sock, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0) {
-#if defined(_WIN32)
     closesocket(sock);
-#else
-    close(sock);
-#endif
     return "";
   }
 
@@ -86,12 +70,7 @@ std::string SendRawHttpRequest(std::uint16_t port, const std::string& request) {
     response.append(buf, bytes);
   }
 
-#if defined(_WIN32)
   closesocket(sock);
-#else
-  close(sock);
-#endif
-
   return response;
 }
 

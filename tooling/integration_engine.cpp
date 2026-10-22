@@ -12,13 +12,7 @@
 #include <fstream>
 #include <sstream>
 
-#if defined(_WIN32)
 #include <windows.h>
-#else
-#include <sys/types.h>
-#include <sys/wait.h>
-#include <unistd.h>
-#endif
 
 #include "antitamper/risk_policy.h"
 #include "bytecode_vm/compiler.h"
@@ -152,7 +146,6 @@ std::vector<std::string> DiscoverCMakeExecutableTargets(const fs::path& cmake_fi
 }
 
 int RunProcess(const std::string& exe, const std::vector<std::string>& args) {
-#if defined(_WIN32)
   std::string cmd_line = "\"" + exe + "\"";
   for (const auto& a : args) {
     cmd_line += " ";
@@ -208,26 +201,6 @@ int RunProcess(const std::string& exe, const std::vector<std::string>& args) {
   CloseHandle(pi.hProcess);
   CloseHandle(pi.hThread);
   return static_cast<int>(exit_code);
-#else
-  pid_t pid = fork();
-  if (pid < 0) return -1;
-  if (pid == 0) {
-    std::vector<char*> argv_ptrs;
-    argv_ptrs.push_back(const_cast<char*>(exe.c_str()));
-    for (const auto& a : args) {
-      argv_ptrs.push_back(const_cast<char*>(a.c_str()));
-    }
-    argv_ptrs.push_back(nullptr);
-    execvp(exe.c_str(), argv_ptrs.data());
-    _exit(127);
-  }
-  int status = 0;
-  waitpid(pid, &status, 0);
-  if (WIFEXITED(status)) {
-    return WEXITSTATUS(status);
-  }
-  return -1;
-#endif
 }
 
 std::string GenerateRandomHex(std::size_t num_bytes) {
@@ -1207,13 +1180,7 @@ IntegrationReport ExecuteIntegration(const IntegrationOptions& options) {
     ss << "#include <string>\n";
     ss << "#include <vector>\n\n";
 
-    ss << "#if defined(_WIN32)\n";
-    ss << "#include <windows.h>\n";
-    ss << "#elif defined(__APPLE__)\n";
-    ss << "#include <mach-o/dyld.h>\n";
-    ss << "#else\n";
-    ss << "#include <unistd.h>\n";
-    ss << "#endif\n\n";
+    ss << "#include <windows.h>\n\n";
 
     ss << "namespace rtprotect_client {\n\n";
     ss << "static bool s_license_validated = false;\n";
@@ -1244,7 +1211,6 @@ IntegrationReport ExecuteIntegration(const IntegrationOptions& options) {
 
     ss << "namespace {\n\n";
     ss << "std::string GetCurrentExecutablePath() {\n";
-    ss << "#if defined(_WIN32)\n";
     ss << "  DWORD size = 512;\n";
     ss << "  while (size <= 65536) {\n";
     ss << "    std::vector<char> buf(size);\n";
@@ -1254,27 +1220,6 @@ IntegrationReport ExecuteIntegration(const IntegrationOptions& options) {
     ss << "    size *= 2;\n";
     ss << "  }\n";
     ss << "  return \"\";\n";
-    ss << "#elif defined(__APPLE__)\n";
-    ss << "  uint32_t size = 0;\n";
-    ss << "  _NSGetExecutablePath(nullptr, &size);\n";
-    ss << "  if (size == 0) return \"\";\n";
-    ss << "  std::vector<char> buf(size);\n";
-    ss << "  if (_NSGetExecutablePath(buf.data(), &size) == 0) return std::string(buf.data());\n";
-    ss << "  return \"\";\n";
-    ss << "#else\n";
-    ss << "  size_t size = 1024;\n";
-    ss << "  while (size <= 65536) {\n";
-    ss << "    std::vector<char> buf(size);\n";
-    ss << "    ssize_t ret = ::readlink(\"/proc/self/exe\", buf.data(), buf.size() - 1);\n";
-    ss << "    if (ret <= 0) return \"\";\n";
-    ss << "    if (static_cast<size_t>(ret) < buf.size() - 1) {\n";
-    ss << "      buf[ret] = '\\0';\n";
-    ss << "      return std::string(buf.data(), ret);\n";
-    ss << "    }\n";
-    ss << "    size *= 2;\n";
-    ss << "  }\n";
-    ss << "  return \"\";\n";
-    ss << "#endif\n";
     ss << "}\n\n";
 
     // HIGH 9 REMEDIATION: Authoritative auxiliary file location ONLY next to binary
@@ -1330,7 +1275,7 @@ IntegrationReport ExecuteIntegration(const IntegrationOptions& options) {
     ss << "\n  // 4. Activation token retrieval and VM root derivation\n";
     ss << "  rtprotect::licensing::ActivationToken token;\n";
     ss << "  bool token_loaded = false;\n\n";
-    ss << "  // 4a. Check OS secure storage (DPAPI / Keychain / Secret Service)\n";
+    ss << "  // 4a. Check OS secure storage (Windows DPAPI)\n";
     ss << "  auto cached_tok = rtprotect::licensing::LoadActivationToken(kProductId);\n";
     ss << "  if (cached_tok.has_value() && (cached_tok->license_id == lic.license_id || cached_tok->license_id.empty())) {\n";
     ss << "    if (cached_tok->expires_at == 0 || ctx.current_time <= cached_tok->expires_at) {\n";

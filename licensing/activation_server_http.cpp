@@ -19,28 +19,16 @@
 #include <openssl/rand.h>
 #include <openssl/ssl.h>
 
-#if defined(_WIN32)
 #include <winsock2.h>
 #include <ws2tcpip.h>
 typedef SOCKET socket_t;
 #define INVALID_SOCKET_VALUE INVALID_SOCKET
 #define CLOSE_SOCKET(s) closesocket(s)
-#else
-#include <arpa/inet.h>
-#include <netinet/in.h>
-#include <sys/socket.h>
-#include <sys/types.h>
-#include <unistd.h>
-typedef int socket_t;
-#define INVALID_SOCKET_VALUE (-1)
-#define CLOSE_SOCKET(s) close(s)
-#endif
 
 namespace rtprotect::licensing {
 
 namespace {
 
-#if defined(_WIN32)
 struct WinsockInit {
   WinsockInit() {
     WSADATA wsa;
@@ -51,20 +39,11 @@ struct WinsockInit {
   }
 };
 static WinsockInit s_winsock_init;
-#endif
 
 void SetSocketTimeouts(socket_t s, int timeout_seconds) {
-#if defined(_WIN32)
   DWORD tv_ms = static_cast<DWORD>(timeout_seconds * 1000);
   setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&tv_ms), sizeof(tv_ms));
   setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, reinterpret_cast<const char*>(&tv_ms), sizeof(tv_ms));
-#else
-  struct timeval tv {};
-  tv.tv_sec = timeout_seconds;
-  tv.tv_usec = 0;
-  setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-  setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
-#endif
 }
 
 bool ConstantTimeStringEquals(const std::string& a, const std::string& b) {
@@ -204,11 +183,7 @@ bool ActivationServerHttp::Start(std::uint16_t port, const std::string& host) {
   if (pton4 == 1) {
     listen_sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
     if (listen_sock == INVALID_SOCKET_VALUE) return false;
-#if defined(_WIN32)
     setsockopt(listen_sock, SOL_SOCKET, SO_REUSEADDR, reinterpret_cast<const char*>(&opt), sizeof(opt));
-#else
-    setsockopt(listen_sock, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
-#endif
     if (bind(listen_sock, reinterpret_cast<sockaddr*>(&addr4), sizeof(addr4)) != 0) {
       CLOSE_SOCKET(listen_sock);
       return false;
@@ -221,11 +196,7 @@ bool ActivationServerHttp::Start(std::uint16_t port, const std::string& host) {
   } else {
     listen_sock = socket(AF_INET6, SOCK_STREAM, IPPROTO_TCP);
     if (listen_sock == INVALID_SOCKET_VALUE) return false;
-#if defined(_WIN32)
     setsockopt(listen_sock, SOL_SOCKET, SO_REUSEADDR, reinterpret_cast<const char*>(&opt), sizeof(opt));
-#else
-    setsockopt(listen_sock, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
-#endif
     if (bind(listen_sock, reinterpret_cast<sockaddr*>(&addr6), sizeof(addr6)) != 0) {
       CLOSE_SOCKET(listen_sock);
       return false;
