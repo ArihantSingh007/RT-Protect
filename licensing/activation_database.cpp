@@ -2,6 +2,7 @@
 
 #include "licensing/activation_database.h"
 
+#include <algorithm>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -10,6 +11,7 @@
 #include <fstream>
 #include <iomanip>
 #include <sstream>
+#include <unordered_set>
 
 #include "tooling/file_io.h"
 
@@ -52,6 +54,32 @@ std::optional<LicenseRecordStatus> ParseLicenseRecordStatus(const std::string& s
   if (s == "active") return LicenseRecordStatus::kActive;
   if (s == "revoked") return LicenseRecordStatus::kRevoked;
   if (s == "refunded") return LicenseRecordStatus::kRefunded;
+  return std::nullopt;
+}
+
+const char* ToString(ActivationEventType type) {
+  switch (type) {
+    case ActivationEventType::kActivationSuccess: return "activation_success";
+    case ActivationEventType::kActivationFailed: return "activation_failed";
+    case ActivationEventType::kSeatLimitExceeded: return "seat_limit_exceeded";
+    case ActivationEventType::kRenewalSuccess: return "renewal_success";
+    case ActivationEventType::kRenewalFailed: return "renewal_failed";
+    case ActivationEventType::kDeactivation: return "deactivation";
+    case ActivationEventType::kRateLimited: return "rate_limited";
+    case ActivationEventType::kReplayBlocked: return "replay_blocked";
+  }
+  return "unknown";
+}
+
+std::optional<ActivationEventType> ParseActivationEventType(const std::string& s) {
+  if (s == "activation_success") return ActivationEventType::kActivationSuccess;
+  if (s == "activation_failed") return ActivationEventType::kActivationFailed;
+  if (s == "seat_limit_exceeded") return ActivationEventType::kSeatLimitExceeded;
+  if (s == "renewal_success") return ActivationEventType::kRenewalSuccess;
+  if (s == "renewal_failed") return ActivationEventType::kRenewalFailed;
+  if (s == "deactivation") return ActivationEventType::kDeactivation;
+  if (s == "rate_limited") return ActivationEventType::kRateLimited;
+  if (s == "replay_blocked") return ActivationEventType::kReplayBlocked;
   return std::nullopt;
 }
 
@@ -136,6 +164,27 @@ bool ActivationDatabase::Open(const std::string& db_path) {
         std::uint64_t exp = std::strtoull(exp_str.c_str(), nullptr, 10);
         used_nonces_[nonce_hex] = exp;
       }
+    } else if (section == "[events]") {
+      // Format: timestamp|event_type|license_id|device_fingerprint|ip_address|details
+      std::string ts_str, type_str, lic_id, dev_fp, ip_str, details;
+      if (std::getline(row, ts_str, '|') &&
+          std::getline(row, type_str, '|') &&
+          std::getline(row, lic_id, '|') &&
+          std::getline(row, dev_fp, '|') &&
+          std::getline(row, ip_str, '|') &&
+          std::getline(row, details)) {
+        auto et = ParseActivationEventType(type_str);
+        if (et.has_value()) {
+          ActivationEvent evt;
+          evt.timestamp = std::strtoull(ts_str.c_str(), nullptr, 10);
+          evt.type = *et;
+          evt.license_id = lic_id;
+          evt.device_fingerprint = dev_fp;
+          evt.ip_address = ip_str;
+          evt.details = details;
+          events_.push_back(evt);
+        }
+      }
     }
   }
 
@@ -173,6 +222,16 @@ bool ActivationDatabase::SaveLocked() const {
   ss << "\n[used_nonces]\n";
   for (const auto& pair : used_nonces_) {
     ss << pair.first << "|" << pair.second << "\n";
+  }
+
+  ss << "\n[events]\n";
+  for (const auto& e : events_) {
+    ss << e.timestamp << "|"
+       << ToString(e.type) << "|"
+       << e.license_id << "|"
+       << e.device_fingerprint << "|"
+       << e.ip_address << "|"
+       << e.details << "\n";
   }
 
   std::string content = ss.str();
@@ -213,6 +272,16 @@ bool ActivationDatabase::Save(const std::string& db_path) {
   ss << "\n[used_nonces]\n";
   for (const auto& pair : used_nonces_) {
     ss << pair.first << "|" << pair.second << "\n";
+  }
+
+  ss << "\n[events]\n";
+  for (const auto& e : events_) {
+    ss << e.timestamp << "|"
+       << ToString(e.type) << "|"
+       << e.license_id << "|"
+       << e.device_fingerprint << "|"
+       << e.ip_address << "|"
+       << e.details << "\n";
   }
 
   std::string content = ss.str();
@@ -414,11 +483,84 @@ void ActivationDatabase::PruneExpiredNonces(std::uint64_t current_time) {
   }
 }
 
+bool ActivationDatabase::RecordEvent(const ActivationEvent& event) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  events_.push_back(event);
+  // Cap max in-memory events to prevent unbounded growth
+  if (events_.size() > 5000) {
+    events_.erase(events_.begin(), events_.begin() + 1000);
+  }
+  SaveLocked();
+  return true;
+}
+
+std::vector<ActivationEvent> ActivationDatabase::GetRecentEvents(const std::string& license_id, std::size_t limit) const {
+  std::lock_guard<std::mutex> lock(mutex_);
+  std::vector<ActivationEvent> out;
+  for (auto it = events_.rbegin(); it != events_.rend(); ++it) {
+    if (license_id.empty() || it->license_id == license_id) {
+      out.push_back(*it);
+      if (out.size() >= limit) break;
+    }
+  }
+  return out;
+}
+
+double ActivationDatabase::ComputeSeatChurnRisk(const std::string& license_id,
+                                                std::uint64_t current_time,
+                                                std::uint64_t window_seconds) const {
+  std::lock_guard<std::mutex> lock(mutex_);
+  auto lic_it = licenses_.find(license_id);
+  if (lic_it == licenses_.end()) return 0.0;
+  std::uint32_t max_seats = lic_it->second.max_seats;
+  if (max_seats == 0) max_seats = 1;
+
+  std::uint64_t window_start = (current_time > window_seconds) ? (current_time - window_seconds) : 0;
+
+  std::unordered_set<std::string> distinct_devices;
+  std::size_t abuse_events = 0;
+
+  for (const auto& e : events_) {
+    if (e.license_id == license_id && e.timestamp >= window_start) {
+      if (!e.device_fingerprint.empty()) {
+        distinct_devices.insert(e.device_fingerprint);
+      }
+      if (e.type == ActivationEventType::kRateLimited ||
+          e.type == ActivationEventType::kReplayBlocked ||
+          e.type == ActivationEventType::kSeatLimitExceeded) {
+        abuse_events++;
+      }
+    }
+  }
+
+  auto act_it = activations_.find(license_id);
+  if (act_it != activations_.end()) {
+    for (const auto& a : act_it->second) {
+      if (a.last_seen >= window_start) {
+        distinct_devices.insert(a.device_fingerprint);
+      }
+    }
+  }
+
+  double device_ratio = static_cast<double>(distinct_devices.size()) / static_cast<double>(max_seats);
+  double risk = 0.0;
+  if (device_ratio > 1.0) {
+    // Risk starts climbing when distinct devices in window exceeds max allowed seats
+    risk += (device_ratio - 1.0) * 0.25;
+  }
+  if (abuse_events > 0) {
+    risk += std::min(0.5, static_cast<double>(abuse_events) * 0.1);
+  }
+
+  return std::min(1.0, std::max(0.0, risk));
+}
+
 void ActivationDatabase::Clear() {
   std::lock_guard<std::mutex> lock(mutex_);
   licenses_.clear();
   activations_.clear();
   used_nonces_.clear();
+  events_.clear();
   SaveLocked();
 }
 

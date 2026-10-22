@@ -43,6 +43,7 @@
 #include "integrity/verifier.h"
 #include "tooling/file_io.h"
 #include "tooling/integration_engine.h"
+#include "tooling/clang_ast_scanner.h"
 #include "bytecode_vm/compiler.h"
 #include "bytecode_vm/opcode_map.h"
 #include "bytecode_vm/serialize.h"
@@ -1198,6 +1199,70 @@ void TestIntegration_OnlineActivationPipeline_EndToEndRoundTrip() {
   std::printf("  PASSED: End-to-end online server provisioning, secure storage caching, and matching vm_root verified.\n");
 }
 
+void TestClangAstScannerAndCompilationDatabase() {
+  std::printf("Running TestClangAstScannerAndCompilationDatabase...\n");
+
+  fs::path test_dir = "temp_test_clang_ast";
+  CleanDir(test_dir);
+  fs::create_directories(test_dir);
+
+  // 1. Verify CompilationDatabase parsing
+  std::string compile_commands_json =
+      "[\n"
+      "  {\n"
+      "    \"directory\": \"" + test_dir.string() + "\",\n"
+      "    \"command\": \"C:/Program Files/LLVM/bin/clang++.exe -std=c++20 -Iinclude -DTEST_DEF -c src/main.cpp -o src/main.o\",\n"
+      "    \"file\": \"src/main.cpp\"\n"
+      "  }\n"
+      "]\n";
+
+  fs::path cc_path = test_dir / "compile_commands.json";
+  WriteTextFile(cc_path.string(), compile_commands_json);
+
+  auto db = tooling::CompilationDatabase::LoadFromFile(cc_path.string());
+  assert(db.has_value());
+  assert(db->size() == 1);
+
+  auto flags = db->GetFlagsForFile("src/main.cpp");
+  assert(!flags.empty());
+  bool has_std = false;
+  bool has_inc = false;
+  for (const auto& f : flags) {
+    if (f == "-std=c++20") has_std = true;
+    if (f == "-Iinclude") has_inc = true;
+  }
+  assert(has_std);
+  assert(has_inc);
+
+  // 2. Verify ClangAstScanner availability and validation rules
+  assert(tooling::ClangAstScanner::IsAvailable());
+
+  tooling::ClangFunctionDecl valid_fn;
+  valid_fn.name = "compute_hash";
+  valid_fn.return_type = "int64_t";
+  valid_fn.param_names = { "a", "b" };
+  valid_fn.param_types = { "int64_t", "int64_t" };
+  assert(tooling::ClangAstScanner::ValidateVirtualizationEligibility(valid_fn));
+
+  // Too many arguments rejected
+  tooling::ClangFunctionDecl too_many_args = valid_fn;
+  too_many_args.param_names = { "a", "b", "c", "d", "e" };
+  too_many_args.param_types = { "int", "int", "int", "int", "int" };
+  std::string reason;
+  assert(!tooling::ClangAstScanner::ValidateVirtualizationEligibility(too_many_args, &reason));
+  assert(reason.find("exceeds VM argument capacity") != std::string::npos);
+
+  // Unsupported C++ constructs (exceptions) rejected
+  tooling::ClangFunctionDecl throw_fn = valid_fn;
+  throw_fn.has_unsupported_constructs = true;
+  throw_fn.unsupported_reason = "C++ exceptions are not supported in virtualized routines";
+  assert(!tooling::ClangAstScanner::ValidateVirtualizationEligibility(throw_fn, &reason));
+  assert(reason.find("exceptions are not supported") != std::string::npos);
+
+  CleanDir(test_dir);
+  std::printf("  PASSED: Clang AST compiler tooling and compilation database verified.\n");
+}
+
 }  // namespace
 
 int main() {
@@ -1222,6 +1287,7 @@ int main() {
   TestDetailedJsonReporting();
   TestAstScannerRawStringsAndTranslationUnitObfuscation();
   TestIntegration_OnlineActivationPipeline_EndToEndRoundTrip();
+  TestClangAstScannerAndCompilationDatabase();
   std::printf("ALL INTEGRATION ENGINE TESTS PASSED.\n");
   return 0;
 }

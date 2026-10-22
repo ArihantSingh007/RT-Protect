@@ -27,6 +27,7 @@ struct ActivateRequest {
   std::string client_version = "1.0.0";
   std::uint64_t client_timestamp = 0;
   std::array<std::uint8_t, 32> client_nonce{};
+  std::string client_ip = "127.0.0.1";
 };
 
 struct ActivateResponse {
@@ -41,6 +42,7 @@ struct RenewRequest {
   std::string token_hex; // Serialized ActivationToken in hex
   std::string device_fingerprint;
   std::array<std::uint8_t, 32> client_nonce{};
+  std::string client_ip = "127.0.0.1";
 };
 
 struct RenewResponse {
@@ -54,6 +56,7 @@ struct RenewResponse {
 struct DeactivateRequest {
   std::string token_hex;
   std::string device_fingerprint;
+  std::string client_ip = "127.0.0.1";
 };
 
 struct DeactivateResponse {
@@ -73,9 +76,19 @@ class ActivationService {
   DeactivateResponse ProcessDeactivate(const DeactivateRequest& req, std::uint64_t current_time = 0);
 
   // JSON REST handlers (for HTTP daemon)
-  std::string HandleActivateJson(const std::string& json_body, std::uint64_t current_time = 0);
-  std::string HandleRenewJson(const std::string& json_body, std::uint64_t current_time = 0);
-  std::string HandleDeactivateJson(const std::string& json_body, std::uint64_t current_time = 0);
+  std::string HandleActivateJson(const std::string& json_body,
+                                 std::uint64_t current_time = 0,
+                                 const std::string& client_ip = "127.0.0.1");
+  std::string HandleRenewJson(const std::string& json_body,
+                              std::uint64_t current_time = 0,
+                              const std::string& client_ip = "127.0.0.1");
+  std::string HandleDeactivateJson(const std::string& json_body,
+                                  std::uint64_t current_time = 0,
+                                  const std::string& client_ip = "127.0.0.1");
+
+  // Abuse analytics & operational telemetry (Stage 2)
+  double ComputeSeatChurnRisk(const std::string& license_id, std::uint64_t current_time = 0) const;
+  std::vector<ActivationEvent> GetRecentEvents(const std::string& license_id = "", std::size_t limit = 100) const;
 
   const integrity::Ed25519PublicKey& public_key() const { return verification_key_; }
   RateLimiter& license_rate_limiter() { return license_rate_limiter_; }

@@ -608,4 +608,59 @@ MT_TEST(Service_RateLimiting_PerLicenseThrottling) {
   std::filesystem::remove(db_path, ec);
 }
 
+MT_TEST(Service_AuditEvents_And_SeatChurnRisk) {
+  std::string db_path = MakeTempDbPath();
+  std::error_code ec;
+  std::filesystem::remove(db_path, ec);
+
+  auto kp = MakeKeyPair();
+  ActivationDatabase db(db_path);
+
+  LicenseRecord lic;
+  lic.license_id = "lic-churn-test";
+  lic.product_id = "com.vendor.churn";
+  lic.max_seats = 2;
+  lic.created_at = 1700000000;
+  lic.vm_root.fill(0x77);
+  MT_CHECK(db.RegisterLicense(lic));
+
+  ActivationService service(db, std::move(kp.private_key), kp.public_key);
+
+  // 1. Initial risk should be 0.0
+  MT_CHECK(service.ComputeSeatChurnRisk("lic-churn-test", 1700000000) == 0.0);
+
+  // 2. Normal activations for 2 seats (within max_seats)
+  ActivateRequest req1{"lic-churn-test", "HWID-A", "com.vendor.churn", "1.0", 1700000000, {}};
+  req1.client_nonce[0] = 0x01;
+  auto resp1 = service.ProcessActivate(req1, 1700000000);
+  MT_CHECK(resp1.status == ActivationStatus::kValid);
+
+  ActivateRequest req2{"lic-churn-test", "HWID-B", "com.vendor.churn", "1.0", 1700000000, {}};
+  req2.client_nonce[0] = 0x02;
+  auto resp2 = service.ProcessActivate(req2, 1700000000);
+  MT_CHECK(resp2.status == ActivationStatus::kValid);
+
+  // Still clean risk (2 devices / 2 seats = ratio 1.0)
+  MT_CHECK(service.ComputeSeatChurnRisk("lic-churn-test", 1700000000) == 0.0);
+
+  // 3. Third device attempt fails with concurrency limit -> generates seat limit event
+  ActivateRequest req3{"lic-churn-test", "HWID-C", "com.vendor.churn", "1.0", 1700000000, {}};
+  req3.client_nonce[0] = 0x03;
+  auto resp3 = service.ProcessActivate(req3, 1700000000);
+  MT_CHECK(resp3.status == ActivationStatus::kConcurrencyLimitExceeded);
+
+  // Distinct devices is now 3 (A, B, C) and an abuse event was logged
+  double churn_risk = service.ComputeSeatChurnRisk("lic-churn-test", 1700000000);
+  MT_CHECK(churn_risk > 0.0);
+
+  // 4. Verify structured events are recorded
+  auto events = service.GetRecentEvents("lic-churn-test");
+  MT_CHECK(events.size() == 3);
+  MT_CHECK(events[0].type == ActivationEventType::kSeatLimitExceeded); // Most recent first
+  MT_CHECK(events[1].type == ActivationEventType::kActivationSuccess);
+  MT_CHECK(events[2].type == ActivationEventType::kActivationSuccess);
+
+  std::filesystem::remove(db_path, ec);
+}
+
 MT_MAIN()

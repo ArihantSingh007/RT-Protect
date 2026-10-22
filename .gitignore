@@ -7,3 +7,5 @@ dist/
 *.a
 *.dll.a
 *.tmp
+__pycache__/
+*.pyc
