@@ -29,7 +29,7 @@ option(RTPROTECT_ENABLE_EXPERIMENTAL_RUNTIME_RECONSTRUCTION
 # Win32-specific code behind #ifdef _WIN32 (none has needed to).
 # ---------------------------------------------------------------------------
 
-find_package(OpenSSL 3.0 REQUIRED COMPONENTS Crypto)
+find_package(OpenSSL 3.0 REQUIRED COMPONENTS Crypto SSL)
 
 # rtprotect_strip_in_release(target): applies full symbol-table stripping as
 # a post-build step on a final Release executable. Defined unconditionally

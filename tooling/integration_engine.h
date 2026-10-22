@@ -61,6 +61,9 @@ struct IntegrationOptions {
   std::string sign_license_key_path; // Optional vendor license signing private key
   std::string license_file_path;     // Optional pre-issued client.license to deploy
   std::string dev_keys_dir;          // Output directory for dev keys (must be outside client project)
+  std::string activation_server_url; // Online Activation Authority URL (e.g. "https://license.vendor.com")
+  std::string vm_root_file;          // Optional explicit binary file for release VM root
+  std::string vm_root_hex;           // Optional explicit 64-char hex string for release VM root
 };
 
 struct ChangePlan {

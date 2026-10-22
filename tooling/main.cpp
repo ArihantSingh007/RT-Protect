@@ -149,6 +149,9 @@ void PrintUsage() {
       "      --report <json-file>              Output JSON execution report to path\n"
       "      --product <id>                    Product identifier (default: com.client.protected)\n"
       "      --version <ver>                   Release version string (default: 1.0.0)\n"
+      "      --activation-server <url>         Online Activation Authority URL\n"
+      "      --vm-root <hex>                   Canonical 64-character hex VM root seed\n"
+      "      --vm-root-file <file>             File containing 32-byte VM root seed\n"
       "      --rtprotect-root <dir>            Root path to RTProtect distribution / SDK\n"
       "      --no-build                        Skip automatic build and verification\n"
       "      --non-interactive                 Do not prompt for confirmation\n"
@@ -490,6 +493,12 @@ int CmdIntegrate(int argc, char** argv) {
       options.license_file_path = argv[++i];
     } else if (arg == "--dev-keys-dir" && i + 1 < argc) {
       options.dev_keys_dir = argv[++i];
+    } else if (arg == "--activation-server" && i + 1 < argc) {
+      options.activation_server_url = argv[++i];
+    } else if (arg == "--vm-root" && i + 1 < argc) {
+      options.vm_root_hex = argv[++i];
+    } else if (arg == "--vm-root-file" && i + 1 < argc) {
+      options.vm_root_file = argv[++i];
     } else {
       std::fprintf(stderr, "Unknown option: %s\n", arg.c_str());
       return 2;

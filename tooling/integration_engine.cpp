@@ -35,6 +35,8 @@
 #include "integrity/signer.h"
 #include "integrity/verifier.h"
 #include "licensing/activation.h"
+#include "licensing/activation_client.h"
+#include "licensing/secure_storage.h"
 #include "licensing/hardware_id.h"
 #include "licensing/license.h"
 #include "licensing/license_signer.h"
@@ -917,15 +919,67 @@ IntegrationReport ExecuteIntegration(const IntegrationOptions& options) {
     }
   }
 
-  rtprotect::licensing::ActivationToken dev_token;
-  if (!rtprotect::licensing::LoadOrCreateDevToken(options.product_id, dev_lic_id, &dev_token)) {
-    if (RAND_bytes(dev_token.vm_root.data(), static_cast<int>(dev_token.vm_root.size())) != 1) {
-      for (std::size_t i = 0; i < dev_token.vm_root.size(); ++i) {
-        dev_token.vm_root[i] = static_cast<std::uint8_t>((i * 7 + 0x3C) & 0xFF);
+  std::array<std::uint8_t, 32> vm_root{};
+  bool vm_root_set = false;
+
+  // 1. Explicit VM root provided via options (file or hex string)
+  if (!options.vm_root_file.empty()) {
+    auto file_bytes = ReadFile(options.vm_root_file);
+    if (file_bytes.has_value() && file_bytes->size() >= 32) {
+      std::memcpy(vm_root.data(), file_bytes->data(), 32);
+      vm_root_set = true;
+    }
+  } else if (!options.vm_root_hex.empty() && options.vm_root_hex.size() == 64) {
+    for (std::size_t i = 0; i < 32; ++i) {
+      unsigned int byte_val = 0;
+      std::sscanf(options.vm_root_hex.c_str() + i * 2, "%02x", &byte_val);
+      vm_root[i] = static_cast<std::uint8_t>(byte_val);
+    }
+    vm_root_set = true;
+  }
+
+  // 2. Deterministic derivation from vendor manifest signing key (Production Release)
+  if (!vm_root_set && !options.sign_manifest_key_path.empty()) {
+    auto priv_data = ReadFile(options.sign_manifest_key_path);
+    if (priv_data.has_value() && priv_data->size() == 64) {
+      crypto::SecureBuffer sec_priv(priv_data->data(), priv_data->size());
+      std::vector<std::uint8_t> salt(options.product_id.begin(), options.product_id.end());
+      auto derived = crypto::Hkdf::DeriveKey(sec_priv, salt, "rtprotect/vm_root/v1", 32);
+      if (derived.has_value() && derived->size() == 32) {
+        std::memcpy(vm_root.data(), derived->data(), 32);
+        vm_root_set = true;
       }
     }
   }
-  std::array<std::uint8_t, 32> vm_root = dev_token.vm_root;
+
+  // 3. Online Activation Authority provisioning at build time (if server URL is configured)
+  if (!vm_root_set && !options.activation_server_url.empty()) {
+    std::string act_err;
+    auto srv_token = rtprotect::licensing::RequestOnlineActivation(
+        options.activation_server_url, dev_lic_id, options.product_id, manifest_pubkey, &act_err);
+    if (srv_token.has_value()) {
+      vm_root = srv_token->vm_root;
+      vm_root_set = true;
+      rtprotect::licensing::SaveActivationToken(options.product_id, *srv_token);
+    }
+  }
+
+  // 4. Local dev token fallback (stored in OS secure storage & external dev_keys_dir)
+  if (!vm_root_set) {
+    rtprotect::licensing::ActivationToken dev_token;
+    if (rtprotect::licensing::LoadOrCreateDevToken(options.product_id, dev_lic_id, &dev_token)) {
+      vm_root = dev_token.vm_root;
+      vm_root_set = true;
+    } else {
+      if (RAND_bytes(dev_token.vm_root.data(), static_cast<int>(dev_token.vm_root.size())) != 1) {
+        for (std::size_t i = 0; i < dev_token.vm_root.size(); ++i) {
+          dev_token.vm_root[i] = static_cast<std::uint8_t>((i * 7 + 0x3C) & 0xFF);
+        }
+      }
+      vm_root = dev_token.vm_root;
+      vm_root_set = true;
+    }
+  }
 
   fs::path config_header_path = proj_path / "rtprotect_config.h";
   {
@@ -946,6 +1000,8 @@ IntegrationReport ExecuteIntegration(const IntegrationOptions& options) {
     ss << "inline constexpr const char* kReleaseVersion = \"" << options.release_version << "\";\n";
     ss << "inline constexpr const char* kProtectionProfile = \"" << ToString(options.profile) << "\";\n";
     ss << "inline constexpr const char* kExpectedExecutableName = \"" << expected_exe_name << "\";\n";
+    ss << "inline constexpr const char* kActivationServerUrl = \"" << options.activation_server_url << "\";\n";
+    ss << "inline constexpr bool kAllowDevTokenFallback = " << (options.use_dev_keys ? "true" : "false") << ";\n";
     ss << "inline constexpr std::uint64_t kRequiredCapabilities = 0x01; // kCapCoreExecution\n";
     ss << "inline constexpr std::uint64_t kMinimumReleaseSequence = 1;\n\n";
 
@@ -1008,6 +1064,8 @@ IntegrationReport ExecuteIntegration(const IntegrationOptions& options) {
     ss << "#include \"licensing/license.h\"\n";
     ss << "#include \"licensing/license_verifier.h\"\n";
     ss << "#include \"licensing/activation.h\"\n";
+    ss << "#include \"licensing/activation_client.h\"\n";
+    ss << "#include \"licensing/secure_storage.h\"\n";
     ss << "#include \"licensing/hardware_id.h\"\n";
     ss << "#include \"integrity/manifest.h\"\n";
     ss << "#include \"integrity/verifier.h\"\n";
@@ -1144,9 +1202,35 @@ IntegrationReport ExecuteIntegration(const IntegrationOptions& options) {
     ss << "  auto manifest = rtprotect::integrity::DeserializeManifest(man_bytes->data(), man_bytes->size());\n";
     ss << "  if (!manifest.has_value() || manifest->release_sequence < kMinimumReleaseSequence) return false;\n";
 
-    ss << "\n  // 4. Activation token verification and VM root derivation\n";
+    ss << "\n  // 4. Activation token retrieval and VM root derivation\n";
     ss << "  rtprotect::licensing::ActivationToken token;\n";
-    ss << "  if (!rtprotect::licensing::LoadOrCreateDevToken(kProductId, lic.license_id, &token)) return false;\n";
+    ss << "  bool token_loaded = false;\n\n";
+    ss << "  // 4a. Check OS secure storage (DPAPI / Keychain / Secret Service)\n";
+    ss << "  auto cached_tok = rtprotect::licensing::LoadActivationToken(kProductId);\n";
+    ss << "  if (cached_tok.has_value() && (cached_tok->license_id == lic.license_id || cached_tok->license_id.empty())) {\n";
+    ss << "    if (cached_tok->expires_at == 0 || ctx.current_time <= cached_tok->expires_at) {\n";
+    ss << "      token = *cached_tok;\n";
+    ss << "      token_loaded = true;\n";
+    ss << "    }\n";
+    ss << "  }\n\n";
+    ss << "  // 4b. Online Activation against server if uncached or expired\n";
+    ss << "  if (!token_loaded && kActivationServerUrl[0] != '\\0') {\n";
+    ss << "    std::string act_err;\n";
+    ss << "    auto online_token = rtprotect::licensing::RequestOnlineActivation(\n";
+    ss << "        kActivationServerUrl, lic.license_id, kProductId, kManifestPublicKey, &act_err);\n";
+    ss << "    if (online_token.has_value()) {\n";
+    ss << "      token = *online_token;\n";
+    ss << "      rtprotect::licensing::SaveActivationToken(kProductId, token);\n";
+    ss << "      token_loaded = true;\n";
+    ss << "    }\n";
+    ss << "  }\n\n";
+    ss << "  // 4c. Development local token fallback (only active if --dev-keys was used at build time)\n";
+    ss << "  if (!token_loaded && kAllowDevTokenFallback) {\n";
+    ss << "    if (rtprotect::licensing::LoadOrCreateDevToken(kProductId, lic.license_id, &token)) {\n";
+    ss << "      token_loaded = true;\n";
+    ss << "    }\n";
+    ss << "  }\n\n";
+    ss << "  if (!token_loaded) return false; // Activation required -> fail closed\n";
     ss << "  if (token.expires_at > 0 && ctx.current_time > token.expires_at) return false;\n";
     ss << "  SetRuntimeManifestRoot(token.vm_root.data(), 32);\n";
 
