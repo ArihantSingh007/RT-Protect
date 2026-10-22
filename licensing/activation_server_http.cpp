@@ -9,6 +9,9 @@
 #include <sstream>
 #include <vector>
 
+#include <openssl/ssl.h>
+#include <openssl/err.h>
+
 #if defined(_WIN32)
 #include <winsock2.h>
 #include <ws2tcpip.h>
@@ -43,6 +46,20 @@ struct WinsockInit {
 static WinsockInit s_winsock_init;
 #endif
 
+void SetSocketTimeouts(socket_t s, int timeout_seconds) {
+#if defined(_WIN32)
+  DWORD tv_ms = static_cast<DWORD>(timeout_seconds * 1000);
+  setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&tv_ms), sizeof(tv_ms));
+  setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, reinterpret_cast<const char*>(&tv_ms), sizeof(tv_ms));
+#else
+  struct timeval tv {};
+  tv.tv_sec = timeout_seconds;
+  tv.tv_usec = 0;
+  setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+  setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+#endif
+}
+
 }  // namespace
 
 ActivationServerHttp::ActivationServerHttp(ActivationService& service)
@@ -50,10 +67,51 @@ ActivationServerHttp::ActivationServerHttp(ActivationService& service)
 
 ActivationServerHttp::~ActivationServerHttp() {
   Stop();
+  if (ssl_ctx_) {
+    SSL_CTX_free(reinterpret_cast<SSL_CTX*>(ssl_ctx_));
+    ssl_ctx_ = nullptr;
+  }
+}
+
+bool ActivationServerHttp::EnableTls(const std::string& cert_file, const std::string& key_file) {
+  if (running_.load()) return false; // Must be set before Start()
+
+  if (ssl_ctx_) {
+    SSL_CTX_free(reinterpret_cast<SSL_CTX*>(ssl_ctx_));
+    ssl_ctx_ = nullptr;
+  }
+
+  const SSL_METHOD* method = TLS_server_method();
+  SSL_CTX* ctx = SSL_CTX_new(method);
+  if (!ctx) return false;
+
+  SSL_CTX_set_min_proto_version(ctx, TLS1_2_VERSION);
+
+  if (SSL_CTX_use_certificate_file(ctx, cert_file.c_str(), SSL_FILETYPE_PEM) <= 0) {
+    SSL_CTX_free(ctx);
+    return false;
+  }
+
+  if (SSL_CTX_use_PrivateKey_file(ctx, key_file.c_str(), SSL_FILETYPE_PEM) <= 0) {
+    SSL_CTX_free(ctx);
+    return false;
+  }
+
+  if (!SSL_CTX_check_private_key(ctx)) {
+    SSL_CTX_free(ctx);
+    return false;
+  }
+
+  ssl_ctx_ = ctx;
+  is_tls_ = true;
+  tls_cert_file_ = cert_file;
+  tls_key_file_ = key_file;
+  return true;
 }
 
 std::string ActivationServerHttp::base_url() const {
-  return "http://" + host_ + ":" + std::to_string(port_);
+  std::string scheme = is_tls_ ? "https://" : "http://";
+  return scheme + host_ + ":" + std::to_string(port_);
 }
 
 bool ActivationServerHttp::Start(std::uint16_t port, const std::string& host) {
@@ -84,7 +142,7 @@ bool ActivationServerHttp::Start(std::uint16_t port, const std::string& host) {
     return false;
   }
 
-  if (listen(listen_sock, 16) != 0) {
+  if (listen(listen_sock, 32) != 0) {
     CLOSE_SOCKET(listen_sock);
     return false;
   }
@@ -99,7 +157,7 @@ bool ActivationServerHttp::Start(std::uint16_t port, const std::string& host) {
   listen_fd_ = static_cast<uintptr_t>(listen_sock);
   running_.store(true);
 
-  worker_thread_ = std::thread(&ActivationServerHttp::ServerLoop, this);
+  accept_thread_ = std::thread(&ActivationServerHttp::ServerLoop, this);
   return true;
 }
 
@@ -112,8 +170,17 @@ void ActivationServerHttp::Stop() {
     CLOSE_SOCKET(s);
   }
 
-  if (worker_thread_.joinable()) {
-    worker_thread_.join();
+  if (accept_thread_.joinable()) {
+    accept_thread_.join();
+  }
+
+  // Wait for in-flight requests to complete
+  auto start = std::chrono::steady_clock::now();
+  while (active_clients_.load() > 0) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    if (std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now() - start).count() > 2) {
+      break;
+    }
   }
 }
 
@@ -127,7 +194,7 @@ void ActivationServerHttp::ServerLoop() {
 
     timeval tv{};
     tv.tv_sec = 0;
-    tv.tv_usec = 100000; // 100ms timeout to check running_ flag
+    tv.tv_usec = 100000; // 100ms poll interval
 
     int sel = select(static_cast<int>(listen_sock + 1), &read_fds, nullptr, nullptr, &tv);
     if (sel <= 0) continue;
@@ -137,42 +204,123 @@ void ActivationServerHttp::ServerLoop() {
     socket_t client_sock = accept(listen_sock, reinterpret_cast<sockaddr*>(&client_addr), &client_len);
     if (client_sock == INVALID_SOCKET_VALUE) continue;
 
-    // Read HTTP request
-    std::string raw_req;
-    char buf[4096];
-    std::size_t content_length = 0;
-    std::size_t header_end = std::string::npos;
-
-    while (running_.load()) {
-      int bytes = recv(client_sock, buf, sizeof(buf), 0);
-      if (bytes <= 0) break;
-      raw_req.append(buf, bytes);
-
-      if (header_end == std::string::npos) {
-        header_end = raw_req.find("\r\n\r\n");
-        if (header_end != std::string::npos) {
-          // Parse Content-Length
-          auto cl_pos = raw_req.find("Content-Length:");
-          if (cl_pos == std::string::npos) cl_pos = raw_req.find("content-length:");
-          if (cl_pos != std::string::npos && cl_pos < header_end) {
-            cl_pos += 15;
-            while (cl_pos < header_end && (raw_req[cl_pos] == ' ' || raw_req[cl_pos] == '\t')) ++cl_pos;
-            content_length = std::strtoul(raw_req.c_str() + cl_pos, nullptr, 10);
-          }
-        }
-      }
-
-      if (header_end != std::string::npos) {
-        std::size_t body_len = raw_req.size() - (header_end + 4);
-        if (body_len >= content_length) break;
-      }
-    }
-
-    if (raw_req.empty()) {
+    // Concurrency limit enforcement
+    if (active_clients_.load() >= kMaxConcurrentClients) {
+      const char* busy_resp =
+          "HTTP/1.1 503 Service Unavailable\r\n"
+          "Content-Type: application/json\r\n"
+          "Content-Length: 33\r\n"
+          "Connection: close\r\n\r\n"
+          "{\"error\":\"server busy - try later\"}\n";
+      send(client_sock, busy_resp, static_cast<int>(std::strlen(busy_resp)), 0);
       CLOSE_SOCKET(client_sock);
       continue;
     }
 
+    // Dispatch connection to worker thread to prevent single client from blocking the service
+    active_clients_++;
+    std::thread([this, client_sock]() {
+      HandleClient(static_cast<uintptr_t>(client_sock));
+      active_clients_--;
+    }).detach();
+  }
+}
+
+void ActivationServerHttp::HandleClient(uintptr_t client_sock_fd) {
+  socket_t client_sock = static_cast<socket_t>(client_sock_fd);
+
+  // Set 5-second socket timeout to prevent Slowloris attacks
+  SetSocketTimeouts(client_sock, 5);
+
+  SSL* ssl = nullptr;
+  if (is_tls_ && ssl_ctx_) {
+    ssl = SSL_new(reinterpret_cast<SSL_CTX*>(ssl_ctx_));
+    if (!ssl) {
+      CLOSE_SOCKET(client_sock);
+      return;
+    }
+    SSL_set_fd(ssl, static_cast<int>(client_sock));
+    if (SSL_accept(ssl) <= 0) {
+      SSL_free(ssl);
+      CLOSE_SOCKET(client_sock);
+      return;
+    }
+  }
+
+  auto raw_read = [&](char* buf, int max_len) -> int {
+    if (ssl) {
+      return SSL_read(ssl, buf, max_len);
+    }
+    return recv(client_sock, buf, max_len, 0);
+  };
+
+  auto raw_write = [&](const char* buf, int len) -> int {
+    if (ssl) {
+      return SSL_write(ssl, buf, len);
+    }
+    return send(client_sock, buf, len, 0);
+  };
+
+  std::string raw_req;
+  char buf[4096];
+  std::size_t content_length = 0;
+  std::size_t header_end = std::string::npos;
+  bool payload_too_large = false;
+
+  while (running_.load()) {
+    int bytes = raw_read(buf, sizeof(buf));
+    if (bytes <= 0) break;
+
+    raw_req.append(buf, bytes);
+
+    // Limit maximum total size to prevent unbounded memory consumption
+    if (raw_req.size() > (kMaxHeaderBytes + kMaxRequestBodyBytes)) {
+      payload_too_large = true;
+      break;
+    }
+
+    if (header_end == std::string::npos) {
+      header_end = raw_req.find("\r\n\r\n");
+      if (header_end != std::string::npos) {
+        if (header_end > kMaxHeaderBytes) {
+          payload_too_large = true;
+          break;
+        }
+
+        auto cl_pos = raw_req.find("Content-Length:");
+        if (cl_pos == std::string::npos) cl_pos = raw_req.find("content-length:");
+        if (cl_pos != std::string::npos && cl_pos < header_end) {
+          cl_pos += 15;
+          while (cl_pos < header_end && (raw_req[cl_pos] == ' ' || raw_req[cl_pos] == '\t')) ++cl_pos;
+          content_length = std::strtoul(raw_req.c_str() + cl_pos, nullptr, 10);
+          if (content_length > kMaxRequestBodyBytes) {
+            payload_too_large = true;
+            break;
+          }
+        }
+      }
+    }
+
+    if (header_end != std::string::npos) {
+      std::size_t body_len = raw_req.size() - (header_end + 4);
+      if (body_len >= content_length) break;
+    }
+  }
+
+  std::string status_line = "HTTP/1.1 200 OK";
+  std::string resp_body;
+
+  if (payload_too_large) {
+    status_line = "HTTP/1.1 413 Payload Too Large";
+    resp_body = "{\"error\":\"payload exceeds maximum allowed limit\"}\n";
+  } else if (raw_req.empty()) {
+    if (ssl) {
+      SSL_shutdown(ssl);
+      SSL_free(ssl);
+    }
+    CLOSE_SOCKET(client_sock);
+    return;
+  } else {
     // Parse method and path
     std::istringstream stream(raw_req);
     std::string method, path, proto;
@@ -183,9 +331,6 @@ void ActivationServerHttp::ServerLoop() {
       body = raw_req.substr(header_end + 4);
       if (body.size() > content_length) body.resize(content_length);
     }
-
-    std::string resp_body;
-    std::string status_line = "HTTP/1.1 200 OK";
 
     if (path == "/activate" && method == "POST") {
       resp_body = service_.HandleActivateJson(body);
@@ -199,19 +344,24 @@ void ActivationServerHttp::ServerLoop() {
       status_line = "HTTP/1.1 404 Not Found";
       resp_body = "{\"error\":\"endpoint not found\"}\n";
     }
-
-    std::ostringstream resp_stream;
-    resp_stream << status_line << "\r\n";
-    resp_stream << "Content-Type: application/json\r\n";
-    resp_stream << "Content-Length: " << resp_body.size() << "\r\n";
-    resp_stream << "Connection: close\r\n";
-    resp_stream << "\r\n";
-    resp_stream << resp_body;
-
-    std::string resp_str = resp_stream.str();
-    send(client_sock, resp_str.data(), static_cast<int>(resp_str.size()), 0);
-    CLOSE_SOCKET(client_sock);
   }
+
+  std::ostringstream resp_stream;
+  resp_stream << status_line << "\r\n";
+  resp_stream << "Content-Type: application/json\r\n";
+  resp_stream << "Content-Length: " << resp_body.size() << "\r\n";
+  resp_stream << "Connection: close\r\n";
+  resp_stream << "\r\n";
+  resp_stream << resp_body;
+
+  std::string resp_str = resp_stream.str();
+  raw_write(resp_str.data(), static_cast<int>(resp_str.size()));
+
+  if (ssl) {
+    SSL_shutdown(ssl);
+    SSL_free(ssl);
+  }
+  CLOSE_SOCKET(client_sock);
 }
 
 }  // namespace rtprotect::licensing

@@ -292,7 +292,8 @@ IntegrationReport ExecuteUnrealIntegration(const IntegrationOptions& options) {
         "#pragma once\n"
         "#define RTPROTECT_UNREAL_BUILD 1\n"
         "#define RTPROTECT_PRODUCT_ID \"" + options.product_id + "\"\n"
-        "#define RTPROTECT_VERSION \"" + options.release_version + "\"\n";
+        "#define RTPROTECT_VERSION \"" + options.release_version + "\"\n"
+        "#define RTPROTECT_ACTIVATION_SERVER_URL \"" + options.activation_server_url + "\"\n";
     WriteStringToFile(config_path, config_content);
     report.generated_files.push_back(config_path.string());
 

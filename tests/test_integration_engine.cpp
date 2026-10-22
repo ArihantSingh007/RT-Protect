@@ -32,6 +32,11 @@
 #include "licensing/license_signer.h"
 #include "licensing/license_verifier.h"
 #include "licensing/activation.h"
+#include "licensing/activation_client.h"
+#include "licensing/activation_database.h"
+#include "licensing/activation_server_http.h"
+#include "licensing/activation_service.h"
+#include "licensing/secure_storage.h"
 #include "licensing/hardware_id.h"
 #include "integrity/manifest.h"
 #include "integrity/signer.h"
@@ -1001,6 +1006,198 @@ void TestAstScannerRawStringsAndTranslationUnitObfuscation() {
   std::printf("  PASSED: AST scanner raw string parsing and translation unit string obfuscation verified.\n");
 }
 
+void TestIntegration_OnlineActivationPipeline_EndToEndRoundTrip() {
+  std::printf("Running TestIntegration_OnlineActivationPipeline_EndToEndRoundTrip...\n");
+
+  fs::path test_dir = "temp_test_online_act_e2e";
+  CleanDir(test_dir);
+  fs::create_directories(test_dir);
+
+  auto man_kp = integrity::GenerateEd25519KeyPair();
+  auto lic_kp = integrity::GenerateEd25519KeyPair();
+  assert(man_kp.has_value() && lic_kp.has_value());
+
+  WriteFile((test_dir / "release.pub").string(), man_kp->public_key.data(), man_kp->public_key.size());
+  WriteFile((test_dir / "license.pub").string(), lic_kp->public_key.data(), lic_kp->public_key.size());
+  WriteFile((test_dir / "release.priv").string(), man_kp->private_key.data(), man_kp->private_key.size());
+  WriteFile((test_dir / "license.priv").string(), lic_kp->private_key.data(), lic_kp->private_key.size());
+
+  // Set up persistent Activation Database and HTTP Authority Server
+  std::string db_path = (test_dir / "activations.db").string();
+  licensing::ActivationDatabase db(db_path);
+
+  // Define canonical server-side vm_root
+  std::array<std::uint8_t, 32> canonical_vm_root{};
+  for (std::size_t i = 0; i < 32; ++i) {
+    canonical_vm_root[i] = static_cast<std::uint8_t>((i * 11 + 0x4F) & 0xFF);
+  }
+
+  licensing::LicenseRecord lic_rec;
+  lic_rec.license_id = "lic-online-e2e-100";
+  lic_rec.product_id = "com.vendor.e2eapp";
+  lic_rec.max_seats = 5;
+  lic_rec.created_at = 1700000000;
+  lic_rec.vm_root = canonical_vm_root;
+  assert(db.RegisterLicense(lic_rec));
+
+  licensing::ActivationService srv_service(db, std::move(man_kp->private_key), man_kp->public_key);
+  licensing::ActivationServerHttp server(srv_service);
+  assert(server.Start(0, "127.0.0.1"));
+  std::string server_url = server.base_url();
+
+  // Create valid client.license matching the registered license
+  licensing::License client_lic;
+  client_lic.license_id = "lic-online-e2e-100";
+  client_lic.product_id = "com.vendor.e2eapp";
+  client_lic.edition = "Enterprise";
+  client_lic.customer_id = "client-user";
+  client_lic.capabilities = licensing::kCapCoreExecution;
+  client_lic.issued_at = 1700000000;
+  client_lic.expires_at = 0; // Perpetual
+  client_lic.hardware_id = licensing::GetLocalHardwareId();
+  licensing::SignLicense(client_lic, lic_kp->private_key);
+  auto lic_bytes = licensing::SerializeLicense(client_lic);
+  WriteFile((test_dir / "client.license").string(), lic_bytes.data(), lic_bytes.size());
+
+  // Create a minimal CMakeLists.txt and main.cpp containing a virtualized tagged function
+  std::string cmake_txt =
+      "cmake_minimum_required(VERSION 3.20)\n"
+      "project(e2eapp CXX)\n"
+      "add_executable(e2eapp main.cpp)\n";
+  WriteTextFile((test_dir / "CMakeLists.txt").string(), cmake_txt);
+
+  std::string cpp_txt =
+      "#include <cstdint>\n"
+      "RTPROTECT_VIRTUALIZE int64_t ComputeSecret(int64_t a, int64_t b) {\n"
+      "  return a * 10 + b;\n"
+      "}\n"
+      "int main() { return static_cast<int>(ComputeSecret(5, 7)); }\n";
+  WriteTextFile((test_dir / "main.cpp").string(), cpp_txt);
+
+  // Configure integration options pointing to the online activation authority server
+  IntegrationOptions options;
+  options.target_project_path = test_dir.string();
+  options.product_id = "com.vendor.e2eapp";
+  options.release_version = "1.0.0";
+  options.activation_server_url = server_url;
+  options.manifest_pubkey_path = (test_dir / "release.pub").string();
+  options.license_pubkey_path = (test_dir / "license.pub").string();
+  options.license_file_path = (test_dir / "client.license").string();
+  options.run_build = false; // We test the generated code, headers, and cryptographic VM contract directly
+  options.staging_only = false;
+  // Pass canonical vm_root directly or via options
+  options.vm_root_hex = "";
+  for (auto b : canonical_vm_root) {
+    char h[3];
+    std::snprintf(h, sizeof(h), "%02x", b);
+    options.vm_root_hex += h;
+  }
+
+  auto report = ExecuteIntegration(options);
+  assert(report.success);
+  assert(report.virtualized_functions.size() == 1);
+  assert(report.virtualized_functions[0] == "ComputeSecret");
+
+  // Verify rtprotect_config.h contains the activation server URL
+  auto config_content = ReadTextFile((test_dir / "rtprotect_config.h").string());
+  assert(config_content.has_value());
+  assert(config_content->find(server_url) != std::string::npos);
+
+  // Verify rtprotect_runtime_glue.cpp contains online activation and secure storage integration
+  auto glue_content = ReadTextFile((test_dir / "rtprotect_runtime_glue.cpp").string());
+  assert(glue_content.has_value());
+  assert(glue_content->find("RequestOnlineActivation") != std::string::npos);
+  assert(glue_content->find("SecureStorage") != std::string::npos || glue_content->find("LoadActivationToken") != std::string::npos);
+
+  // Now, simulate the end-user machine:
+  // Ensure NO token exists in local secure storage
+  licensing::SecureStorage::Delete("activation_com_vendor_e2eapp");
+
+  // Call online activation over network socket against the server
+  std::string net_err;
+  auto net_token = licensing::RequestOnlineActivation(
+      server_url, "lic-online-e2e-100", "com.vendor.e2eapp", man_kp->public_key, &net_err);
+  assert(net_token.has_value());
+  assert(net_token->license_id == "lic-online-e2e-100");
+  assert(net_token->vm_root == canonical_vm_root); // Critical: Server issued the exact canonical vm_root!
+
+  // Save the server-issued token into OS SecureStorage (Windows DPAPI / Keychain / Secret Service)
+  assert(licensing::SaveActivationToken("com.vendor.e2eapp", *net_token));
+
+  // Verify that subsequent retrieval from local SecureStorage loads the exact same token
+  auto cached_tok = licensing::LoadActivationToken("com.vendor.e2eapp");
+  assert(cached_tok.has_value());
+  assert(cached_tok->vm_root == canonical_vm_root);
+
+  // Test VM execution round-trip under this canonical root:
+  // Compile the virtualized function
+  std::string compile_err;
+  vm::CompilerOptions c_opts;
+  auto opcode_map = vm::OpcodeMap::FromSeed(report.opcode_seed);
+  c_opts.opcode_map = &opcode_map;
+
+  auto prog = vm::CompileCSubset("int64_t ComputeSecret(int64_t a, int64_t b) { return a * 10 + b; }", &compile_err, c_opts);
+  assert(prog.has_value());
+
+  auto bytecode = vm::Serialize(*prog);
+
+  // Build the routine key from canonical vm_root:
+  // HKDF(vm_root, salt=pubkey + "ComputeSecret", info="rtprotect/virtualize/com.vendor.e2eapp")
+  crypto::SecureBuffer sec_root(canonical_vm_root.data(), canonical_vm_root.size());
+  std::vector<std::uint8_t> salt(man_kp->public_key.begin(), man_kp->public_key.end());
+  std::string fn_name = "ComputeSecret";
+  salt.insert(salt.end(), fn_name.begin(), fn_name.end());
+  std::string info = "rtprotect/virtualize/com.vendor.e2eapp";
+  auto derived_key_opt = crypto::Hkdf::DeriveKey(sec_root, salt, info, 32);
+  assert(derived_key_opt.has_value());
+  auto derived_key = crypto::Aes256Key::FromBytes(derived_key_opt->data(), derived_key_opt->size());
+  assert(derived_key.has_value());
+
+  // Encrypt bytecode at build time
+  auto encrypted_prog = crypto::Encrypt(*derived_key, bytecode.data(), bytecode.size());
+  assert(encrypted_prog.has_value());
+  auto wire_bytes = encrypted_prog->Serialize();
+
+  // Runtime decryption: decrypt using key derived from cached_tok->vm_root!
+  crypto::SecureBuffer runtime_sec_root(cached_tok->vm_root.data(), cached_tok->vm_root.size());
+  auto runtime_key_opt = crypto::Hkdf::DeriveKey(runtime_sec_root, salt, info, 32);
+  assert(runtime_key_opt.has_value());
+  auto runtime_key = crypto::Aes256Key::FromBytes(runtime_key_opt->data(), runtime_key_opt->size());
+  assert(runtime_key.has_value());
+
+  auto msg = crypto::EncryptedMessage::Deserialize(wire_bytes.data(), wire_bytes.size());
+  assert(msg.has_value());
+  auto decrypted_bytecode = crypto::Decrypt(*runtime_key, *msg, nullptr, 0, nullptr);
+  assert(decrypted_bytecode.has_value());
+
+  auto restored_prog = vm::Deserialize(decrypted_bytecode->data(), decrypted_bytecode->size());
+  assert(restored_prog.has_value());
+
+  // Run in VM with inputs a=5, b=7 -> output must be 5*10 + 7 = 57
+  std::vector<std::int64_t> test_args = {5, 7};
+  vm::MemoryContext mem_ctx(65536);
+  auto exec_res = vm::Run(*restored_prog, test_args, &opcode_map, &mem_ctx);
+  assert(exec_res.error == vm::VmError::kNone);
+  assert(exec_res.value == 57);
+
+  // Adversarial check: An unauthorized / different random root MUST fail decryption closed!
+  std::array<std::uint8_t, 32> wrong_root{};
+  wrong_root.fill(0xEE);
+  crypto::SecureBuffer wrong_sec_root(wrong_root.data(), wrong_root.size());
+  auto wrong_key_opt = crypto::Hkdf::DeriveKey(wrong_sec_root, salt, info, 32);
+  auto wrong_key = crypto::Aes256Key::FromBytes(wrong_key_opt->data(), wrong_key_opt->size());
+  assert(wrong_key.has_value());
+  crypto::AeadError aead_err = crypto::AeadError::kNone;
+  auto fail_decrypted = crypto::Decrypt(*wrong_key, *msg, nullptr, 0, &aead_err);
+  assert(!fail_decrypted.has_value()); // Fail closed! Wrong root cannot decrypt.
+
+  // Shutdown server and clean up
+  server.Stop();
+  licensing::SecureStorage::Delete("activation_com_vendor_e2eapp");
+  CleanDir(test_dir);
+  std::printf("  PASSED: End-to-end online server provisioning, secure storage caching, and matching vm_root verified.\n");
+}
+
 }  // namespace
 
 int main() {
@@ -1024,6 +1221,7 @@ int main() {
   TestFunctionExtractionHandlesCommentsAndStrings();
   TestDetailedJsonReporting();
   TestAstScannerRawStringsAndTranslationUnitObfuscation();
+  TestIntegration_OnlineActivationPipeline_EndToEndRoundTrip();
   std::printf("ALL INTEGRATION ENGINE TESTS PASSED.\n");
   return 0;
 }

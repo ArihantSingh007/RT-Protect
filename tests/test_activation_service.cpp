@@ -341,4 +341,76 @@ MT_TEST(HttpServer_Loopback_ActivateAndRenew) {
   std::filesystem::remove(db_path, ec);
 }
 
+MT_TEST(HttpServer_PayloadTooLarge_Rejected) {
+  std::string db_path = MakeTempDbPath();
+  std::error_code ec;
+  std::filesystem::remove(db_path, ec);
+
+  auto kp = MakeKeyPair();
+  ActivationDatabase db(db_path);
+  ActivationService service(db, std::move(kp.private_key), kp.public_key);
+  ActivationServerHttp server(service);
+
+  MT_CHECK(server.Start(0, "127.0.0.1"));
+  std::string server_url = server.base_url();
+
+  // Send an oversized payload > 64KB
+  std::string huge_body(70000, 'X');
+  std::string err;
+  auto res = RequestOnlineActivation(server_url, huge_body, "com.vendor.app", kp.public_key, &err);
+  // Must fail closed due to HTTP 413 Payload Too Large
+  MT_CHECK(!res.has_value());
+
+  server.Stop();
+  std::filesystem::remove(db_path, ec);
+}
+
+MT_TEST(HttpServer_ConcurrentClients_NonBlocking) {
+  std::string db_path = MakeTempDbPath();
+  std::error_code ec;
+  std::filesystem::remove(db_path, ec);
+
+  auto kp = MakeKeyPair();
+  ActivationDatabase db(db_path);
+
+  // Register 10 distinct licenses
+  for (int i = 0; i < 10; ++i) {
+    LicenseRecord lic;
+    lic.license_id = "lic-concur-" + std::to_string(i);
+    lic.product_id = "com.vendor.concurapp";
+    lic.max_seats = 5;
+    lic.created_at = 1700000000;
+    lic.vm_root.fill(static_cast<std::uint8_t>(i + 1));
+    MT_CHECK(db.RegisterLicense(lic));
+  }
+
+  ActivationService service(db, std::move(kp.private_key), kp.public_key);
+  ActivationServerHttp server(service);
+  MT_CHECK(server.Start(0, "127.0.0.1"));
+  std::string server_url = server.base_url();
+
+  std::vector<std::thread> workers;
+  std::atomic<int> success_count{0};
+
+  for (int i = 0; i < 10; ++i) {
+    workers.emplace_back([i, &server_url, &kp, &success_count]() {
+      std::string err;
+      std::string lic_id = "lic-concur-" + std::to_string(i);
+      auto tok = RequestOnlineActivation(server_url, lic_id, "com.vendor.concurapp", kp.public_key, &err);
+      if (tok.has_value() && tok->license_id == lic_id) {
+        success_count++;
+      }
+    });
+  }
+
+  for (auto& w : workers) {
+    if (w.joinable()) w.join();
+  }
+
+  MT_CHECK(success_count.load() == 10);
+
+  server.Stop();
+  std::filesystem::remove(db_path, ec);
+}
+
 MT_MAIN()
