@@ -1,6 +1,7 @@
 // licensing/activation_server_http.cpp
 
 #include "licensing/activation_server_http.h"
+#include "licensing/abuse_analytics.h"
 
 #include <algorithm>
 #include <array>
@@ -607,6 +608,37 @@ void ActivationServerHttp::HandleClient(uintptr_t client_sock_fd, const std::str
         }
         ess << "  ]\n}\n";
         resp_body = ess.str();
+      }
+    } else if ((path == "/analytics" || path.rfind("/analytics?", 0) == 0) && method == "GET") {
+      // Administrative abuse analytics and anomaly detection endpoint (requires authentication)
+      bool authorized = false;
+      if (!admin_auth_token_.empty()) {
+        std::string headers_part = (header_end != std::string::npos) ? raw_req.substr(0, header_end) : raw_req;
+        auto x_admin = FindHeaderCaseInsensitive(headers_part, "X-Admin-Key");
+        if (x_admin.has_value() && ConstantTimeStringEquals(*x_admin, admin_auth_token_)) {
+          authorized = true;
+        } else {
+          auto auth_hdr = FindHeaderCaseInsensitive(headers_part, "Authorization");
+          if (auth_hdr.has_value()) {
+            std::string auth = *auth_hdr;
+            if (auth.rfind("Bearer ", 0) == 0 || auth.rfind("bearer ", 0) == 0) {
+              std::string token = auth.substr(7);
+              while (!token.empty() && (token.front() == ' ' || token.front() == '\t')) token.erase(0, 1);
+              if (ConstantTimeStringEquals(token, admin_auth_token_)) {
+                authorized = true;
+              }
+            }
+          }
+        }
+      }
+
+      if (!authorized) {
+        status_line = "HTTP/1.1 401 Unauthorized";
+        extra_headers = "WWW-Authenticate: Bearer realm=\"RTProtect Admin\"\r\n";
+        resp_body = "{\n  \"error\": \"Unauthorized: missing or invalid administrative authentication key\"\n}\n";
+      } else {
+        auto summary = AbuseAnalyticsEngine::Analyze(service_.database());
+        resp_body = AbuseAnalyticsEngine::ToJson(summary);
       }
     } else {
       status_line = "HTTP/1.1 404 Not Found";

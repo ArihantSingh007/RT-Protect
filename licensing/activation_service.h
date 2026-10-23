@@ -100,6 +100,8 @@ class ActivationService {
   std::vector<ActivationEvent> GetRecentEvents(const std::string& license_id = "", std::size_t limit = 100) const;
 
   const integrity::Ed25519PublicKey& public_key() const { return verification_key_; }
+  const ActivationDatabase& database() const { return db_; }
+  ActivationDatabase& database() { return db_; }
   RateLimiter& license_rate_limiter() { return license_rate_limiter_; }
   const RateLimiter& license_rate_limiter() const { return license_rate_limiter_; }
   RateLimiter& ip_rate_limiter() { return ip_rate_limiter_; }
