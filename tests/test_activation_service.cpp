@@ -26,6 +26,7 @@
 #include "licensing/activation_server.h"
 #include "licensing/activation_server_http.h"
 #include "licensing/activation_service.h"
+#include "licensing/abuse_analytics.h"
 #include "licensing/hardware_id.h"
 #include "tests/micro_test.h"
 #include "tooling/file_io.h"
@@ -1222,6 +1223,144 @@ MT_TEST(SecurityAudit_MandatoryActivationCredentials_ProductionMode) {
   MT_CHECK(resp_valid.status == ActivationStatus::kValid);
   MT_CHECK(!resp_valid.encrypted_token_hex.empty());
 
+  std::filesystem::remove(db_path, ec);
+}
+
+MT_TEST(AbuseAnalytics_AnomalyDetectionAndScoring) {
+  std::string db_path = MakeTempDbPath();
+  std::error_code ec;
+  std::filesystem::remove(db_path, ec);
+
+  ActivationDatabase db(db_path);
+
+  // 1. Normal License (1 seat, 1 device, normal activation)
+  LicenseRecord lic_normal;
+  lic_normal.license_id = "lic-normal";
+  lic_normal.product_id = "com.vendor.product";
+  lic_normal.max_seats = 1;
+  lic_normal.created_at = 1700000000;
+  lic_normal.vm_root.fill(0x11);
+  MT_CHECK(db.RegisterLicense(lic_normal));
+  MT_CHECK(db.RecordActivation(ActivationRecord{"lic-normal", "DEV-NORM-1", 1700001000, 1700001000, 1}));
+  db.RecordEvent(ActivationEvent{1700001000, ActivationEventType::kActivationSuccess, "lic-normal", "DEV-NORM-1", "192.168.1.50", "Success"});
+
+  // 2. Shared-Key License (1 seat, but 5 distinct devices across multiple subnets and replays)
+  LicenseRecord lic_shared;
+  lic_shared.license_id = "lic-shared-abuse";
+  lic_shared.product_id = "com.vendor.product";
+  lic_shared.max_seats = 1;
+  lic_shared.created_at = 1700000000;
+  lic_shared.vm_root.fill(0x22);
+  MT_CHECK(db.RegisterLicense(lic_shared));
+  for (int i = 1; i <= 5; ++i) {
+    std::string dev = "PIRATE-DEV-" + std::to_string(i);
+    std::string ip = "10." + std::to_string(i) + ".1.100";
+    db.RecordEvent(ActivationEvent{1700001000ULL + i * 10, ActivationEventType::kActivationSuccess, "lic-shared-abuse", dev, ip, "Activation"});
+    db.RecordEvent(ActivationEvent{1700001000ULL + i * 10 + 1, ActivationEventType::kReplayBlocked, "lic-shared-abuse", dev, ip, "Replay"});
+    db.RecordEvent(ActivationEvent{1700001000ULL + i * 10 + 2, ActivationEventType::kSeatLimitExceeded, "lic-shared-abuse", dev, ip, "Exceeded"});
+  }
+
+  // 3. Rapid Churn License (1 seat, 6 deactivations in window)
+  LicenseRecord lic_churn;
+  lic_churn.license_id = "lic-churn-abuse";
+  lic_churn.product_id = "com.vendor.product";
+  lic_churn.max_seats = 1;
+  lic_churn.created_at = 1700000000;
+  lic_churn.vm_root.fill(0x33);
+  MT_CHECK(db.RegisterLicense(lic_churn));
+  for (int i = 1; i <= 6; ++i) {
+    db.RecordEvent(ActivationEvent{1700001000ULL + i * 10, ActivationEventType::kDeactivation, "lic-churn-abuse", "DEV-CHURN", "192.168.1.10", "Deactivated"});
+  }
+
+  // Analyze normal license
+  auto rep_normal = AbuseAnalyticsEngine::AnalyzeLicense(db, "lic-normal", 1700002000, 86400);
+  MT_CHECK(rep_normal.severity == RiskSeverity::kLow);
+  MT_CHECK(rep_normal.action == RecommendedAction::kAllow);
+  MT_CHECK(rep_normal.anomaly_flags.empty());
+
+  // Analyze shared abuse license
+  auto rep_shared = AbuseAnalyticsEngine::AnalyzeLicense(db, "lic-shared-abuse", 1700002000, 86400);
+  MT_CHECK(rep_shared.severity == RiskSeverity::kCritical || rep_shared.severity == RiskSeverity::kHigh);
+  MT_CHECK(rep_shared.action == RecommendedAction::kSuspendLicense || rep_shared.action == RecommendedAction::kFlagForReview);
+  MT_CHECK(rep_shared.risk_score >= 0.5);
+
+  bool found_shared_flag = false;
+  bool found_subnet_flag = false;
+  bool found_replay_flag = false;
+  for (const auto& f : rep_shared.anomaly_flags) {
+    if (f.flag_code == "SHARED_KEY_SYNDROME") found_shared_flag = true;
+    if (f.flag_code == "SUBNET_DISPERSION") found_subnet_flag = true;
+    if (f.flag_code == "REPLAY_OR_BRUTE_FORCE_SPIKE") found_replay_flag = true;
+  }
+  MT_CHECK(found_shared_flag);
+  MT_CHECK(found_subnet_flag);
+  MT_CHECK(found_replay_flag);
+
+  // Analyze churn abuse license
+  auto rep_churn = AbuseAnalyticsEngine::AnalyzeLicense(db, "lic-churn-abuse", 1700002000, 86400);
+  bool found_churn_flag = false;
+  for (const auto& f : rep_churn.anomaly_flags) {
+    if (f.flag_code == "RAPID_SEAT_CHURN") found_churn_flag = true;
+  }
+  MT_CHECK(found_churn_flag);
+
+  // Analyze full database
+  auto summary = AbuseAnalyticsEngine::Analyze(db, 1700002000, 86400);
+  MT_CHECK(summary.total_licenses_analyzed == 3);
+  MT_CHECK(summary.low_risk_count == 1);
+  MT_CHECK(summary.flagged_licenses.size() >= 2);
+
+  // Test JSON serialization
+  std::string json = AbuseAnalyticsEngine::ToJson(summary);
+  MT_CHECK(json.find("\"total_licenses_analyzed\": 3") != std::string::npos);
+  MT_CHECK(json.find("\"flagged_licenses\": [") != std::string::npos);
+  MT_CHECK(json.find("SHARED_KEY_SYNDROME") != std::string::npos);
+
+  std::filesystem::remove(db_path, ec);
+}
+
+MT_TEST(HttpServer_Analytics_AdminAuthRequired) {
+  std::string db_path = MakeTempDbPath();
+  std::error_code ec;
+  std::filesystem::remove(db_path, ec);
+
+  auto kp = MakeKeyPair();
+  ActivationDatabase db(db_path);
+
+  LicenseRecord lic;
+  lic.license_id = "lic-analytics-http";
+  lic.product_id = "com.vendor.analytics";
+  lic.max_seats = 1;
+  lic.created_at = 1700000000;
+  lic.vm_root.fill(0x44);
+  MT_CHECK(db.RegisterLicense(lic));
+
+  ActivationService service(db, std::move(kp.private_key), kp.public_key);
+  ActivationServerHttp server(service);
+
+  server.SetAdminAuthToken("admin-secret-analytics-token");
+  MT_CHECK(server.Start(0, "127.0.0.1"));
+  std::uint16_t port = server.port();
+
+  // 1. GET /analytics without auth header -> 401 Unauthorized
+  std::string req_no_auth = "GET /analytics HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n";
+  std::string resp_no_auth = SendRawHttpRequest(port, req_no_auth);
+  MT_CHECK(resp_no_auth.find("HTTP/1.1 401 Unauthorized") != std::string::npos);
+  MT_CHECK(resp_no_auth.find("WWW-Authenticate: Bearer") != std::string::npos);
+
+  // 2. GET /analytics with invalid X-Admin-Key -> 401 Unauthorized
+  std::string req_bad_key = "GET /analytics HTTP/1.1\r\nHost: 127.0.0.1\r\nX-Admin-Key: invalid-key\r\nConnection: close\r\n\r\n";
+  std::string resp_bad_key = SendRawHttpRequest(port, req_bad_key);
+  MT_CHECK(resp_bad_key.find("HTTP/1.1 401 Unauthorized") != std::string::npos);
+
+  // 3. GET /analytics with valid Authorization: Bearer -> 200 OK
+  std::string req_bearer = "GET /analytics HTTP/1.1\r\nHost: 127.0.0.1\r\nAuthorization: Bearer admin-secret-analytics-token\r\nConnection: close\r\n\r\n";
+  std::string resp_bearer = SendRawHttpRequest(port, req_bearer);
+  MT_CHECK(resp_bearer.find("HTTP/1.1 200 OK") != std::string::npos);
+  MT_CHECK(resp_bearer.find("\"total_licenses_analyzed\":") != std::string::npos);
+  MT_CHECK(resp_bearer.find("\"flagged_licenses\":") != std::string::npos);
+
+  server.Stop();
   std::filesystem::remove(db_path, ec);
 }
 

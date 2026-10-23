@@ -45,9 +45,9 @@ void PrintUsage() {
             << "  --port <p>                     Listen port (default: 8080)\n"
             << "  --host <h>                     Listen address (default: 127.0.0.1)\n"
             << "  --db <path>                    Database file path (default: activations.db)\n"
-            << "  --key <path>                   Ed25519 signing private key file (required or auto-generated)\n"
+            << "  --key <path>                   Ed25519 signing private key file (unencrypted; discouraged in production)\n"
             << "  --key-vault <type>             Vault type: 'dpapi' (default), 'env', or 'file'\n"
-            << "  --vault-id <id>                Retrieve signing key from secret store by ID\n"
+            << "  --vault-id <id>                Retrieve signing key from secret store by ID (recommended for production)\n"
             << "  --vault-dir <path>             Custom directory path for secret vault store\n"
             << "  --provision-vault <id> <pub>   Generate key directly into vault, export public key to <pub>, and exit\n"
             << "  --tls-cert <path>              TLS server certificate PEM file\n"
@@ -328,7 +328,19 @@ int main(int argc, char* argv[]) {
     }
 
     key_pair = integrity::Ed25519KeyPair{std::move(*priv), pub};
+    if (!insecure_dev_only) {
+      std::cout << "[SECURITY WARNING] Server is loading Ed25519 signing private key from filesystem path ("
+                << key_path << ").\n"
+                << "                   For enterprise/production deployments, storing private keys on disk unencrypted is discouraged.\n"
+                << "                   Use --vault-id <id> with DPAPI or Secrets Manager for hardware/system-protected key storage.\n";
+    }
   } else {
+    if (!insecure_dev_only) {
+      std::cerr << "Error: Neither --vault-id nor --key was provided.\n"
+                << "       Production activation servers must specify --vault-id <id> (DPAPI/Secrets Manager) or --key <path>.\n"
+                << "       Ephemeral key generation is only permitted in development mode (--insecure-dev-only).\n";
+      return 1;
+    }
     std::cout << "Generating ephemeral Ed25519 signing key pair for development server...\n"
               << "[NOTICE] For production deployments, specify --vault-id to load protected keys from DPAPI or Secrets Manager.\n";
     key_pair = integrity::GenerateEd25519KeyPair();
