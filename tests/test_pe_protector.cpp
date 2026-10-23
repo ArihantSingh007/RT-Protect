@@ -105,6 +105,19 @@ MT_TEST(PeProtector_RejectsInvalidPeHeaders) {
   PeProtectionResult res2;
   MT_CHECK(!PeProtector::ProtectMemory(pe_raw_overflow, opts, &res2));
   MT_CHECK(!res2.success);
+
+  // Test section with VirtualAddress + VirtualSize wrapping 32-bit uint
+  auto pe_wrap = CreateSyntheticPe64();
+  auto* sec_wrap = IMAGE_FIRST_SECTION(reinterpret_cast<IMAGE_NT_HEADERS64*>(pe_wrap.data() + 0x100));
+  sec_wrap->VirtualAddress = 0xFFFFF000;
+  sec_wrap->Misc.VirtualSize = 0x2000; // 0xFFFFF000 + 0x2000 = 0x1000 (wraps around in 32-bit)
+  PeProtectionOptions opts_wrap;
+  opts_wrap.target_section = ".text";
+  opts_wrap.encrypt_section = false;
+  opts_wrap.obfuscate_imports = true;
+  PeProtectionResult res_wrap;
+  // Must execute safely without integer-wrap false section matching
+  PeProtector::ProtectMemory(pe_wrap, opts_wrap, &res_wrap);
 }
 
 MT_TEST(PeProtector_ValidatesSyntheticPe64) {
