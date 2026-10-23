@@ -216,3 +216,66 @@ RTProtect counters VM cloning and container replication through layered controls
 2. **Non-Deterministic Probe Fallbacks:** When OS hardware queries fail (e.g. inside restrictive sandboxes), RTProtect mixes a cryptographically random device secret (`GetOrCreateDeviceSeed()`) rather than static public literals, ensuring different sandboxed machines do not collide on identical fallback hashes.
 3. **Hypervisor & VM Detection:** Anti-tamper heuristics detect hypervisor environments and virtualized machine signatures, enabling risk policies to restrict high-value operations or demand online verification.
 
+---
+
+## 8. Server-Side Secrets Management & Enterprise Vault Deployment
+
+In enterprise production environments, the activation server's private signing key (`Ed25519PrivateKey`) must never reside unencrypted on disk in plain configuration files.
+
+### 8.1 Fail-Closed Production Key Policy
+Starting in version 2.0.0, `rtprotect-activation-server` enforces strict fail-closed key loading:
+- **Production Mode Enforcement:** In standard production mode (`!insecure_dev_only`), running without `--vault-id` or `--key` immediately terminates with exit code 1. Ephemeral key generation is rejected to prevent silent loss of signing authority across server restarts.
+- **Filesystem Key Warning:** Supplying an unencrypted private key file via `--key <path>` emits a visible `[SECURITY WARNING]` recommending hardware/system-protected vault storage.
+
+### 8.2 Supported Secret Vault Providers
+The server provides modular key isolation via `IServerSecretProvider`:
+1. **Windows DPAPI Vault (`--key-vault dpapi`):** Key material is encrypted at rest using Windows Data Protection API (`CryptProtectData`), bound to the machine and operating system service account master key.
+2. **Environment Secret Injection (`--key-vault env`):** Key material is securely injected at startup via environment variables from cloud secret managers (AWS Secrets Manager, Azure Key Vault, HashiCorp Vault).
+3. **Guarded File Storage (`--key-vault file`):** File-based encrypted secret envelope for staging environments.
+
+### 8.3 Zero-Disk-Plaintext Vault Provisioning
+To generate an Ed25519 signing key directly into the vault so that the private key never touches the filesystem in plaintext:
+```powershell
+# Provision key directly into DPAPI vault and export only the public key:
+rtprotect-activation-server.exe --provision-vault "prod-authority-key-01" "authority_pub.key"
+
+# Run production server loading key directly from DPAPI vault:
+rtprotect-activation-server.exe --port 8443 --host 0.0.0.0 `
+    --tls-cert server.crt --tls-key server.key `
+    --vault-id "prod-authority-key-01" `
+    --db "activations.db" `
+    --admin-token-file "admin_token.txt"
+```
+
+---
+
+## 9. Real-Time Abuse Analytics & Anomaly Detection Engine
+
+`rtprotect-activation-server` features an automated behavioral anomaly detection engine (`AbuseAnalyticsEngine`) exposed via authenticated `GET /analytics`.
+
+### 9.1 Risk Heuristics and Anomaly Flags
+Over a rolling evaluation window (default 7 days), the engine correlates activations, deactivations, IP subnets, and security telemetry events:
+
+| Anomaly Flag | Trigger Condition | Severity Impact |
+|---|---|---|
+| `SHARED_KEY_SYNDROME` | Distinct hardware fingerprints exceed licensed seat quota ($H > S$). | High to Critical (+0.15 to +0.50 score) |
+| `SUBNET_DISPERSION` | Activations originate from disparate /24 or /48 network subnets. | Medium to High (+0.10 to +0.35 score) |
+| `RAPID_SEAT_CHURN` | Abnormal seat deactivation/reallocation churn ($C > S \times 3$). | Medium (+0.05 to +0.25 score) |
+| `REPLAY_OR_BRUTE_FORCE_SPIKE` | Cryptographic nonce reuse or 429 rate limit triggers detected. | High (+0.15 per replay, +0.03 per 429) |
+| `SEAT_LIMIT_EXHAUSTION_SPIKE` | Repeated blocked activations exceeding available capacity. | Medium (+0.05 to +0.25 score) |
+
+### 9.2 Automated Thresholds & Recommended Actions
+Based on cumulative risk scoring ($0.0$ to $1.0$):
+- **$0.00 \le \text{Score} < 0.25$ (`LOW`):** `ALLOW` — normal operations.
+- **$0.25 \le \text{Score} < 0.50$ (`MEDIUM`):** `MONITOR` — elevated churn or minor subnet variation.
+- **$0.50 \le \text{Score} < 0.75$ (`HIGH`):** `FLAG_FOR_REVIEW` — key sharing symptoms or persistent rate-limit violations.
+- **$0.75 \le \text{Score} \le 1.00$ (`CRITICAL`):** `SUSPEND_LICENSE` — confirmed key distribution across disparate networks or active credential stuffing.
+
+### 9.3 Querying the Telemetry Endpoint
+The `/analytics` endpoint requires administrator authentication (`X-Admin-Key: <token>` or `Authorization: Bearer <token>`):
+```powershell
+curl -k -H "Authorization: Bearer <admin_token>" https://127.0.0.1:8443/analytics
+```
+Returns structured JSON containing fleet risk metrics, summary counts, and ranked flagged licenses.
+
+

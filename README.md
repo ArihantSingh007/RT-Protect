@@ -118,14 +118,17 @@ Launch `bin/rtprotect-gui.exe` to inspect project source trees visually, select 
 
 ### 4.3 Running the Licensing Activation Server
 ```cmd
-# Run server on port 8080 (loopback interface)
-bin\rtprotect-activation-server.exe --port 8080 --host 127.0.0.1 --db activations.db
+# Development / Local testing (insecure mode with ephemeral keys):
+bin\rtprotect-activation-server.exe --insecure-dev-only --port 8080 --host 127.0.0.1 --db activations.db
 
-# Register a 5-seat commercial license
-bin\rtprotect-activation-server.exe --db activations.db --register-license "LIC-ENT-001" "com.vendor.mygame" 5
+# Register a 5-seat commercial license with generated activation credential:
+bin\rtprotect-activation-server.exe --db activations.db --register-license "LIC-ENT-001" "com.vendor.mygame" 5 --generate-credential
 
-# Production TLS deployment with external interface binding
-bin\rtprotect-activation-server.exe --port 8443 --host 0.0.0.0 --tls-cert cert.pem --tls-key key.pem --admin-token-file admin_key.txt
+# Provision signing key directly into Windows DPAPI vault (zero plaintext on disk):
+bin\rtprotect-activation-server.exe --provision-vault "prod-key-01" "pubkey.hex"
+
+# Production TLS deployment backed by DPAPI secret vault:
+bin\rtprotect-activation-server.exe --port 8443 --host 0.0.0.0 --tls-cert cert.pem --tls-key key.pem --vault-id "prod-key-01" --admin-token-file admin_key.txt
 ```
 
 ---
