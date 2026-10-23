@@ -124,6 +124,11 @@ target_link_libraries(test_unreal_integration PRIVATE rtprotect_tooling)
 target_include_directories(test_unreal_integration PRIVATE ${CMAKE_SOURCE_DIR})
 add_test(NAME test_unreal_integration COMMAND test_unreal_integration)
 
+add_executable(test_pe_protector test_pe_protector.cpp)
+target_link_libraries(test_pe_protector PRIVATE rtprotect_tooling rtprotect_antitamper)
+target_include_directories(test_pe_protector PRIVATE ${CMAKE_SOURCE_DIR})
+add_test(NAME test_pe_protector COMMAND test_pe_protector)
+
 # Phase 6 tests only exist when the experimental module itself is built --
 # see top-level CMakeLists.txt's RTPROTECT_ENABLE_EXPERIMENTAL_RUNTIME_RECONSTRUCTION.
 if(RTPROTECT_ENABLE_EXPERIMENTAL_RUNTIME_RECONSTRUCTION)
