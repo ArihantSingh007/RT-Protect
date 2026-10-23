@@ -120,6 +120,8 @@ class ActivationDatabase {
   // Structured audit event logging & abuse analytics (Stage 2)
   bool RecordEvent(const ActivationEvent& event);
   std::vector<ActivationEvent> GetRecentEvents(const std::string& license_id = "", std::size_t limit = 100) const;
+  std::vector<ActivationEvent> GetAllEvents() const;
+  std::vector<LicenseRecord> GetAllLicenses() const;
   double ComputeSeatChurnRisk(const std::string& license_id,
                               std::uint64_t current_time,
                               std::uint64_t window_seconds = 7 * 86400) const;

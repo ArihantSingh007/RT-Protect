@@ -617,6 +617,21 @@ std::vector<ActivationEvent> ActivationDatabase::GetRecentEvents(const std::stri
   return out;
 }
 
+std::vector<ActivationEvent> ActivationDatabase::GetAllEvents() const {
+  std::lock_guard<std::mutex> lock(mutex_);
+  return events_;
+}
+
+std::vector<LicenseRecord> ActivationDatabase::GetAllLicenses() const {
+  std::lock_guard<std::mutex> lock(mutex_);
+  std::vector<LicenseRecord> out;
+  out.reserve(licenses_.size());
+  for (const auto& kv : licenses_) {
+    out.push_back(kv.second);
+  }
+  return out;
+}
+
 double ActivationDatabase::ComputeSeatChurnRisk(const std::string& license_id,
                                                 std::uint64_t current_time,
                                                 std::uint64_t window_seconds) const {
