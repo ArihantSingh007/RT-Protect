@@ -17,6 +17,8 @@ add_library(rtprotect_licensing_buildtools STATIC
     activation_database.cpp
     activation_service.cpp
     activation_server_http.cpp
+    secrets_manager.cpp
+    abuse_analytics.cpp
 )
 target_include_directories(rtprotect_licensing_buildtools PUBLIC ${CMAKE_SOURCE_DIR})
-target_link_libraries(rtprotect_licensing_buildtools PUBLIC rtprotect_licensing rtprotect_integrity_buildtools OpenSSL::SSL ws2_32)
+target_link_libraries(rtprotect_licensing_buildtools PUBLIC rtprotect_licensing rtprotect_integrity_buildtools OpenSSL::SSL ws2_32 crypt32)
