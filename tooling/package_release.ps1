@@ -9,7 +9,8 @@
 param(
     [string]$BuildDir = "build-release-pkg",
     [string]$VcpkgRoot = $env:VCPKG_ROOT,
-    [string]$OpenSslDir = ""
+    [string]$OpenSslDir = "",
+    [string]$Generator = ""
 )
 
 $ErrorActionPreference = "Stop"
@@ -28,20 +29,37 @@ if (-not $OpenSslDir) {
 }
 
 # 1. Configure and Build Release
-$CmakeArgs = @("-S", ".", "-B", $BuildDir, "-DCMAKE_BUILD_TYPE=Release", "-DRTPROTECT_HARDEN_RELEASE=ON")
-
-if ($VcpkgRoot) {
-    $ToolchainFile = Join-Path $VcpkgRoot "scripts\buildsystems\vcpkg.cmake"
-    if (Test-Path $ToolchainFile) {
-        Write-Host "Using vcpkg toolchain: $ToolchainFile"
-        $CmakeArgs += "-DCMAKE_TOOLCHAIN_FILE=$ToolchainFile"
-        $CmakeArgs += @("-G", "Visual Studio 17 2022", "-A", "x64")
+$ExistingCache = Join-Path $BuildDir "CMakeCache.txt"
+if (Test-Path $ExistingCache) {
+    Write-Host "Detected existing build configuration in $BuildDir"
+    $CmakeArgs = @("-S", ".", "-B", $BuildDir)
+    if ($OpenSslDir) {
+        $CmakeArgs += "-DOPENSSL_ROOT_DIR=$OpenSslDir"
+        $env:PATH = "$OpenSslDir\bin;$env:PATH"
     }
-} elseif ($OpenSslDir) {
-    Write-Host "Using OpenSSL from: $OpenSslDir"
-    $CmakeArgs += "-DOPENSSL_ROOT_DIR=$OpenSslDir"
-    $CmakeArgs += @("-G", "Ninja")
-    $env:PATH = "$OpenSslDir\bin;$env:PATH"
+} else {
+    $CmakeArgs = @("-S", ".", "-B", $BuildDir, "-DCMAKE_BUILD_TYPE=Release", "-DRTPROTECT_HARDEN_RELEASE=ON")
+    if ($OpenSslDir) {
+        $CmakeArgs += "-DOPENSSL_ROOT_DIR=$OpenSslDir"
+        $env:PATH = "$OpenSslDir\bin;$env:PATH"
+    }
+
+    if ($Generator) {
+        Write-Host "Using requested generator: $Generator"
+        $CmakeArgs += @("-G", $Generator)
+        if ($Generator -match "Visual Studio") {
+            $CmakeArgs += @("-A", "x64")
+        }
+    } elseif ($VcpkgRoot) {
+        $ToolchainFile = Join-Path $VcpkgRoot "scripts\buildsystems\vcpkg.cmake"
+        if (Test-Path $ToolchainFile) {
+            Write-Host "Using vcpkg toolchain: $ToolchainFile"
+            $CmakeArgs += "-DCMAKE_TOOLCHAIN_FILE=$ToolchainFile"
+            $CmakeArgs += @("-G", "Visual Studio 17 2022", "-A", "x64")
+        }
+    } else {
+        $CmakeArgs += @("-G", "Ninja")
+    }
 }
 
 Write-Host "`n-- [Step 1/6] Configuring Release Build --"
@@ -224,7 +242,18 @@ $SmokeCmakeArgs = @(
 )
 if ($OpenSslDir) {
     $SmokeCmakeArgs += "-DOPENSSL_ROOT_DIR=$OpenSslDir"
-    $SmokeCmakeArgs += @("-G", "Ninja")
+}
+
+$SmokeGenerator = "Ninja"
+if (Test-Path (Join-Path $BuildDir "CMakeCache.txt")) {
+    $cacheContent = Get-Content (Join-Path $BuildDir "CMakeCache.txt") -Raw
+    if ($cacheContent -match "CMAKE_GENERATOR:INTERNAL=Visual Studio") {
+        $SmokeGenerator = "Visual Studio 17 2022"
+    }
+}
+$SmokeCmakeArgs += @("-G", $SmokeGenerator)
+if ($SmokeGenerator -match "Visual Studio") {
+    $SmokeCmakeArgs += @("-A", "x64")
 }
 cmake @SmokeCmakeArgs
 if ($LASTEXITCODE -ne 0) { throw "Consumer sample CMake configure failed against packaged SDK" }

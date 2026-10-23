@@ -12,14 +12,13 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  windows-build-and-test:
-    name: Windows (${{ matrix.generator }}, ${{ matrix.build_type }})
+  windows-msvc:
+    name: Windows MSVC (${{ matrix.build_type }})
     runs-on: windows-2022
     strategy:
       fail-fast: false
       matrix:
         build_type: [ Release, Debug ]
-        generator: [ "Visual Studio 17 2022" ]
 
     steps:
       - name: Checkout repository
@@ -37,7 +36,7 @@ jobs:
       - name: Configure CMake (Visual Studio 17 2022 x64)
         shell: powershell
         run: |
-          cmake -B build -G "${{ matrix.generator }}" -A x64 `
+          cmake -B build -G "Visual Studio 17 2022" -A x64 `
             -DOPENSSL_ROOT_DIR="${{ github.workspace }}/third_party/openssl" `
             -DRTPROTECT_BUILD_TESTS=ON
 
@@ -63,3 +62,40 @@ jobs:
           path: |
             dist/*.zip
             dist/SHA256SUMS.txt
+
+  windows-mingw-ninja:
+    name: Windows MinGW (GCC, Ninja, Release)
+    runs-on: windows-2022
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup MinGW-w64 and Ninja
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          update: false
+          install: mingw-w64-x86_64-gcc mingw-w64-x86_64-ninja
+          path-type: inherit
+
+      - name: Add OpenSSL bin to PATH
+        shell: powershell
+        run: echo "${{ github.workspace }}/third_party/openssl/bin" >> $env:GITHUB_PATH
+
+      - name: Configure CMake (MinGW GCC + Ninja)
+        shell: powershell
+        run: |
+          cmake -B build-mingw -G Ninja `
+            -DCMAKE_BUILD_TYPE=Release `
+            -DCMAKE_CXX_COMPILER=g++ `
+            -DCMAKE_C_COMPILER=gcc `
+            -DOPENSSL_ROOT_DIR="${{ github.workspace }}/third_party/openssl" `
+            -DRTPROTECT_BUILD_TESTS=ON
+
+      - name: Build all targets
+        shell: powershell
+        run: cmake --build build-mingw
+
+      - name: Execute automated test suite
+        shell: powershell
+        run: ctest --test-dir build-mingw -C Release --output-on-failure
