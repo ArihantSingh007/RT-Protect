@@ -35,3 +35,7 @@ target_link_libraries(fuzz_encrypted_message_deserialize PRIVATE rtprotect_crypt
 
 add_rtprotect_fuzzer(fuzz_source_scanner fuzz_source_scanner.cpp)
 target_link_libraries(fuzz_source_scanner PRIVATE rtprotect_tooling)
+
+add_rtprotect_fuzzer(fuzz_pe_protector fuzz_pe_protector.cpp)
+target_link_libraries(fuzz_pe_protector PRIVATE rtprotect_tooling)
+

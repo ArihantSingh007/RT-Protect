@@ -120,6 +120,109 @@ MT_TEST(PeProtector_RejectsInvalidPeHeaders) {
   PeProtector::ProtectMemory(pe_wrap, opts_wrap, &res_wrap);
 }
 
+MT_TEST(PeProtector_DeterministicFuzzing_MalformedAndMutatedPE) {
+  // Lightweight deterministic PRNG (xorshift64*) for reproducible fuzzing in CI
+  struct SimplePrng {
+    std::uint64_t state = 0x853c49e6748fea9bULL;
+    std::uint64_t Next() {
+      state ^= state >> 12;
+      state ^= state << 25;
+      state ^= state >> 27;
+      return state * 0x2545F4914F6CDD1DULL;
+    }
+    std::uint32_t NextU32() { return static_cast<std::uint32_t>(Next()); }
+    std::size_t NextRange(std::size_t min_val, std::size_t max_val) {
+      if (min_val >= max_val) return min_val;
+      return min_val + static_cast<std::size_t>(Next() % (max_val - min_val + 1));
+    }
+  } prng;
+
+  PeProtectionOptions opts;
+  opts.target_section = ".text";
+  opts.encrypt_section = true;
+  opts.obfuscate_imports = true;
+
+  // Pass 1: 500 fully random buffers of random lengths (0..8192 bytes)
+  for (int iter = 0; iter < 500; ++iter) {
+    std::size_t len = prng.NextRange(0, 8192);
+    std::vector<std::uint8_t> rand_buf(len);
+    for (std::size_t i = 0; i < len; ++i) {
+      rand_buf[i] = static_cast<std::uint8_t>(prng.Next() & 0xFF);
+    }
+
+    bool is_valid = PeProtector::IsValidPe64(rand_buf);
+    PeProtectionResult res;
+    bool protect_ok = PeProtector::ProtectMemory(rand_buf, opts, &res);
+
+    // Invariant: If PE is invalid, ProtectMemory MUST fail safely without crashing
+    if (!is_valid) {
+      MT_CHECK(!protect_ok);
+      MT_CHECK(!res.success);
+    }
+  }
+
+  // Pass 2: 500 mutated synthetic PE buffers with structured corruptions
+  for (int iter = 0; iter < 500; ++iter) {
+    auto mutated = CreateSyntheticPe64();
+    auto* dos = reinterpret_cast<IMAGE_DOS_HEADER*>(mutated.data());
+    int mutation_type = static_cast<int>(prng.NextRange(0, 4));
+
+    switch (mutation_type) {
+      case 0: { // Corrupt e_lfanew
+        const LONG test_offsets[] = {
+          -1, -100, -2147483647,
+          0, 1, 16, 63,
+          static_cast<LONG>(mutated.size() - sizeof(IMAGE_NT_HEADERS64) + 1),
+          static_cast<LONG>(mutated.size()),
+          static_cast<LONG>(mutated.size() + 100),
+          0x7FFFFFF0
+        };
+        dos->e_lfanew = test_offsets[prng.NextRange(0, sizeof(test_offsets)/sizeof(test_offsets[0]) - 1)];
+        break;
+      }
+      case 1: { // Corrupt NumberOfSections and SizeOfOptionalHeader
+        auto* nt = reinterpret_cast<IMAGE_NT_HEADERS64*>(mutated.data() + dos->e_lfanew);
+        nt->FileHeader.NumberOfSections = static_cast<WORD>(prng.NextRange(0, 65535));
+        if (prng.Next() % 2 == 0) {
+          nt->FileHeader.SizeOfOptionalHeader = static_cast<WORD>(prng.NextRange(0, 1024));
+        }
+        break;
+      }
+      case 2: { // Corrupt section table offsets, sizes, and wraparound bounds
+        auto* nt = reinterpret_cast<IMAGE_NT_HEADERS64*>(mutated.data() + dos->e_lfanew);
+        auto* sec = IMAGE_FIRST_SECTION(nt);
+        sec->VirtualAddress = prng.NextU32();
+        sec->Misc.VirtualSize = prng.NextU32();
+        sec->PointerToRawData = prng.NextU32();
+        sec->SizeOfRawData = prng.NextU32();
+        break;
+      }
+      case 3: { // Arbitrary truncation
+        std::size_t trunc_len = prng.NextRange(0, mutated.size() - 1);
+        mutated.resize(trunc_len);
+        break;
+      }
+      case 4: { // Random multi-byte corruption across headers and section body
+        std::size_t flips = prng.NextRange(1, 32);
+        for (std::size_t f = 0; f < flips; ++f) {
+          std::size_t idx = prng.NextRange(0, mutated.size() - 1);
+          mutated[idx] = static_cast<std::uint8_t>(prng.Next() & 0xFF);
+        }
+        break;
+      }
+    }
+
+    bool is_valid = PeProtector::IsValidPe64(mutated);
+    PeProtectionResult res;
+    bool protect_ok = PeProtector::ProtectMemory(mutated, opts, &res);
+
+    if (!is_valid) {
+      MT_CHECK(!protect_ok);
+      MT_CHECK(!res.success);
+    }
+  }
+}
+
 MT_TEST(PeProtector_ValidatesSyntheticPe64) {
   auto pe = CreateSyntheticPe64();
   MT_CHECK(PeProtector::IsValidPe64(pe));
