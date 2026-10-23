@@ -29,6 +29,7 @@
 #include "licensing/activation_server.h"
 #include "tooling/file_io.h"
 #include "tooling/integration_engine.h"
+#include "tooling/pe_protector.h"
 
 using namespace rtprotect;
 using namespace rtprotect::tooling;
@@ -165,6 +166,13 @@ void PrintUsage() {
       "\n"
       "    rtprotect-tool validate-build <project-dir> <pub-key-file> <manifest-file> <sig-file>\n"
       "      Validates integrity of protected build outputs against signed manifest.\n"
+      "\n"
+      "    rtprotect-tool protect-binary <input.exe> <output.exe> [options]\n"
+      "      Applies post-build PE section encryption (.text) and IAT import obfuscation.\n"
+      "      --section <name>                  Target PE section to encrypt (default: .text)\n"
+      "      --no-encrypt                      Disable section encryption\n"
+      "      --no-import-obfuscation           Disable IAT import table obfuscation\n"
+      "      --key <hex>                       64-character hex AES-256 encryption key\n"
       "\n"
       "  License Management & Hardware ID:\n"
       "    rtprotect-tool license-generate [options]\n"
@@ -1117,6 +1125,50 @@ int CmdActivateRevoke(int argc, char** argv) {
   return 0;
 }
 
+int CmdProtectBinary(int argc, char** argv) {
+  if (argc < 4) {
+    std::fprintf(stderr, "Usage: rtprotect-tool protect-binary <input.exe> <output.exe> [options]\n\n"
+                         "Options:\n"
+                         "  --section <name>           Target PE section to encrypt (default: .text)\n"
+                         "  --no-encrypt               Disable section encryption\n"
+                         "  --no-import-obfuscation    Disable IAT import table obfuscation\n"
+                         "  --key <hex>                64-character hex AES-256 encryption key\n");
+    return 1;
+  }
+  std::string in_path = argv[2];
+  std::string out_path = argv[3];
+  PeProtectionOptions opts;
+  for (int i = 4; i < argc; ++i) {
+    std::string arg = argv[i];
+    if (arg == "--section" && i + 1 < argc) {
+      opts.target_section = argv[++i];
+    } else if (arg == "--no-encrypt") {
+      opts.encrypt_section = false;
+    } else if (arg == "--no-import-obfuscation") {
+      opts.obfuscate_imports = false;
+    } else if (arg == "--key" && i + 1 < argc) {
+      opts.custom_key_hex = argv[++i];
+    }
+  }
+
+  PeProtectionResult res;
+  if (!PeProtector::ProtectFile(in_path, out_path, opts, &res)) {
+    std::fprintf(stderr, "error: PE binary protection failed: %s\n", res.error.c_str());
+    return 1;
+  }
+
+  std::printf("PE x64 Binary Protection Completed:\n"
+              "  Input:                   %s\n"
+              "  Output:                  %s\n"
+              "  Section Encrypted:       %s (%zu bytes)\n"
+              "  Imports Obfuscated:      %zu entries\n"
+              "  Integrity Checksum:      0x%08X\n",
+              in_path.c_str(), out_path.c_str(),
+              opts.target_section.c_str(), res.section_bytes_encrypted,
+              res.imports_obfuscated, res.checksum);
+  return 0;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -1144,6 +1196,7 @@ int main(int argc, char** argv) {
   if (cmd == "sign-release") return CmdSignRelease(argc, argv);
   if (cmd == "rollback") return CmdRollback(argc, argv);
   if (cmd == "validate-build") return CmdValidateBuild(argc, argv);
+  if (cmd == "protect-binary") return CmdProtectBinary(argc, argv);
 
   // Licensing & HWID commands
   if (cmd == "license-generate") return CmdLicenseGenerate(argc, argv);
