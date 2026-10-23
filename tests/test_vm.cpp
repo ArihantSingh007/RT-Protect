@@ -4,6 +4,11 @@
 #include "bytecode_vm/vm.h"
 #include "bytecode_vm/program_registry.h"
 
+#include <cmath>
+#include <limits>
+#include <thread>
+#include <vector>
+
 #include "tests/micro_test.h"
 
 using namespace rtprotect::vm;
@@ -1023,6 +1028,105 @@ MT_TEST(Vm_DirectThreadedTable_LoopsAndCalls) {
   auto r_table = Run(p, {10, 0}, nullptr, nullptr, VmEngineFlavor::kDirectThreadedTable);
   MT_CHECK(r_table.error == VmError::kNone);
   MT_CHECK(r_table.value == 55);
+}
+
+MT_TEST(Vm_FloatingPoint_FloatToInt_NaN_Inf_And_Overflow) {
+  // Test invalid float conversions (NaN, +inf, -inf, overflow beyond int64_t)
+  std::vector<double> invalid_values = {
+    std::numeric_limits<double>::quiet_NaN(),
+    std::numeric_limits<double>::infinity(),
+    -std::numeric_limits<double>::infinity(),
+    9.3e18,           // Exceeds INT64_MAX (9.223372036854775807e18)
+    -9.3e18,          // Exceeds INT64_MIN (-9.223372036854775808e18)
+    1e30,
+    -1e30
+  };
+
+  for (double val : invalid_values) {
+    ProgramBuilder b(0);
+    b.PushFloat(val);
+    b.FloatToInt();
+    b.Ret();
+    auto p = b.Build();
+
+    auto r_stack = Run(p, {}, nullptr, nullptr, VmEngineFlavor::kStackBased);
+    MT_CHECK(r_stack.error == VmError::kArithmeticOverflow);
+
+    auto r_reg = Run(p, {}, nullptr, nullptr, VmEngineFlavor::kRegisterThreaded);
+    MT_CHECK(r_reg.error == VmError::kArithmeticOverflow);
+
+    auto r_table = Run(p, {}, nullptr, nullptr, VmEngineFlavor::kDirectThreadedTable);
+    MT_CHECK(r_table.error == VmError::kArithmeticOverflow);
+  }
+
+  // Valid values should convert correctly across all engines
+  struct TestCase {
+    double in;
+    std::int64_t expected;
+  };
+  std::vector<TestCase> valid_cases = {
+    {0.0, 0},
+    {-0.0, 0},
+    {123.456, 123},
+    {-456.789, -456},
+    {-9223372036854775808.0, std::numeric_limits<std::int64_t>::min()}, // INT64_MIN
+    {9223372036854773760.0, 9223372036854773760LL}                      // Largest float < 2^63
+  };
+
+  for (const auto& tc : valid_cases) {
+    ProgramBuilder b(0);
+    b.PushFloat(tc.in);
+    b.FloatToInt();
+    b.Ret();
+    auto p = b.Build();
+
+    auto r_stack = Run(p, {}, nullptr, nullptr, VmEngineFlavor::kStackBased);
+    MT_CHECK(r_stack.error == VmError::kNone);
+    MT_CHECK(r_stack.value == tc.expected);
+
+    auto r_reg = Run(p, {}, nullptr, nullptr, VmEngineFlavor::kRegisterThreaded);
+    MT_CHECK(r_reg.error == VmError::kNone);
+    MT_CHECK(r_reg.value == tc.expected);
+
+    auto r_table = Run(p, {}, nullptr, nullptr, VmEngineFlavor::kDirectThreadedTable);
+    MT_CHECK(r_table.error == VmError::kNone);
+    MT_CHECK(r_table.value == tc.expected);
+  }
+}
+
+MT_TEST(Vm_DirectThreadedTable_ConcurrentFirstUse) {
+  // Test concurrent calls from multiple threads to ensure table initialization is race-free
+  ProgramBuilder b(1);
+  b.PushLocal(0);
+  b.PushConst(10);
+  b.Add();
+  b.Ret();
+  auto p = b.Build();
+
+  constexpr int kNumThreads = 16;
+  std::vector<std::thread> threads;
+  threads.reserve(kNumThreads);
+  std::vector<std::int64_t> results(kNumThreads, 0);
+  std::vector<bool> successes(kNumThreads, false);
+
+  for (int i = 0; i < kNumThreads; ++i) {
+    threads.emplace_back([i, &p, &results, &successes]() {
+      auto r = Run(p, {i * 5}, nullptr, nullptr, VmEngineFlavor::kDirectThreadedTable);
+      if (r.error == VmError::kNone && r.value == (i * 5 + 10)) {
+        results[i] = r.value;
+        successes[i] = true;
+      }
+    });
+  }
+
+  for (auto& t : threads) {
+    t.join();
+  }
+
+  for (int i = 0; i < kNumThreads; ++i) {
+    MT_CHECK(successes[i]);
+    MT_CHECK(results[i] == (i * 5 + 10));
+  }
 }
 
 MT_MAIN()

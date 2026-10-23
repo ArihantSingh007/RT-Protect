@@ -99,6 +99,10 @@ class ActivationService {
   double ComputeSeatChurnRisk(const std::string& license_id, std::uint64_t current_time = 0) const;
   std::vector<ActivationEvent> GetRecentEvents(const std::string& license_id = "", std::size_t limit = 100) const;
 
+  // Configures whether licenses must have an activation credential verifier (default: false for test/dev, enabled for production)
+  void SetRequireActivationCredentials(bool req) { require_activation_credentials_ = req; }
+  bool require_activation_credentials() const { return require_activation_credentials_; }
+
   const integrity::Ed25519PublicKey& public_key() const { return verification_key_; }
   const ActivationDatabase& database() const { return db_; }
   ActivationDatabase& database() { return db_; }
@@ -113,6 +117,7 @@ class ActivationService {
   integrity::Ed25519PublicKey verification_key_;
   RateLimiter license_rate_limiter_{1.0, 10.0}; // 1 req/sec, burst 10 requests per license
   RateLimiter ip_rate_limiter_{5.0, 20.0};      // 5 req/sec, burst 20 requests per IP
+  bool require_activation_credentials_{false};
 };
 
 }  // namespace rtprotect::licensing

@@ -1,5 +1,6 @@
 // tooling/pe_protector.cpp
 //
+// [EXPERIMENTAL - NON-PRODUCTION]
 // Binary-Level PE64 Executable Protection Engine implementation.
 
 #include "tooling/pe_protector.h"
@@ -8,6 +9,7 @@
 #include <cstring>
 #include <fstream>
 #include <iostream>
+#include <limits>
 
 #include <openssl/evp.h>
 #include <openssl/rand.h>
@@ -43,15 +45,19 @@ bool HexToBytes(const std::string& hex, std::uint8_t* out, std::size_t len) {
 std::size_t RvaToFileOffset(const IMAGE_NT_HEADERS64* nt,
                             const IMAGE_SECTION_HEADER* sections,
                             std::uint32_t rva,
+                            std::size_t required_bytes,
                             std::size_t image_size) {
+  if (required_bytes == 0 || required_bytes > image_size) return 0;
   for (WORD i = 0; i < nt->FileHeader.NumberOfSections; ++i) {
     const auto& sec = sections[i];
     std::uint32_t sec_rva = sec.VirtualAddress;
     std::uint32_t sec_vsize = sec.Misc.VirtualSize ? sec.Misc.VirtualSize : sec.SizeOfRawData;
     if (rva >= sec_rva && rva < sec_rva + sec_vsize) {
-      std::size_t offset = sec.PointerToRawData + (rva - sec_rva);
-      if (offset < image_size) return offset;
-      return 0;
+      std::uint32_t offset_in_sec = rva - sec_rva;
+      if (static_cast<std::size_t>(offset_in_sec) + required_bytes > sec_vsize) return 0;
+      if (sec.PointerToRawData > image_size) return 0;
+      if (static_cast<std::size_t>(sec.PointerToRawData) + offset_in_sec > image_size - required_bytes) return 0;
+      return static_cast<std::size_t>(sec.PointerToRawData) + offset_in_sec;
     }
   }
   return 0;
@@ -62,6 +68,7 @@ bool Aes256CtrTransform(const std::uint8_t* key,
                         const std::uint8_t* input,
                         std::size_t len,
                         std::uint8_t* output) {
+  if (len > static_cast<std::size_t>(std::numeric_limits<int>::max())) return false;
   EVP_CIPHER_CTX* ctx = EVP_CIPHER_CTX_new();
   if (!ctx) return false;
 
@@ -87,14 +94,25 @@ bool PeProtector::IsValidPe64(const std::vector<std::uint8_t>& pe_image) {
   const auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(pe_image.data());
   if (dos->e_magic != IMAGE_DOS_SIGNATURE) return false;
 
-  if (dos->e_lfanew <= 0 || static_cast<std::size_t>(dos->e_lfanew) + sizeof(IMAGE_NT_HEADERS64) > pe_image.size()) {
+  if (dos->e_lfanew < static_cast<LONG>(sizeof(IMAGE_DOS_HEADER))) return false;
+  if (static_cast<std::size_t>(dos->e_lfanew) > pe_image.size() - sizeof(IMAGE_NT_HEADERS64)) {
     return false;
   }
 
   const auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS64*>(pe_image.data() + dos->e_lfanew);
   if (nt->Signature != IMAGE_NT_SIGNATURE) return false;
   if (nt->FileHeader.Machine != IMAGE_FILE_MACHINE_AMD64) return false;
+  if (nt->FileHeader.SizeOfOptionalHeader < sizeof(IMAGE_OPTIONAL_HEADER64)) return false;
   if (nt->OptionalHeader.Magic != IMAGE_NT_OPTIONAL_HDR64_MAGIC) return false;
+
+  // Validate entire section table fits in the file image
+  std::size_t sec_table_offset = static_cast<std::size_t>(dos->e_lfanew) +
+                                 offsetof(IMAGE_NT_HEADERS64, OptionalHeader) +
+                                 nt->FileHeader.SizeOfOptionalHeader;
+  std::size_t sec_table_size = static_cast<std::size_t>(nt->FileHeader.NumberOfSections) * sizeof(IMAGE_SECTION_HEADER);
+  if (sec_table_size > pe_image.size() || sec_table_offset > pe_image.size() - sec_table_size) {
+    return false;
+  }
 
   return true;
 }
@@ -108,7 +126,7 @@ bool PeProtector::ProtectMemory(std::vector<std::uint8_t>& pe_image,
   }
 
   if (!IsValidPe64(pe_image)) {
-    if (result_out) result_out->error = "Invalid PE64 executable format";
+    if (result_out) result_out->error = "Invalid PE64 executable format or truncated image bounds";
     return false;
   }
 
@@ -131,13 +149,28 @@ bool PeProtector::ProtectMemory(std::vector<std::uint8_t>& pe_image,
     return false;
   }
 
+  // Ensure sufficient DOS stub space exists before e_lfanew to store the header
+  if (dos->e_lfanew < static_cast<LONG>(0x40 + sizeof(PeProtectedSectionHeader))) {
+    if (result_out) {
+      result_out->error = "Insufficient DOS stub padding in executable header to embed protection descriptor";
+    }
+    return false;
+  }
+
   PeProtectedSectionHeader header{};
   header.magic = kPeProtectorMagic;
   header.version = 1;
 
   if (options.encrypt_section && target_sec) {
-    if (target_sec->PointerToRawData + target_sec->SizeOfRawData > pe_image.size()) {
-      if (result_out) result_out->error = "Section data extends beyond PE file bounds";
+    // Checked arithmetic for section bounds
+    if (target_sec->PointerToRawData > pe_image.size() ||
+        target_sec->SizeOfRawData > pe_image.size() - target_sec->PointerToRawData) {
+      if (result_out) result_out->error = "Section raw data extends beyond PE file bounds";
+      return false;
+    }
+
+    if (target_sec->SizeOfRawData == 0) {
+      if (result_out) result_out->error = "Target section has zero SizeOfRawData";
       return false;
     }
 
@@ -161,7 +194,8 @@ bool PeProtector::ProtectMemory(std::vector<std::uint8_t>& pe_image,
 
     header.section_rva = target_sec->VirtualAddress;
     header.section_size = target_sec->SizeOfRawData;
-    header.original_protect = target_sec->Characteristics;
+    // Map section characteristics to actual Win32 VirtualProtect PAGE_* constants
+    header.original_protect = SectionCharacteristicsToPageProtection(target_sec->Characteristics);
 
     // Encrypt section in-place
     std::uint8_t* sec_data = pe_image.data() + target_sec->PointerToRawData;
@@ -174,7 +208,7 @@ bool PeProtector::ProtectMemory(std::vector<std::uint8_t>& pe_image,
 
     header.checksum = ComputeFnv1a(sec_data, target_sec->SizeOfRawData);
 
-    // Make section writable in PE header characteristics so runtime decryption succeeds
+    // Ensure section has read, write, execute in header characteristics
     target_sec->Characteristics |= IMAGE_SCN_MEM_WRITE | IMAGE_SCN_MEM_READ | IMAGE_SCN_MEM_EXECUTE;
 
     if (result_out) {
@@ -185,28 +219,41 @@ bool PeProtector::ProtectMemory(std::vector<std::uint8_t>& pe_image,
     }
   }
 
-  // Import table obfuscation
+  // Import table obfuscation with full bounds validation
   std::size_t obfuscated_count = 0;
   if (options.obfuscate_imports) {
     const auto& import_dir = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
-    if (import_dir.VirtualAddress != 0 && import_dir.Size != 0) {
-      std::size_t import_file_offset = RvaToFileOffset(nt, sections, import_dir.VirtualAddress, pe_image.size());
+    if (import_dir.VirtualAddress != 0 && import_dir.Size >= sizeof(IMAGE_IMPORT_DESCRIPTOR)) {
+      std::size_t import_file_offset = RvaToFileOffset(nt, sections, import_dir.VirtualAddress, import_dir.Size, pe_image.size());
       if (import_file_offset != 0) {
+        std::size_t max_descriptors = import_dir.Size / sizeof(IMAGE_IMPORT_DESCRIPTOR);
         auto* desc = reinterpret_cast<IMAGE_IMPORT_DESCRIPTOR*>(pe_image.data() + import_file_offset);
-        while (desc->Name != 0 || desc->FirstThunk != 0) {
+        for (std::size_t d = 0; d < max_descriptors && (desc->Name != 0 || desc->FirstThunk != 0); ++d, ++desc) {
           std::uint32_t thunk_rva = desc->OriginalFirstThunk ? desc->OriginalFirstThunk : desc->FirstThunk;
-          std::size_t thunk_offset = RvaToFileOffset(nt, sections, thunk_rva, pe_image.size());
-          if (thunk_offset != 0) {
-            auto* thunk = reinterpret_cast<IMAGE_THUNK_DATA64*>(pe_image.data() + thunk_offset);
-            while (thunk->u1.AddressOfData != 0) {
-              if (!(thunk->u1.Ordinal & IMAGE_ORDINAL_FLAG64)) {
-                std::uint32_t name_rva = static_cast<std::uint32_t>(thunk->u1.AddressOfData);
-                std::size_t name_offset = RvaToFileOffset(nt, sections, name_rva, pe_image.size());
-                if (name_offset != 0 && name_offset + sizeof(IMAGE_IMPORT_BY_NAME) < pe_image.size()) {
-                  auto* import_by_name = reinterpret_cast<IMAGE_IMPORT_BY_NAME*>(pe_image.data() + name_offset);
-                  char* func_name = import_by_name->Name;
-                  std::size_t fn_len = std::strlen(func_name);
-                  // Obfuscate function name ASCII characters in-place
+          if (thunk_rva == 0) continue;
+          std::size_t thunk_offset = RvaToFileOffset(nt, sections, thunk_rva, sizeof(IMAGE_THUNK_DATA64), pe_image.size());
+          if (thunk_offset == 0) continue;
+
+          auto* thunk = reinterpret_cast<IMAGE_THUNK_DATA64*>(pe_image.data() + thunk_offset);
+          std::size_t max_thunks = (pe_image.size() - thunk_offset) / sizeof(IMAGE_THUNK_DATA64);
+          for (std::size_t t = 0; t < max_thunks && thunk->u1.AddressOfData != 0; ++t, ++thunk) {
+            if (!(thunk->u1.Ordinal & IMAGE_ORDINAL_FLAG64)) {
+              std::uint32_t name_rva = static_cast<std::uint32_t>(thunk->u1.AddressOfData);
+              std::size_t name_offset = RvaToFileOffset(nt, sections, name_rva, sizeof(IMAGE_IMPORT_BY_NAME) + 1, pe_image.size());
+              if (name_offset != 0) {
+                auto* import_by_name = reinterpret_cast<IMAGE_IMPORT_BY_NAME*>(pe_image.data() + name_offset);
+                char* func_name = import_by_name->Name;
+                std::size_t max_name_len = pe_image.size() - (name_offset + offsetof(IMAGE_IMPORT_BY_NAME, Name));
+                std::size_t fn_len = 0;
+                bool found_null = false;
+                while (fn_len < max_name_len && fn_len < 256) {
+                  if (func_name[fn_len] == '\0') {
+                    found_null = true;
+                    break;
+                  }
+                  fn_len++;
+                }
+                if (found_null && fn_len > 0) {
                   for (std::size_t k = 0; k < fn_len; ++k) {
                     func_name[k] = static_cast<char>(func_name[k] ^ (0x5A + (k % 7)));
                     if (func_name[k] == '\0') func_name[k] = '_';
@@ -214,10 +261,8 @@ bool PeProtector::ProtectMemory(std::vector<std::uint8_t>& pe_image,
                   obfuscated_count++;
                 }
               }
-              ++thunk;
             }
           }
-          ++desc;
         }
       }
     }
@@ -228,16 +273,8 @@ bool PeProtector::ProtectMemory(std::vector<std::uint8_t>& pe_image,
     result_out->imports_obfuscated = obfuscated_count;
   }
 
-  // Embed the PeProtectedSectionHeader into the PE image
-  // Primary location: DOS stub area at offset 0x40 if space allows before e_lfanew
-  if (dos->e_lfanew >= static_cast<LONG>(0x40 + sizeof(PeProtectedSectionHeader))) {
-    std::memcpy(pe_image.data() + 0x40, &header, sizeof(header));
-  } else {
-    // Secondary fallback: Append descriptor block to PE image
-    std::size_t old_size = pe_image.size();
-    pe_image.resize(old_size + sizeof(header));
-    std::memcpy(pe_image.data() + old_size, &header, sizeof(header));
-  }
+  // Embed the PeProtectedSectionHeader into the validated DOS stub padding
+  std::memcpy(pe_image.data() + 0x40, &header, sizeof(header));
 
   if (result_out) {
     result_out->success = true;

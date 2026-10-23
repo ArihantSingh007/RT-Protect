@@ -69,6 +69,27 @@ MT_TEST(PeProtector_RejectsInvalidPeHeaders) {
   PeProtectionResult res;
   MT_CHECK(!PeProtector::ProtectMemory(invalid_data, opts, &res));
   MT_CHECK(!res.success);
+
+  // Test truncated NT headers
+  auto pe_trunc = CreateSyntheticPe64();
+  auto* dos = reinterpret_cast<IMAGE_DOS_HEADER*>(pe_trunc.data());
+  dos->e_lfanew = static_cast<LONG>(pe_trunc.size() - 10); // Not enough space for IMAGE_NT_HEADERS64
+  MT_CHECK(!PeProtector::IsValidPe64(pe_trunc));
+
+  // Test section table extending beyond file bounds
+  auto pe_sec_overflow = CreateSyntheticPe64();
+  auto* nt = reinterpret_cast<IMAGE_NT_HEADERS64*>(pe_sec_overflow.data() + 0x100);
+  nt->FileHeader.NumberOfSections = 100; // 100 * 40 bytes = 4000 bytes, exceeds file size
+  MT_CHECK(!PeProtector::IsValidPe64(pe_sec_overflow));
+
+  // Test section raw data extending beyond file bounds
+  auto pe_raw_overflow = CreateSyntheticPe64();
+  auto* sec = IMAGE_FIRST_SECTION(reinterpret_cast<IMAGE_NT_HEADERS64*>(pe_raw_overflow.data() + 0x100));
+  sec->PointerToRawData = 0x800;
+  sec->SizeOfRawData = 0xFFFFFFFF; // Integer overflow attempt
+  PeProtectionResult res2;
+  MT_CHECK(!PeProtector::ProtectMemory(pe_raw_overflow, opts, &res2));
+  MT_CHECK(!res2.success);
 }
 
 MT_TEST(PeProtector_ValidatesSyntheticPe64) {

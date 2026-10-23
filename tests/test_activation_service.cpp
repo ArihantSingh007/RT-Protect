@@ -1155,4 +1155,74 @@ MT_TEST(SecurityAudit_StaleSequenceRejection_RenewAndDeactivate) {
   std::filesystem::remove(db_path, ec);
 }
 
+MT_TEST(SecurityAudit_MandatoryActivationCredentials_ProductionMode) {
+  std::string db_path = MakeTempDbPath();
+  std::error_code ec;
+  std::filesystem::remove(db_path, ec);
+
+  auto act_kp = MakeKeyPair();
+  ActivationDatabase db(db_path);
+
+  // License 1: Credential-free license
+  LicenseRecord lic_no_cred;
+  lic_no_cred.license_id = "lic-no-cred-prod";
+  lic_no_cred.product_id = "com.vendor.mandate";
+  lic_no_cred.max_seats = 1;
+  lic_no_cred.created_at = 1700000000;
+  lic_no_cred.vm_root.fill(0x11);
+  MT_CHECK(db.RegisterLicense(lic_no_cred));
+
+  // License 2: License with credential
+  std::string secret = "ProductionSecretPassphrase#9988";
+  auto cred_hash = rtprotect::integrity::Sha256(reinterpret_cast<const std::uint8_t*>(secret.data()), secret.size());
+  MT_CHECK(cred_hash.has_value());
+  LicenseRecord lic_with_cred;
+  lic_with_cred.license_id = "lic-with-cred-prod";
+  lic_with_cred.product_id = "com.vendor.mandate";
+  lic_with_cred.max_seats = 1;
+  lic_with_cred.created_at = 1700000000;
+  lic_with_cred.vm_root.fill(0x22);
+  lic_with_cred.activation_credential_hash = "";
+  for (auto b : *cred_hash) {
+    char h[3];
+    std::snprintf(h, sizeof(h), "%02x", b);
+    lic_with_cred.activation_credential_hash += h;
+  }
+  MT_CHECK(db.RegisterLicense(lic_with_cred));
+
+  ActivationService service(db, std::move(act_kp.private_key), act_kp.public_key);
+  service.SetRequireActivationCredentials(true);
+  MT_CHECK(service.require_activation_credentials());
+
+  // 1. Attempting to activate credential-free license in production mode MUST BE REJECTED
+  ActivateRequest req_no_cred{"lic-no-cred-prod", "HWID-PROD-DEV1", "com.vendor.mandate", "1.0", 1700000000, {}};
+  req_no_cred.client_nonce.fill(0x01);
+  auto resp_no_cred = service.ProcessActivate(req_no_cred, 1700000000);
+  MT_CHECK(resp_no_cred.status == ActivationStatus::kMalformed);
+  MT_CHECK(resp_no_cred.error_message.find("lacks mandatory activation credential") != std::string::npos);
+
+  // 2. Attempting to activate lic_with_cred with missing credential MUST BE REJECTED
+  ActivateRequest req_empty_cred{"lic-with-cred-prod", "HWID-PROD-DEV1", "com.vendor.mandate", "1.0", 1700000000, {}};
+  req_empty_cred.client_nonce.fill(0x02);
+  auto resp_empty_cred = service.ProcessActivate(req_empty_cred, 1700000000);
+  MT_CHECK(resp_empty_cred.status == ActivationStatus::kMalformed);
+  MT_CHECK(resp_empty_cred.error_message.find("Activation credential is required") != std::string::npos);
+
+  // 3. Attempting to activate lic_with_cred with wrong credential MUST BE REJECTED
+  ActivateRequest req_wrong_cred{"lic-with-cred-prod", "HWID-PROD-DEV1", "com.vendor.mandate", "1.0", 1700000000, {}, "127.0.0.1", "WrongPassphrase123"};
+  req_wrong_cred.client_nonce.fill(0x03);
+  auto resp_wrong_cred = service.ProcessActivate(req_wrong_cred, 1700000000);
+  MT_CHECK(resp_wrong_cred.status == ActivationStatus::kLicenseMismatch);
+  MT_CHECK(resp_wrong_cred.error_message.find("Invalid activation credential") != std::string::npos);
+
+  // 4. Activating with correct credential MUST SUCCEED
+  ActivateRequest req_valid{"lic-with-cred-prod", "HWID-PROD-DEV1", "com.vendor.mandate", "1.0", 1700000000, {}, "127.0.0.1", secret};
+  req_valid.client_nonce.fill(0x04);
+  auto resp_valid = service.ProcessActivate(req_valid, 1700000000);
+  MT_CHECK(resp_valid.status == ActivationStatus::kValid);
+  MT_CHECK(!resp_valid.encrypted_token_hex.empty());
+
+  std::filesystem::remove(db_path, ec);
+}
+
 MT_MAIN()

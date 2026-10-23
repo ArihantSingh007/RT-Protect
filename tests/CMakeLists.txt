@@ -89,6 +89,20 @@ endif()
 target_include_directories(test_activation_service PRIVATE ${CMAKE_SOURCE_DIR})
 add_test(NAME test_activation_service COMMAND test_activation_service)
 
+add_executable(test_secrets_manager test_secrets_manager.cpp)
+target_link_libraries(test_secrets_manager PRIVATE
+    rtprotect_licensing
+    rtprotect_licensing_buildtools
+    rtprotect_integrity_buildtools
+    rtprotect_integrity
+    rtprotect_crypto
+)
+if(WIN32)
+    target_link_libraries(test_secrets_manager PRIVATE crypt32 shell32)
+endif()
+target_include_directories(test_secrets_manager PRIVATE ${CMAKE_SOURCE_DIR})
+add_test(NAME test_secrets_manager COMMAND test_secrets_manager)
+
 add_executable(test_trusted_time test_trusted_time.cpp)
 target_link_libraries(test_trusted_time PRIVATE rtprotect_licensing)
 target_include_directories(test_trusted_time PRIVATE ${CMAKE_SOURCE_DIR})
