@@ -67,7 +67,7 @@ endfunction()
 
 if(MSVC)
   add_compile_definitions(_CRT_SECURE_NO_WARNINGS)
-  add_compile_options(/W4 /permissive- /Zc:__cplusplus)
+  add_compile_options(/W4 /permissive- /Zc:__cplusplus /EHsc)
   add_compile_options($<$<CONFIG:Release>:/guard:cf>)
   add_link_options($<$<CONFIG:Release>:/guard:cf>)
   # /DYNAMICBASE (ASLR) and /NXCOMPAT (DEP) are MSVC linker defaults for
