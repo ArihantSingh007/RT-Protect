@@ -224,8 +224,9 @@ In enterprise production environments, the activation server's private signing k
 
 ### 8.1 Fail-Closed Production Key Policy
 Starting in version 2.0.0, `rtprotect-activation-server` enforces strict fail-closed key loading:
-- **Production Mode Enforcement:** In standard production mode (`!insecure_dev_only`), running without `--vault-id` or `--key` immediately terminates with exit code 1. Ephemeral key generation is rejected to prevent silent loss of signing authority across server restarts.
-- **Filesystem Key Warning:** Supplying an unencrypted private key file via `--key <path>` emits a visible `[SECURITY WARNING]` recommending hardware/system-protected vault storage.
+- **Production Mode Enforcement:** In production mode (active by default unless `--insecure-dev-only` is explicitly passed, or when `--production` is specified), loading an unencrypted private key from disk (`--key <path>`) is **strictly prohibited and hard-rejected with exit code 1**. Server private signing keys must reside in system-protected vaults (`--vault-id <id>`).
+- **Ephemeral Key Rejection:** Running in production mode without `--vault-id` immediately terminates to prevent silent loss of signing authority across server restarts.
+- **Development Escape Hatch:** Passing an unencrypted filesystem key file (`--key <path>`) or generating temporary test keys is permitted strictly when `--insecure-dev-only` is explicitly specified as a deliberate operator override.
 
 ### 8.2 Supported Secret Vault Providers
 The server provides modular key isolation via `IServerSecretProvider`:

@@ -17,10 +17,28 @@ if(NOT CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
   return()
 endif()
 
+if(WIN32)
+  set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+  if(EXISTS "${CMAKE_SOURCE_DIR}/third_party/openssl/bin/libcrypto-3-x64.dll")
+    file(COPY "${CMAKE_SOURCE_DIR}/third_party/openssl/bin/libcrypto-3-x64.dll"
+              "${CMAKE_SOURCE_DIR}/third_party/openssl/bin/libssl-3-x64.dll"
+         DESTINATION "${CMAKE_CURRENT_BINARY_DIR}")
+  endif()
+  file(GLOB_RECURSE CLANG_ASAN_DLLS "C:/Program Files/LLVM/lib/clang/*/lib/windows/clang_rt.asan_dynamic-x86_64.dll")
+  if(CLANG_ASAN_DLLS)
+    list(GET CLANG_ASAN_DLLS 0 FIRST_ASAN_DLL)
+    file(COPY "${FIRST_ASAN_DLL}" DESTINATION "${CMAKE_CURRENT_BINARY_DIR}")
+  endif()
+endif()
+
 function(add_rtprotect_fuzzer name source)
   add_executable(${name} ${source})
   target_include_directories(${name} PRIVATE ${CMAKE_SOURCE_DIR})
   target_compile_options(${name} PRIVATE -fsanitize=fuzzer,address,undefined -g)
+  if(WIN32)
+    set_property(TARGET ${name} PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+    target_compile_definitions(${name} PRIVATE _DISABLE_STRING_ANNOTATION _DISABLE_VECTOR_ANNOTATION _CRT_SECURE_NO_WARNINGS)
+  endif()
   target_link_options(${name} PRIVATE -fsanitize=fuzzer,address,undefined)
 endfunction()
 
@@ -38,4 +56,7 @@ target_link_libraries(fuzz_source_scanner PRIVATE rtprotect_tooling)
 
 add_rtprotect_fuzzer(fuzz_pe_protector fuzz_pe_protector.cpp)
 target_link_libraries(fuzz_pe_protector PRIVATE rtprotect_tooling)
+
+add_rtprotect_fuzzer(fuzz_json_parser fuzz_json_parser.cpp)
+
 

@@ -117,12 +117,12 @@ LicenseRiskReport AbuseAnalyticsEngine::AnalyzeLicense(
   std::unordered_set<std::string> subnets_in_window;
 
   for (const auto& a : activations) {
-    if (a.last_seen >= window_start) {
+    if (a.last_seen >= window_start && a.last_seen <= current_time) {
       devices_in_window.insert(a.device_fingerprint);
     }
   }
 
-  auto events = db.GetRecentEvents(license_id, 1000);
+  auto events = db.GetRecentEvents(license_id, 5000);
   std::size_t total_events = 0;
   std::size_t abuse_events = 0;
   std::size_t replay_count = 0;
@@ -131,7 +131,7 @@ LicenseRiskReport AbuseAnalyticsEngine::AnalyzeLicense(
   std::size_t churn_swaps = 0;
 
   for (const auto& ev : events) {
-    if (ev.timestamp >= window_start) {
+    if (ev.timestamp >= window_start && ev.timestamp <= current_time) {
       total_events++;
       if (!ev.device_fingerprint.empty()) {
         devices_in_window.insert(ev.device_fingerprint);
@@ -178,7 +178,8 @@ LicenseRiskReport AbuseAnalyticsEngine::AnalyzeLicense(
   }
 
   // 2. Subnet Dispersion Detection
-  std::size_t expected_max_subnets = (std::max)(static_cast<std::size_t>(2), static_cast<std::size_t>(report.max_seats * 2));
+  std::size_t expected_max_subnets = (std::max)(static_cast<std::size_t>(2),
+      static_cast<std::size_t>(static_cast<std::uint64_t>(report.max_seats) * 2ULL));
   if (report.distinct_subnets_window > expected_max_subnets) {
     std::size_t excess_subnets = report.distinct_subnets_window - expected_max_subnets;
     double impact = (std::min)(0.35, static_cast<double>(excess_subnets) * 0.10);
@@ -192,7 +193,7 @@ LicenseRiskReport AbuseAnalyticsEngine::AnalyzeLicense(
   }
 
   // 3. Rapid Seat Churn Detection
-  if (churn_swaps > static_cast<std::size_t>(report.max_seats * 3)) {
+  if (static_cast<std::uint64_t>(churn_swaps) > static_cast<std::uint64_t>(report.max_seats) * 3ULL) {
     double impact = (std::min)(0.25, static_cast<double>(churn_swaps) * 0.05);
     raw_score += impact;
     LicenseAnomalyFlag flag;

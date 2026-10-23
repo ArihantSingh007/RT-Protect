@@ -5,6 +5,8 @@ on:
     branches: [ master, main ]
   pull_request:
     branches: [ master, main ]
+  schedule:
+    - cron: '0 3 * * 0' # Weekly Sunday 03:00 UTC
   workflow_dispatch:
 
 concurrency:
@@ -99,3 +101,55 @@ jobs:
       - name: Execute automated test suite
         shell: powershell
         run: ctest --test-dir build-mingw -C Release --output-on-failure
+
+  windows-clang-fuzzing:
+    name: Windows Clang libFuzzer + ASan/UBSan
+    runs-on: windows-2022
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Ninja
+        uses: ashutoshvarma/setup-ninja@v1.1
+        with:
+          version: 1.11.1
+
+      - name: Configure CMake (Clang + libFuzzer)
+        shell: powershell
+        run: |
+          cmake -B build-fuzz -G Ninja `
+            -DCMAKE_CXX_COMPILER=clang++ `
+            -DCMAKE_C_COMPILER=clang `
+            -DOPENSSL_ROOT_DIR="${{ github.workspace }}/third_party/openssl" `
+            -DRTPROTECT_BUILD_FUZZERS=ON `
+            -DCMAKE_BUILD_TYPE=Release
+
+      - name: Compile libFuzzer targets
+        shell: powershell
+        run: |
+          cmake --build build-fuzz --target fuzz_pe_protector fuzz_json_parser fuzz_manifest_deserialize fuzz_vm_deserialize_and_verify fuzz_encrypted_message_deserialize fuzz_source_scanner
+
+      - name: Execute Fuzzers (Time-Bounded Smoke/Sanity Pass)
+        shell: powershell
+        run: |
+          $asanDll = (Get-ChildItem -Path "C:\Program Files\LLVM" -Filter "clang_rt.asan_dynamic-x86_64.dll" -Recurse | Select-Object -First 1).DirectoryName
+          $env:PATH = "$asanDll;${{ github.workspace }}/third_party/openssl/bin;$env:PATH"
+          
+          Write-Host "Running fuzz_pe_protector..."
+          .\build-fuzz\fuzz\fuzz_pe_protector.exe -max_total_time=20
+          
+          Write-Host "Running fuzz_json_parser..."
+          .\build-fuzz\fuzz\fuzz_json_parser.exe -max_total_time=20
+          
+          Write-Host "Running fuzz_manifest_deserialize..."
+          .\build-fuzz\fuzz\fuzz_manifest_deserialize.exe -max_total_time=20
+          
+          Write-Host "Running fuzz_vm_deserialize_and_verify..."
+          .\build-fuzz\fuzz\fuzz_vm_deserialize_and_verify.exe -max_total_time=20
+          
+          Write-Host "Running fuzz_encrypted_message_deserialize..."
+          .\build-fuzz\fuzz\fuzz_encrypted_message_deserialize.exe -max_total_time=20
+          
+          Write-Host "Running fuzz_source_scanner..."
+          .\build-fuzz\fuzz\fuzz_source_scanner.exe -max_total_time=20
+

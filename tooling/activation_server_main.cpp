@@ -45,14 +45,15 @@ void PrintUsage() {
             << "  --port <p>                     Listen port (default: 8080)\n"
             << "  --host <h>                     Listen address (default: 127.0.0.1)\n"
             << "  --db <path>                    Database file path (default: activations.db)\n"
-            << "  --key <path>                   Ed25519 signing private key file (unencrypted; discouraged in production)\n"
+            << "  --key <path>                   Ed25519 signing private key file (unencrypted; requires --insecure-dev-only)\n"
             << "  --key-vault <type>             Vault type: 'dpapi' (default), 'env', or 'file'\n"
-            << "  --vault-id <id>                Retrieve signing key from secret store by ID (recommended for production)\n"
+            << "  --vault-id <id>                Retrieve signing key from secret store by ID (mandatory in production)\n"
             << "  --vault-dir <path>             Custom directory path for secret vault store\n"
             << "  --provision-vault <id> <pub>   Generate key directly into vault, export public key to <pub>, and exit\n"
             << "  --tls-cert <path>              TLS server certificate PEM file\n"
             << "  --tls-key <path>               TLS server private key PEM file\n"
-            << "  --insecure-dev-only            Allow non-loopback binding without TLS and print secrets\n"
+            << "  --production                   Explicitly enforce strict production mode (active by default unless --insecure-dev-only)\n"
+            << "  --insecure-dev-only            Development escape hatch: permit plaintext --key files, ephemeral keys, and unencrypted HTTP\n"
             << "  --admin-token <token>          Shared secret token for administrative /events and /analytics endpoints\n"
             << "  --admin-token-file <path>      File containing administrative shared secret token\n"
             << "  --register-license <id> <prod> <seats> [vm_root_hex]\n"
@@ -101,6 +102,7 @@ int main(int argc, char* argv[]) {
   std::string admin_token;
   std::string admin_token_file;
   bool insecure_dev_only = false;
+  bool explicit_production = false;
 
   std::string reg_lic_id;
   std::string reg_prod_id;
@@ -142,6 +144,8 @@ int main(int argc, char* argv[]) {
       tls_key_path = argv[++i];
     } else if (arg == "--insecure-dev-only") {
       insecure_dev_only = true;
+    } else if (arg == "--production") {
+      explicit_production = true;
     } else if (arg == "--admin-token" && i + 1 < argc) {
       admin_token = argv[++i];
     } else if (arg == "--admin-token-file" && i + 1 < argc) {
@@ -162,10 +166,16 @@ int main(int argc, char* argv[]) {
     }
   }
 
+  if (explicit_production && insecure_dev_only) {
+    std::cerr << "Error: Flags --production and --insecure-dev-only are mutually exclusive.\n";
+    return 1;
+  }
+  bool is_production = explicit_production || !insecure_dev_only;
+
   ActivationDatabase db(db_path);
 
   if (!reg_lic_id.empty()) {
-    if (reg_credential.empty() && !reg_generate_cred && !insecure_dev_only) {
+    if (reg_credential.empty() && !reg_generate_cred && is_production) {
       std::cerr << "Error: --register-license requires --credential <secret> or --generate-credential in production mode.\n"
                 << "       (Pass --insecure-dev-only to register credential-free licenses for local testing).\n";
       return 1;
@@ -295,6 +305,14 @@ int main(int argc, char* argv[]) {
     std::cout << "Securely retrieved signing key from " << provider->Name()
               << " (Vault ID: " << vault_id << ")\n";
   } else if (!key_path.empty()) {
+    if (is_production) {
+      std::cerr << "Error: Loading plaintext signing private keys from filesystem path (--key) is prohibited in production mode.\n"
+                << "       Production servers must load keys securely from DPAPI, Cloud Secrets Manager, or HSM via --vault-id <id>.\n"
+                << "       (To generate a key directly into the vault without touching disk, use --provision-vault <id> <pub>).\n"
+                << "       To run with an unencrypted disk key in development/staging, pass --insecure-dev-only.\n";
+      return 1;
+    }
+
     auto kbytes = tooling::ReadFile(key_path);
     if (!kbytes.has_value() || kbytes->size() != integrity::kEd25519PrivateKeyLen) {
       std::cerr << "Error: Unable to read valid Ed25519 private key from " << key_path << "\n";
@@ -328,17 +346,15 @@ int main(int argc, char* argv[]) {
     }
 
     key_pair = integrity::Ed25519KeyPair{std::move(*priv), pub};
-    if (!insecure_dev_only) {
-      std::cout << "[SECURITY WARNING] Server is loading Ed25519 signing private key from filesystem path ("
-                << key_path << ").\n"
-                << "                   For enterprise/production deployments, storing private keys on disk unencrypted is discouraged.\n"
-                << "                   Use --vault-id <id> with DPAPI or Secrets Manager for hardware/system-protected key storage.\n";
-    }
+    std::cout << "[SECURITY WARNING] Server is loading Ed25519 signing private key from filesystem path ("
+              << key_path << ") under --insecure-dev-only flag.\n"
+              << "                   For enterprise/production deployments, storing private keys on disk unencrypted is prohibited.\n"
+              << "                   Use --vault-id <id> with DPAPI or Secrets Manager for hardware/system-protected key storage.\n";
   } else {
-    if (!insecure_dev_only) {
-      std::cerr << "Error: Neither --vault-id nor --key was provided.\n"
-                << "       Production activation servers must specify --vault-id <id> (DPAPI/Secrets Manager) or --key <path>.\n"
-                << "       Ephemeral key generation is only permitted in development mode (--insecure-dev-only).\n";
+    if (is_production) {
+      std::cerr << "Error: Mandatory signing key vault not specified in production mode.\n"
+                << "       Production servers must specify --vault-id <id> (DPAPI/Secrets Manager).\n"
+                << "       (Use --insecure-dev-only to permit ephemeral key generation for local development).\n";
       return 1;
     }
     std::cout << "Generating ephemeral Ed25519 signing key pair for development server...\n"
@@ -405,6 +421,7 @@ int main(int argc, char* argv[]) {
   std::signal(SIGTERM, SignalHandler);
 
   std::cout << "RTProtect Activation Server running at " << server.base_url() << "\n"
+            << "Posture:     " << (is_production ? "PRODUCTION (Hardened Vault Key Required)" : "DEVELOPMENT (Insecure Mode)") << "\n"
             << "Public Key:  " << BytesToHex(key_pair->public_key.data(), key_pair->public_key.size()) << "\n";
   if (insecure_dev_only) {
     std::cout << "Admin Token: " << server.admin_auth_token() << " (insecure-dev-only)\n";

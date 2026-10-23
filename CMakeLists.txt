@@ -27,6 +27,11 @@ option(RTPROTECT_ENABLE_EXPERIMENTAL_RUNTIME_RECONSTRUCTION
        "Build Phase 6's experimental native-code-reconstruction module (runtime/). OFF by default per the brief's explicit instruction that this technique be an isolated, opt-in research experiment -- see docs/RUNTIME_RECONSTRUCTION.md before turning this on."
        OFF)
 
+if(RTPROTECT_BUILD_FUZZERS AND WIN32)
+  # LLVM on Windows ships libFuzzer static libraries linked against MT runtime
+  set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+endif()
+
 # ---------------------------------------------------------------------------
 # Toolchain notes
 #
@@ -85,10 +90,11 @@ if(MSVC)
   endif()
 else()
   add_compile_options(-Wall -Wextra -Wpedantic -fstack-protector-strong)
-  # Position-independent executable: required for ASLR to randomize the
-  # main executable's own load address (MinGW / Clang on Windows).
-  add_compile_options(-fPIE)
-  add_link_options(-pie)
+  if(MINGW)
+    # Position-independent executable on MinGW
+    add_compile_options(-fPIE)
+    add_link_options(-pie)
+  endif()
   if(RTPROTECT_HARDEN_RELEASE)
     # -fvisibility=hidden / -fvisibility-inlines-hidden: don't export symbols
     # from this project's libraries unless explicitly marked, so a release

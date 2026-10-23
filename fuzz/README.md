@@ -1,6 +1,6 @@
 # Fuzz harnesses
 
-Five libFuzzer harnesses, covering the critical untrusted input entry points across RTProtect:
+Six libFuzzer harnesses, covering the critical untrusted input entry points across RTProtect:
 
 | Harness | Covers |
 |---|---|
@@ -9,6 +9,7 @@ Five libFuzzer harnesses, covering the critical untrusted input entry points acr
 | `fuzz_encrypted_message_deserialize` | `crypto::EncryptedMessage::Deserialize()` |
 | `fuzz_source_scanner` | `tooling::TransformSourceFile()` AST/lexical parser and virtualizer |
 | `fuzz_pe_protector` | `tooling::PeProtector::IsValidPe64()` and `tooling::PeProtector::ProtectMemory()` |
+| `fuzz_json_parser` | `tooling::JsonValue::Parse()` Clang AST and journal parser |
 
 ## Status: written, not executed
 
@@ -31,7 +32,8 @@ project can currently back up with real output.
 mkdir build-fuzz && cd build-fuzz
 CC=clang CXX=clang++ cmake .. -DRTPROTECT_BUILD_FUZZERS=ON -DCMAKE_BUILD_TYPE=Debug
 cmake --build . --target fuzz_manifest_deserialize fuzz_vm_deserialize_and_verify \
-                          fuzz_encrypted_message_deserialize fuzz_source_scanner fuzz_pe_protector
+                          fuzz_encrypted_message_deserialize fuzz_source_scanner \
+                          fuzz_pe_protector fuzz_json_parser
 
 # Run each for a bounded time (adjust -max_total_time, in seconds):
 ./fuzz_manifest_deserialize -max_total_time=300 corpus/manifest/
@@ -39,6 +41,7 @@ cmake --build . --target fuzz_manifest_deserialize fuzz_vm_deserialize_and_verif
 ./fuzz_encrypted_message_deserialize -max_total_time=300 corpus/aead/
 ./fuzz_source_scanner -max_total_time=300 corpus/source/
 ./fuzz_pe_protector -max_total_time=300 corpus/pe/
+./fuzz_json_parser -max_total_time=300 corpus/json/
 ```
 
 Create the `corpus/*` directories first (even empty) -- libFuzzer uses
