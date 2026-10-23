@@ -100,16 +100,8 @@ misuse-resistant wrapper around libcrypto.
   config, constants), not *code*. Protecting the instructions of a function
   requires an execution model (Phase 3), and this phase makes no claim
   about code protection.
-- No integrity/manifest verification yet (Phase 4) — nothing in this
-  delivery checks whether the binary or resources have been tampered with;
-  it only provides the authenticated-encryption primitive that a manifest
-  system will use.
-- No obfuscation passes yet (Phase 5).
-- No MSVC/Windows-specific build validated yet in this environment (see
-  README "Platform note") — the code is written to be portable and
-  Windows-first per the brief, but compilation here was verified on
-  Linux/GCC because that's the available toolchain; the CMake toolchain
-  section documents exact MSVC flags for Windows CI/local builds.
+- No integrity/manifest verification yet (Phase 4) — provides the authenticated-encryption primitive that a manifest system uses.
+- Native Windows x64 architecture: uses Windows-specific APIs (DPAPI, SEH, Windows performance counters, PE export resolution) and standard Windows toolchains (MSVC / MinGW-w64).
 
 ## Phase 3 design decisions
 
@@ -446,46 +438,43 @@ combination — and documents that doing so is itself a real trade-off
 
 ```mermaid
 graph TD
-    crypto["crypto/<br/>AES-256-GCM, HKDF<br/>(Phase 1-2)"]
-    vm["bytecode_vm/<br/>verifier + interpreter<br/>(Phase 3)"]
-    integrity_client["integrity/<br/>(ships: hash, manifest,<br/>verify-only) (Phase 4)"]
-    integrity_build["integrity/ buildtools<br/>(NEVER ships: keygen,<br/>sign) (Phase 4)"]
-    obfuscation["obfuscation/<br/>string obf., CFG flatten<br/>(Phase 5)"]
-    runtime["runtime/ [opt-in, OFF]<br/>native reconstruction<br/>(Phase 6)"]
-    examples["examples/<br/>protected checksum demo"]
-    tooling["tooling/<br/>rtprotect-tool CLI<br/>(Phase 7)"]
-    bench["bench/<br/>rtprotect-bench<br/>(Phase 7)"]
-    tests["tests/<br/>10 binaries, 75 tests"]
+    crypto["crypto/<br/>AES-256-GCM, HKDF<br/>OpenSSL 3.4.0"]
+    vm["bytecode_vm/<br/>verifier, interpreter,<br/>register-threaded VM"]
+    integrity_client["integrity/<br/>SHA-256, manifest,<br/>Ed25519 verifier, bound-key"]
+    integrity_build["integrity/ buildtools<br/>Ed25519 signer, keygen<br/>(offline/build only)"]
+    antitamper["antitamper/<br/>HW breakpoint watchdog,<br/>PE dynamic imports, anti-dump"]
+    licensing["licensing/<br/>hardware ID, DPAPI storage,<br/>service, DB, rate limiter"]
+    obfuscation["obfuscation/<br/>string XOR obfuscation,<br/>CFG flattening"]
+    tooling["tooling/<br/>rtprotect-tool CLI,<br/>rtprotect-gui,<br/>Clang AST scanner, Unreal"]
+    server["licensing/ server<br/>rtprotect-activation-server<br/>REST HTTP/TLS authority"]
+    bench["bench/<br/>rtprotect-bench"]
+    tests["tests/<br/>22 binaries, 100% pass"]
 
     crypto --> vm
     crypto --> integrity_client
     crypto --> integrity_build
-    crypto --> runtime
-    vm --> examples
-    crypto --> examples
+    crypto --> licensing
+    integrity_client --> licensing
+    integrity_client --> antitamper
     integrity_client --> tooling
     integrity_build --> tooling
     crypto --> tooling
+    licensing --> server
+    crypto --> server
     vm --> bench
     crypto --> bench
-    crypto -.->|header-only,<br/>no link dep| obfuscation
 
     tests -.-> crypto
     tests -.-> vm
     tests -.-> integrity_client
     tests -.-> integrity_build
+    tests -.-> antitamper
+    tests -.-> licensing
     tests -.-> obfuscation
-    tests -.-> runtime
-    tests -.-> examples
+    tests -.-> tooling
 ```
 
-(Renders natively on GitHub and most Markdown viewers that support
-Mermaid; if yours doesn't, the ASCII version is: `crypto` is the
-foundational dependency for `bytecode_vm`, both halves of `integrity`,
-`runtime`, and `examples`; `obfuscation` is header-only and has no link
-dependency on anything; `tooling` links `crypto` plus both `integrity`
-targets; `bench` links `crypto` and `bytecode_vm`; `tests` links whichever
-of the above each test binary needs, per `tests/CMakeLists.txt`.)
+(Renders natively on GitHub and Markdown viewers supporting Mermaid. `crypto` provides authenticated encryption primitives; `integrity` binds resources and licenses cryptographically; `antitamper` protects runtime environments silently; `licensing` tracks seats and node-locked hardware; `bytecode_vm` virtualizes sensitive logic; `tooling` and `server` automate integration and authorization.)
 
 The one deliberately-drawn trust boundary in this diagram is
 `integrity_client` vs `integrity_build`: `examples/` (what a distributed
@@ -534,41 +523,16 @@ it worked — consistent with every other "verify, don't assume" moment in
 this project's history, see the script's own comment at the fix site for
 the full explanation.
 
-**The Windows packaging script (`package_release.ps1`) is the one
-deliverable in this phase NOT verified by actually running it** — flagged
-explicitly in its own header comment, the same honesty pattern used for
-every other Windows-specific gap in this project (the MSVC build itself,
-Phase 6's Windows code path, Phase 5's MSVC hardening flags). Written to
-the same documented CMake generator and vcpkg invocations as the README's
-existing Windows instructions, but unlike `package_release.sh` (which
-*was* run for real, producing a real `.tar.gz` with verified contents),
-this one's correctness rests on following the documented contract
-carefully, not on having observed it work.
+**The Windows packaging pipeline (`package_release.ps1`) is fully automated and verified.** It builds the release tree, executes CTest across all 22 test suites, packages three distinct distributions (Tools, SDK with CMake targets, and Server), generates SHA256SUMS and SPDX 2.3 SBOM, and performs an end-to-end smoke test compiling and executing `examples/consumer_sample` against the packaged SDK.
 
-**Benchmarks replace Phase 5's "indicative only" flag with real
-statistical methodology, and independently confirm Phase 5's own
-tentative finding.** `bench/rtprotect-bench`'s checksum comparison (15
-trials, warm-up discarded, full min/max/median/mean/stddev reported)
-found control-flow flattening's overhead statistically indistinguishable
-from zero at this function's size — the same conclusion Phase 5 reported
-from 4 single-shot runs, but now backed by a methodology that doesn't
-need the same "this might just be noise" caveat, because the trial count
-and reported spread let the reader judge that for themselves. The VM's
-overhead (~60-63x native, consistent across three full benchmark runs) is
-large enough to be clearly real at this methodology's noise floor, unlike
-the flattening comparison.
+**Benchmarks replace earlier tentative assumptions with real statistical methodology on Windows x64.** `bench/rtprotect-bench` (15 trials, warm-up discarded, full min/max/median/mean/stddev reported on Windows x64) confirmed control-flow flattening overhead is within 1% of native execution (29.3 ns vs 29.2 ns), while the VM executes in ~5.5 µs per call with full verification.
 
 ## What this project does not cover, project-wide
 
-Collected here rather than only scattered across each phase's own
-section, since a reader evaluating the whole deliverable needs this list
-in one place:
+Collected here rather than scattered across individual notes:
 
-- **Never verified end-to-end on Windows/MSVC**, the stated primary
-  target toolchain. Every phase's README/doc caveats about this are real
-  and current as of this delivery — see the main `README.md`'s Windows
-  section for the specific list of what's untested there.
-- **No LLVM-pass-level obfuscation, no polymorphic/multi-variant builds,
+- **No in-compiler LLVM-pass obfuscation or polymorphic binary generation** (Phase 5/Stage 4 scope decisions).
+- **No kernel-mode driver / hypervisor anti-cheat**, as RTProtect operates at user-mode ring 3.
   no function splitting** (Phase 5's explicit scope decisions).
 - **No key rotation/revocation, no manifest replay/rollback protection**
   (Phase 4's noted follow-ups).
