@@ -70,6 +70,21 @@ MT_TEST(PeProtector_RejectsInvalidPeHeaders) {
   MT_CHECK(!PeProtector::ProtectMemory(invalid_data, opts, &res));
   MT_CHECK(!res.success);
 
+  // Security Audit Regression: Test buffers in the 64..263 byte window (and up to e_lfanew + sizeof(NT_HEADERS))
+  // where pe_image.size() < sizeof(IMAGE_NT_HEADERS64) would cause integer underflow in bounds checks
+  for (std::size_t sz : {64, 65, 100, 128, 200, 263, 264, 300, 327}) {
+    std::vector<std::uint8_t> small_pe(sz, 0);
+    auto* dos_small = reinterpret_cast<IMAGE_DOS_HEADER*>(small_pe.data());
+    dos_small->e_magic = IMAGE_DOS_SIGNATURE;
+    dos_small->e_lfanew = static_cast<LONG>(sizeof(IMAGE_DOS_HEADER)); // 64 bytes
+    // Must be rejected safely without out-of-bounds reads or underflow
+    MT_CHECK(!PeProtector::IsValidPe64(small_pe));
+
+    PeProtectionResult small_res;
+    MT_CHECK(!PeProtector::ProtectMemory(small_pe, opts, &small_res));
+    MT_CHECK(!small_res.success);
+  }
+
   // Test truncated NT headers
   auto pe_trunc = CreateSyntheticPe64();
   auto* dos = reinterpret_cast<IMAGE_DOS_HEADER*>(pe_trunc.data());

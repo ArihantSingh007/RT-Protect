@@ -64,6 +64,9 @@ const tooling::PeProtectedSectionHeader* FindProtectedSectionHeader(const void* 
   const auto* base_bytes = reinterpret_cast<const std::uint8_t*>(module_base);
   const auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(base_bytes);
   if (dos->e_magic != IMAGE_DOS_SIGNATURE) return nullptr;
+  if (dos->e_lfanew < static_cast<LONG>(0x40 + sizeof(tooling::PeProtectedSectionHeader))) {
+    return nullptr;
+  }
 
   // Check offset 0x40 in DOS stub padding
   const auto* candidate = reinterpret_cast<const tooling::PeProtectedSectionHeader*>(base_bytes + 0x40);
