@@ -36,8 +36,11 @@ HWND g_hRadioDevMode = nullptr;
 HWND g_hRadioProdMode = nullptr;
 HWND g_hEditManPubKey = nullptr;
 HWND g_hEditLicPubKey = nullptr;
+HWND g_hEditActPubKey = nullptr;
+HWND g_hEditActCred = nullptr;
 HWND g_hBtnBrowseManPub = nullptr;
 HWND g_hBtnBrowseLicPub = nullptr;
+HWND g_hBtnBrowseActPub = nullptr;
 HWND g_hBtnBrowse = nullptr;
 HWND g_hBtnPlan = nullptr;
 HWND g_hBtnProtect = nullptr;
@@ -120,11 +123,16 @@ void RunPlanWorkflow() {
     return;
   }
 
+  int profile_idx = (int)SendMessage(g_hComboProfile, CB_GETCURSEL, 0, 0);
+  rtprotect::tooling::ProtectionProfile profile = rtprotect::tooling::ProtectionProfile::kMaximum;
+  if (profile_idx == 1) profile = rtprotect::tooling::ProtectionProfile::kBalanced;
+  else if (profile_idx == 2) profile = rtprotect::tooling::ProtectionProfile::kDevelopment;
+
   if (g_worker_thread.joinable()) {
     g_worker_thread.join();
   }
 
-  g_worker_thread = std::thread([proj_dir, target_name, product_id]() {
+  g_worker_thread = std::thread([proj_dir, target_name, product_id, profile]() {
     AppendLog("\r\n========================================\r\n");
     AppendLog("[RTProtect GUI] Scanning project workspace: " + proj_dir + "\r\n");
     SetProgress(20);
@@ -133,7 +141,7 @@ void RunPlanWorkflow() {
     opts.target_project_path = proj_dir;
     opts.target_name = target_name;
     opts.product_id = product_id;
-    opts.profile = rtprotect::tooling::ProtectionProfile::kMaximum;
+    opts.profile = profile;
 
     auto plan = rtprotect::tooling::PlanIntegration(opts);
     SetProgress(60);
@@ -153,6 +161,22 @@ void RunPlanWorkflow() {
       for (const auto& f : plan.files_to_modify) {
         AppendLog("    * " + f + "\r\n");
       }
+
+      AppendLog("\r\n  Profile Capability Audit:\r\n");
+      if (profile == rtprotect::tooling::ProtectionProfile::kMaximum) {
+        AppendLog("    [+] Bytecode VM Function Virtualization\r\n");
+        AppendLog("    [+] Dynamic Per-Function Key Derivation (HKDF-SHA256)\r\n");
+        AppendLog("    [+] Compile-Time String Encryption (XOR Keystream)\r\n");
+        AppendLog("    [+] Multi-Threaded Anti-Tamper & Watchdog Heartbeat\r\n");
+        AppendLog("    [+] Cryptographic 3-Key Verification (Manifest, License, Activation)\r\n");
+      } else if (profile == rtprotect::tooling::ProtectionProfile::kBalanced) {
+        AppendLog("    [+] Bytecode VM Function Virtualization\r\n");
+        AppendLog("    [+] Anti-Tamper Checkpoints & Integrity Manifest\r\n");
+        AppendLog("    [+] Cryptographic 3-Key Verification\r\n");
+      } else {
+        AppendLog("    [+] Binary Integrity Manifest & Basic Anti-Debug\r\n");
+      }
+
       AppendLog("\r\nProject is valid and ready for protection integration.\r\n");
       SetProgress(100);
     }
@@ -171,18 +195,24 @@ void RunProtectWorkflow() {
   char prod_buf[256] = {0};
   char man_pub_buf[MAX_PATH] = {0};
   char lic_pub_buf[MAX_PATH] = {0};
+  char act_pub_buf[MAX_PATH] = {0};
+  char act_cred_buf[256] = {0};
 
   GetWindowTextA(g_hEditProjectDir, dir_buf, MAX_PATH);
   GetWindowTextA(g_hEditTarget, target_buf, 256);
   GetWindowTextA(g_hEditProductId, prod_buf, 256);
   GetWindowTextA(g_hEditManPubKey, man_pub_buf, MAX_PATH);
   GetWindowTextA(g_hEditLicPubKey, lic_pub_buf, MAX_PATH);
+  GetWindowTextA(g_hEditActPubKey, act_pub_buf, MAX_PATH);
+  GetWindowTextA(g_hEditActCred, act_cred_buf, 256);
 
   std::string proj_dir(dir_buf);
   std::string target_name(target_buf);
   std::string product_id = prod_buf[0] ? std::string(prod_buf) : "com.vendor.app";
   std::string man_pub_path(man_pub_buf);
   std::string lic_pub_path(lic_pub_buf);
+  std::string act_pub_path(act_pub_buf);
+  std::string act_cred(act_cred_buf);
 
   if (proj_dir.empty()) {
     MessageBoxA(g_hMainWnd, "Please select a project directory first.", "RTProtect", MB_ICONWARNING);
@@ -192,10 +222,10 @@ void RunProtectWorkflow() {
 
   bool is_prod_mode = (SendMessageA(g_hRadioProdMode, BM_GETCHECK, 0, 0) == BST_CHECKED);
   if (is_prod_mode) {
-    if (man_pub_path.empty() || lic_pub_path.empty()) {
+    if (man_pub_path.empty() || lic_pub_path.empty() || act_pub_path.empty()) {
       MessageBoxA(g_hMainWnd,
                   "Production Release Mode requires configured vendor verification public keys.\n\n"
-                  "Please specify both Manifest Public Key and License Public Key, or switch to Development Mode.",
+                  "Please specify Manifest Public Key, License Public Key, and Activation Public Key, or switch to Development Mode.",
                   "RTProtect - Missing Production Keys", MB_ICONERROR);
       g_is_busy.store(false);
       return;
@@ -211,7 +241,7 @@ void RunProtectWorkflow() {
     g_worker_thread.join();
   }
 
-  g_worker_thread = std::thread([proj_dir, target_name, product_id, profile, is_prod_mode, man_pub_path, lic_pub_path]() {
+  g_worker_thread = std::thread([proj_dir, target_name, product_id, profile, is_prod_mode, man_pub_path, lic_pub_path, act_pub_path, act_cred]() {
     AppendLog("\r\n========================================\r\n");
     AppendLog(std::string("[RTProtect GUI] Starting ") +
               (is_prod_mode ? "PRODUCTION RELEASE" : "DEVELOPMENT") + " Pipeline...\r\n");
@@ -223,11 +253,13 @@ void RunProtectWorkflow() {
     opts.product_id = product_id;
     opts.profile = profile;
     opts.run_build = true;
+    opts.activation_credential = act_cred;
 
     if (is_prod_mode) {
       opts.use_dev_keys = false;
       opts.manifest_pubkey_path = man_pub_path;
       opts.license_pubkey_path = lic_pub_path;
+      opts.activation_pubkey_path = act_pub_path;
     } else {
       opts.use_dev_keys = true;
     }
@@ -328,16 +360,25 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
       g_hEditLicPubKey = CreateWindowExA(WS_EX_CLIENTEDGE, "EDIT", "", WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL, 140, 166, 440, 24, hWnd, nullptr, nullptr, nullptr);
       g_hBtnBrowseLicPub = CreateWindowA("BUTTON", "Browse...", WS_CHILD | WS_VISIBLE, 590, 166, 90, 24, hWnd, (HMENU)105, nullptr, nullptr);
 
+      // Activation Public Key
+      CreateWindowA("STATIC", "Activation PubKey:", WS_CHILD | WS_VISIBLE, 20, 198, 120, 20, hWnd, nullptr, nullptr, nullptr);
+      g_hEditActPubKey = CreateWindowExA(WS_EX_CLIENTEDGE, "EDIT", "", WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL, 140, 196, 440, 24, hWnd, nullptr, nullptr, nullptr);
+      g_hBtnBrowseActPub = CreateWindowA("BUTTON", "Browse...", WS_CHILD | WS_VISIBLE, 590, 196, 90, 24, hWnd, (HMENU)106, nullptr, nullptr);
+
+      // Activation Credential Secret
+      CreateWindowA("STATIC", "Activation Secret:", WS_CHILD | WS_VISIBLE, 20, 228, 120, 20, hWnd, nullptr, nullptr, nullptr);
+      g_hEditActCred = CreateWindowExA(WS_EX_CLIENTEDGE, "EDIT", "", WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL, 140, 226, 540, 24, hWnd, nullptr, nullptr, nullptr);
+
       // Action Buttons
-      g_hBtnPlan = CreateWindowA("BUTTON", "1. Scan & Plan Project", WS_CHILD | WS_VISIBLE, 140, 202, 190, 32, hWnd, (HMENU)102, nullptr, nullptr);
-      g_hBtnProtect = CreateWindowA("BUTTON", "2. Integrate, Build & Verify", WS_CHILD | WS_VISIBLE, 350, 202, 230, 32, hWnd, (HMENU)103, nullptr, nullptr);
+      g_hBtnPlan = CreateWindowA("BUTTON", "1. Scan & Plan Project", WS_CHILD | WS_VISIBLE, 140, 260, 190, 32, hWnd, (HMENU)102, nullptr, nullptr);
+      g_hBtnProtect = CreateWindowA("BUTTON", "2. Integrate, Build & Verify", WS_CHILD | WS_VISIBLE, 350, 260, 230, 32, hWnd, (HMENU)103, nullptr, nullptr);
 
       // Progress Bar
-      g_hProgressBar = CreateWindowExA(0, PROGRESS_CLASSA, "", WS_CHILD | WS_VISIBLE, 20, 246, 660, 16, hWnd, nullptr, nullptr, nullptr);
+      g_hProgressBar = CreateWindowExA(0, PROGRESS_CLASSA, "", WS_CHILD | WS_VISIBLE, 20, 302, 660, 16, hWnd, nullptr, nullptr, nullptr);
 
       // Output Console
-      CreateWindowA("STATIC", "Protection & Build Diagnostics Log:", WS_CHILD | WS_VISIBLE, 20, 270, 300, 18, hWnd, nullptr, nullptr, nullptr);
-      g_hEditLog = CreateWindowExA(WS_EX_CLIENTEDGE, "EDIT", "", WS_CHILD | WS_VISIBLE | ES_MULTILINE | ES_AUTOVSCROLL | ES_READONLY | WS_VSCROLL, 20, 290, 660, 250, hWnd, nullptr, nullptr, nullptr);
+      CreateWindowA("STATIC", "Protection & Build Diagnostics Log:", WS_CHILD | WS_VISIBLE, 20, 324, 300, 18, hWnd, nullptr, nullptr, nullptr);
+      g_hEditLog = CreateWindowExA(WS_EX_CLIENTEDGE, "EDIT", "", WS_CHILD | WS_VISIBLE | ES_MULTILINE | ES_AUTOVSCROLL | ES_READONLY | WS_VSCROLL, 20, 344, 660, 260, hWnd, nullptr, nullptr, nullptr);
 
       // Set Font on all child controls
       EnumChildWindows(hWnd, [](HWND hChild, LPARAM lParam) -> BOOL {
@@ -366,6 +407,11 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         std::string file = BrowseForFile(hWnd, "Select License Public Key (license.pub)", "Public Key Files (*.pub)\0*.pub\0All Files (*.*)\0*.*\0");
         if (!file.empty()) {
           SetWindowTextA(g_hEditLicPubKey, file.c_str());
+        }
+      } else if (id == 106) { // Browse activation pub key
+        std::string file = BrowseForFile(hWnd, "Select Activation Public Key (activation.pub)", "Public Key Files (*.pub)\0*.pub\0All Files (*.*)\0*.*\0");
+        if (!file.empty()) {
+          SetWindowTextA(g_hEditActPubKey, file.c_str());
         }
       } else if (id == 102) { // Plan
         RunPlanWorkflow();
@@ -437,7 +483,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
       "RTProtectGUIWindow",
       "RTProtect - Anti-Piracy & Binary Protection Workbench",
       WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX,
-      CW_USEDEFAULT, CW_USEDEFAULT, 715, 600,
+      CW_USEDEFAULT, CW_USEDEFAULT, 715, 660,
       nullptr, nullptr, hInstance, nullptr);
 
   if (!g_hMainWnd) return 1;

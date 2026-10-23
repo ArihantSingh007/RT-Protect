@@ -91,7 +91,10 @@ bool RunProcessCaptureOutput(const std::string& exe,
   si.dwFlags = STARTF_USESTDHANDLES | STARTF_USESHOWWINDOW;
   si.wShowWindow = SW_HIDE;
   si.hStdOutput = hWritePipe;
-  si.hStdError = hWritePipe;
+
+  // Separate stderr from stdout: redirect stderr to NUL to prevent compiler diagnostics from corrupting JSON AST
+  HANDLE hNul = ::CreateFileA("NUL", GENERIC_WRITE, FILE_SHARE_WRITE | FILE_SHARE_READ, &sa, OPEN_EXISTING, 0, nullptr);
+  si.hStdError = (hNul != INVALID_HANDLE_VALUE) ? hNul : hWritePipe;
 
   PROCESS_INFORMATION pi{};
   std::vector<char> cmd_buf(cmd_line.begin(), cmd_line.end());
@@ -111,6 +114,9 @@ bool RunProcessCaptureOutput(const std::string& exe,
       &pi);
 
   ::CloseHandle(hWritePipe);
+  if (hNul != INVALID_HANDLE_VALUE && hNul != hWritePipe) {
+    ::CloseHandle(hNul);
+  }
 
   if (!ok) {
     ::CloseHandle(hReadPipe);
@@ -331,6 +337,51 @@ std::string ClangAstScanner::GetClangBinaryPath() {
   return "";
 }
 
+namespace {
+
+bool IsValidVmType(const std::string& type_str, bool allow_void) {
+  std::string s = type_str;
+  while (!s.empty() && std::isspace(static_cast<unsigned char>(s.front()))) s.erase(s.begin());
+  while (!s.empty() && std::isspace(static_cast<unsigned char>(s.back()))) s.pop_back();
+
+  if (s.rfind("const ", 0) == 0) s = s.substr(6);
+  if (s.rfind("volatile ", 0) == 0) s = s.substr(9);
+  while (!s.empty() && std::isspace(static_cast<unsigned char>(s.front()))) s.erase(s.begin());
+  while (!s.empty() && std::isspace(static_cast<unsigned char>(s.back()))) s.pop_back();
+
+  if (s.size() > 6 && s.substr(s.size() - 6) == " const") s = s.substr(0, s.size() - 6);
+
+  // Strictly disallow pointers (*), references (&), arrays ([]), templates (<>), ellipses (...)
+  if (s.find('*') != std::string::npos) return false;
+  if (s.find('&') != std::string::npos) return false;
+  if (s.find('[') != std::string::npos) return false;
+  if (s.find('<') != std::string::npos) return false;
+  if (s.find("...") != std::string::npos) return false;
+
+  if (allow_void && s == "void") return true;
+
+  static const char* const kExactPrimitives[] = {
+      "int", "signed int", "unsigned int",
+      "short", "signed short", "unsigned short", "short int", "unsigned short int",
+      "long", "signed long", "unsigned long", "long int", "unsigned long int",
+      "long long", "signed long long", "unsigned long long", "long long int", "unsigned long long int",
+      "char", "signed char", "unsigned char",
+      "bool", "_Bool",
+      "int8_t", "int16_t", "int32_t", "int64_t",
+      "uint8_t", "uint16_t", "uint32_t", "uint64_t",
+      "std::int8_t", "std::int16_t", "std::int32_t", "std::int64_t",
+      "std::uint8_t", "std::uint16_t", "std::uint32_t", "std::uint64_t",
+      "size_t", "std::size_t"
+  };
+
+  for (const char* prim : kExactPrimitives) {
+    if (s == prim) return true;
+  }
+  return false;
+}
+
+}  // namespace
+
 bool ClangAstScanner::ValidateVirtualizationEligibility(const ClangFunctionDecl& fn, std::string* out_reason) {
   if (fn.has_unsupported_constructs) {
     if (out_reason) *out_reason = fn.unsupported_reason;
@@ -342,22 +393,17 @@ bool ClangAstScanner::ValidateVirtualizationEligibility(const ClangFunctionDecl&
     return false;
   }
 
-  static const char* const kSupportedPrimitives[] = {
-      "int", "long", "long long", "int64_t", "int32_t", "uint64_t", "uint32_t",
-      "short", "char", "bool", "void", "unsigned int", "unsigned long"
-  };
-
-  bool ret_ok = false;
-  for (const char* prim : kSupportedPrimitives) {
-    if (fn.return_type.find(prim) != std::string::npos) {
-      ret_ok = true;
-      break;
-    }
+  if (!IsValidVmType(fn.return_type, /*allow_void=*/true)) {
+    if (out_reason) *out_reason = "Unsupported return type for bytecode VM (pointers, references, floats, structs are prohibited): " + fn.return_type;
+    return false;
   }
 
-  if (!ret_ok) {
-    if (out_reason) *out_reason = "Unsupported return type for bytecode VM: " + fn.return_type;
-    return false;
+  for (std::size_t i = 0; i < fn.param_types.size(); ++i) {
+    const auto& pt = fn.param_types[i];
+    if (!IsValidVmType(pt, /*allow_void=*/false)) {
+      if (out_reason) *out_reason = "Unsupported parameter " + std::to_string(i + 1) + " type for bytecode VM (must be primitive integer/bool): " + pt;
+      return false;
+    }
   }
 
   return true;
@@ -405,17 +451,38 @@ std::vector<ClangFunctionDecl> ClangAstScanner::AnalyzeTranslationUnit(
     if (node->contains("kind") && (*node)["kind"].as_string() == "FunctionDecl") {
       std::string fn_name = (*node)["name"].as_string();
       if (!fn_name.empty()) {
-        std::size_t src_fn_pos = src_text->find(fn_name);
+        std::size_t src_fn_pos = std::string::npos;
+        if (node->contains("loc") && (*node)["loc"].contains("offset")) {
+          src_fn_pos = static_cast<std::size_t>((*node)["loc"]["offset"].as_int());
+        }
+        if (src_fn_pos == std::string::npos || src_fn_pos > src_text->size()) {
+          src_fn_pos = src_text->find(fn_name);
+        }
+
         if (src_fn_pos != std::string::npos) {
-          std::size_t lookback = (src_fn_pos >= 200) ? 200 : src_fn_pos;
+          std::size_t lookback = (src_fn_pos >= 250) ? 250 : src_fn_pos;
           std::string prefix = src_text->substr(src_fn_pos - lookback, lookback);
 
           bool is_tagged = (prefix.find("RTPROTECT_VIRTUALIZE") != std::string::npos ||
                             prefix.find("[[rtprotect::virtualize]]") != std::string::npos);
 
+          // Also check AST attributes in inner nodes
+          if (!is_tagged && node->contains("inner") && (*node)["inner"].is_array()) {
+            for (const auto& in_node : (*node)["inner"].as_array()) {
+              if (in_node.contains("kind") && in_node["kind"].as_string() == "AnnotateAttr") {
+                std::string ann = in_node.contains("annotation") ? in_node["annotation"].as_string() : "";
+                if (ann.find("virtualize") != std::string::npos) {
+                  is_tagged = true;
+                  break;
+                }
+              }
+            }
+          }
+
           if (is_tagged) {
             ClangFunctionDecl decl;
             decl.name = fn_name;
+            decl.start_offset = src_fn_pos;
             decl.is_virtualized_annotated = true;
 
             if (node->contains("type") && (*node)["type"].contains("qualType")) {
@@ -441,6 +508,14 @@ std::vector<ClangFunctionDecl> ClangAstScanner::AnalyzeTranslationUnit(
                 }
               }
             }
+
+            // Build unique overload signature: name(type1, type2)
+            decl.signature = decl.name + "(";
+            for (std::size_t p = 0; p < decl.param_types.size(); ++p) {
+              if (p > 0) decl.signature += ", ";
+              decl.signature += decl.param_types[p];
+            }
+            decl.signature += ")";
 
             results.push_back(decl);
           }

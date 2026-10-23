@@ -22,6 +22,7 @@ struct LicenseVerificationContext {
   std::string expected_edition;             // E.g. "Enterprise" (empty = any)
   double min_hw_match_score = 0.75;         // Required hardware similarity (0.0 to 1.0)
   bool reject_degraded_hardware = false;     // Reject validation if hardware fingerprint probes failed
+  bool enforce_hardware_binding = true;      // If false, bypasses HWID match (for packaging/build verification)
 };
 
 // Verifies the license against the vendor public key and verification context.

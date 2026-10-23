@@ -55,7 +55,7 @@ LicenseStatus VerifyLicense(const License& lic,
   }
 
   // 7. Hardware binding check
-  if (!lic.hardware_id.empty()) {
+  if (ctx.enforce_hardware_binding && !lic.hardware_id.empty()) {
     if (ctx.current_hardware_id.empty()) {
       return LicenseStatus::kHardwareMismatch;
     }

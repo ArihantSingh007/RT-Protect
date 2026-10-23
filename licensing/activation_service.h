@@ -28,6 +28,15 @@ struct ActivateRequest {
   std::uint64_t client_timestamp = 0;
   std::array<std::uint8_t, 32> client_nonce{};
   std::string client_ip = "127.0.0.1";
+  std::string activation_credential; // Secret activation secret (separated from public license ID)
+
+  ActivateRequest() = default;
+  ActivateRequest(std::string lk, std::string df, std::string pid, std::string ver = "1.0.0",
+                  std::uint64_t ts = 0, std::array<std::uint8_t, 32> nonce = {},
+                  std::string ip = "127.0.0.1", std::string cred = "")
+      : license_key(std::move(lk)), device_fingerprint(std::move(df)), product_id(std::move(pid)),
+        client_version(std::move(ver)), client_timestamp(ts), client_nonce(nonce),
+        client_ip(std::move(ip)), activation_credential(std::move(cred)) {}
 };
 
 struct ActivateResponse {

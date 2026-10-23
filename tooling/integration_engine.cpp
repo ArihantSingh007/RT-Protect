@@ -251,7 +251,8 @@ bool IsExcludedSourcePath(const fs::path& p, const fs::path& proj_root) {
   if (fname.rfind("rtprotect_", 0) == 0) {
     return true;
   }
-  if (fname == "release.manifest" || fname == "release.sig" || fname == "release.pub" || fname == "license.pub" || fname == "client.license") {
+  if (fname == "release.manifest" || fname == "release.sig" || fname == "release.pub" ||
+      fname == "license.pub" || fname == "activation.pub" || fname == "client.license") {
     return true;
   }
 
@@ -297,11 +298,23 @@ bool TransformSourceFile(const fs::path& file_path,
 
   auto opcode_map = rtprotect::vm::OpcodeMap::FromSeed(opcode_seed);
 
-  // 1. Clang AST semantic validation (Stage 3)
+  // 1. Clang AST semantic validation with compilation database flags (Stage 3)
   std::unordered_map<std::string, ClangFunctionDecl> clang_decls;
   if (ClangAstScanner::IsAvailable()) {
-    auto clang_fns = ClangAstScanner::AnalyzeTranslationUnit(file_path.string());
+    std::vector<std::string> compiler_flags;
+    auto comp_db = CompilationDatabase::LoadFromDirectory(file_path.parent_path().string());
+    if (!comp_db.has_value() && file_path.parent_path().has_parent_path()) {
+      comp_db = CompilationDatabase::LoadFromDirectory(file_path.parent_path().parent_path().string());
+    }
+    if (comp_db.has_value()) {
+      compiler_flags = comp_db->GetFlagsForFile(file_path.string());
+    }
+
+    auto clang_fns = ClangAstScanner::AnalyzeTranslationUnit(file_path.string(), compiler_flags);
     for (const auto& cfn : clang_fns) {
+      if (!cfn.signature.empty()) {
+        clang_decls[cfn.signature] = cfn;
+      }
       clang_decls[cfn.name] = cfn;
     }
   }
@@ -319,8 +332,13 @@ bool TransformSourceFile(const fs::path& file_path,
     std::string fn_name = fn.name;
     const auto& arg_names = fn.arg_names;
 
-    // A. Clang AST semantic validation
-    auto it = clang_decls.find(fn_name);
+    // A. Clang AST semantic validation with overload signature matching
+    std::string sig_key = fn_name + "(" + fn.params_raw + ")";
+    auto it = clang_decls.find(sig_key);
+    if (it == clang_decls.end()) {
+      it = clang_decls.find(fn_name);
+    }
+
     if (it != clang_decls.end()) {
       const auto& cfn = it->second;
       std::string reject_reason;
@@ -686,6 +704,7 @@ ChangePlan PlanIntegration(const IntegrationOptions& options) {
   plan.files_to_create.push_back((proj_path / "rtprotect_runtime_glue.cpp").string());
   plan.files_to_create.push_back((proj_path / "release.pub").string());
   plan.files_to_create.push_back((proj_path / "license.pub").string());
+  plan.files_to_create.push_back((proj_path / "activation.pub").string());
   plan.files_to_create.push_back((proj_path / "release.manifest").string());
   plan.files_to_create.push_back((proj_path / "release.sig").string());
   plan.files_to_create.push_back((proj_path / "client.license").string());
@@ -795,12 +814,20 @@ IntegrationReport ExecuteIntegration(const IntegrationOptions& options) {
 
   // 2. Cryptographic Key Handling (CRITICAL 1 REMEDIATION)
   // Production security: Private keys are NEVER placed in the client project or backup directory.
+  // Enforces strict role separation across THREE distinct keys:
+  // 1. manifest.pub (Release resource integrity and anti-rollback)
+  // 2. license.pub  (Customer entitlement, edition, and capabilities)
+  // 3. activation.pub (Online Activation Authority token verification)
   integrity::Ed25519PublicKey manifest_pubkey{};
   integrity::Ed25519PublicKey license_pubkey{};
+  integrity::Ed25519PublicKey activation_pubkey{};
   std::optional<integrity::Ed25519PrivateKey> manifest_privkey;
   std::optional<integrity::Ed25519PrivateKey> license_privkey;
+  std::optional<integrity::Ed25519PrivateKey> activation_privkey;
   bool has_manifest_privkey = false;
   bool has_license_privkey = false;
+  bool has_activation_privkey = false;
+  (void)has_activation_privkey;
 
   if (options.use_dev_keys) {
     // Development-only testing workflow
@@ -828,7 +855,8 @@ IntegrationReport ExecuteIntegration(const IntegrationOptions& options) {
 
     auto man_kp = integrity::GenerateEd25519KeyPair();
     auto lic_kp = integrity::GenerateEd25519KeyPair();
-    if (!man_kp.has_value() || !lic_kp.has_value()) {
+    auto act_kp = integrity::GenerateEd25519KeyPair();
+    if (!man_kp.has_value() || !lic_kp.has_value() || !act_kp.has_value()) {
       report.success = false;
       report.state = IntegrationState::kFailed;
       report.error_message = "Failed to generate ephemeral development keypairs.";
@@ -837,11 +865,14 @@ IntegrationReport ExecuteIntegration(const IntegrationOptions& options) {
 
     manifest_pubkey = man_kp->public_key;
     license_pubkey = lic_kp->public_key;
+    activation_pubkey = act_kp->public_key;
 
     fs::path dev_man_priv = dev_keys_dir / "manifest.priv";
     fs::path dev_lic_priv = dev_keys_dir / "license.priv";
+    fs::path dev_act_priv = dev_keys_dir / "activation.priv";
     if (!WriteSecretFile(dev_man_priv.string(), man_kp->private_key.data(), man_kp->private_key.size()) ||
-        !WriteSecretFile(dev_lic_priv.string(), lic_kp->private_key.data(), lic_kp->private_key.size())) {
+        !WriteSecretFile(dev_lic_priv.string(), lic_kp->private_key.data(), lic_kp->private_key.size()) ||
+        !WriteSecretFile(dev_act_priv.string(), act_kp->private_key.data(), act_kp->private_key.size())) {
       report.success = false;
       report.state = IntegrationState::kFailed;
       report.error_message = "Failed to write development private keys to secure storage";
@@ -850,8 +881,10 @@ IntegrationReport ExecuteIntegration(const IntegrationOptions& options) {
 
     manifest_privkey = std::move(man_kp->private_key);
     license_privkey = std::move(lic_kp->private_key);
+    activation_privkey = std::move(act_kp->private_key);
     has_manifest_privkey = true;
     has_license_privkey = true;
+    has_activation_privkey = true;
 
     report.private_key_file = dev_man_priv.string();
     report.warnings.push_back("Development test keys generated outside project at: " + dev_keys_dir.string() + " (Not for production distribution)");
@@ -882,6 +915,22 @@ IntegrationReport ExecuteIntegration(const IntegrationOptions& options) {
     }
     std::memcpy(license_pubkey.data(), lic_bytes->data(), integrity::kEd25519PublicKeyLen);
 
+    if (!options.activation_pubkey_path.empty()) {
+      auto act_bytes = ReadFile(options.activation_pubkey_path);
+      if (!act_bytes.has_value() || act_bytes->size() != integrity::kEd25519PublicKeyLen) {
+        report.success = false;
+        report.state = IntegrationState::kFailed;
+        report.error_message = "Invalid or unreadable activation public key file: " + options.activation_pubkey_path;
+        return report;
+      }
+      std::memcpy(activation_pubkey.data(), act_bytes->data(), integrity::kEd25519PublicKeyLen);
+    } else {
+      auto act_kp = integrity::GenerateEd25519KeyPair();
+      if (act_kp.has_value()) {
+        activation_pubkey = act_kp->public_key;
+      }
+    }
+
     // Optional signing keys for authorized build machine
     if (!options.sign_manifest_key_path.empty()) {
       auto m_priv = ReadFile(options.sign_manifest_key_path);
@@ -898,6 +947,15 @@ IntegrationReport ExecuteIntegration(const IntegrationOptions& options) {
         license_privkey = integrity::Ed25519PrivateKey::FromBytes(l_priv->data(), l_priv->size());
         if (license_privkey.has_value()) {
           has_license_privkey = true;
+        }
+      }
+    }
+    if (!options.sign_activation_key_path.empty()) {
+      auto a_priv = ReadFile(options.sign_activation_key_path);
+      if (a_priv.has_value() && a_priv->size() == integrity::kEd25519PrivateKeyLen) {
+        activation_privkey = integrity::Ed25519PrivateKey::FromBytes(a_priv->data(), a_priv->size());
+        if (activation_privkey.has_value()) {
+          has_activation_privkey = true;
         }
       }
     }
@@ -966,8 +1024,10 @@ IntegrationReport ExecuteIntegration(const IntegrationOptions& options) {
   // 4. Write Public Keys to Project
   fs::path manifest_pub_path = proj_path / "release.pub";
   fs::path license_pub_path = proj_path / "license.pub";
+  fs::path activation_pub_path = proj_path / "activation.pub";
   if (!WriteFile(manifest_pub_path.string(), manifest_pubkey.data(), manifest_pubkey.size()) ||
-      !WriteFile(license_pub_path.string(), license_pubkey.data(), license_pubkey.size())) {
+      !WriteFile(license_pub_path.string(), license_pubkey.data(), license_pubkey.size()) ||
+      !WriteFile(activation_pub_path.string(), activation_pubkey.data(), activation_pubkey.size())) {
     report.success = false;
     report.state = IntegrationState::kFailed;
     report.error_message = "Failed to write public verification key files into project directory";
@@ -977,8 +1037,10 @@ IntegrationReport ExecuteIntegration(const IntegrationOptions& options) {
   report.public_key_file = manifest_pub_path.string();
   report.manifest_public_key_file = manifest_pub_path.string();
   report.license_public_key_file = license_pub_path.string();
+  report.activation_public_key_file = activation_pub_path.string();
   report.generated_files.push_back(manifest_pub_path.string());
   report.generated_files.push_back(license_pub_path.string());
+  report.generated_files.push_back(activation_pub_path.string());
 
   std::string expected_exe_name = target_name;
 #if defined(_WIN32)
@@ -1044,7 +1106,7 @@ IntegrationReport ExecuteIntegration(const IntegrationOptions& options) {
   if (!vm_root_set && !options.activation_server_url.empty()) {
     std::string act_err;
     auto srv_token = rtprotect::licensing::RequestOnlineActivation(
-        options.activation_server_url, dev_lic_id, options.product_id, manifest_pubkey, &act_err);
+        options.activation_server_url, dev_lic_id, options.product_id, activation_pubkey, &act_err, options.activation_credential);
     if (srv_token.has_value()) {
       vm_root = srv_token->vm_root;
       vm_root_set = true;
@@ -1099,9 +1161,10 @@ IntegrationReport ExecuteIntegration(const IntegrationOptions& options) {
     ss << "inline constexpr const char* kProtectionProfile = \"" << ToString(options.profile) << "\";\n";
     ss << "inline constexpr const char* kExpectedExecutableName = \"" << expected_exe_name << "\";\n";
     ss << "inline constexpr const char* kActivationServerUrl = \"" << options.activation_server_url << "\";\n";
+    ss << "inline constexpr const char* kActivationCredential = \"" << options.activation_credential << "\";\n";
     ss << "inline constexpr bool kAllowDevTokenFallback = " << (options.use_dev_keys ? "true" : "false") << ";\n";
     ss << "inline constexpr std::uint64_t kRequiredCapabilities = 0x01; // kCapCoreExecution\n";
-    ss << "inline constexpr std::uint64_t kMinimumReleaseSequence = 1;\n\n";
+    ss << "inline constexpr std::uint64_t kMinimumReleaseSequence = " << options.minimum_release_sequence << "ULL;\n\n";
 
     char seed_buf[32];
     std::snprintf(seed_buf, sizeof(seed_buf), "0x%08XU", opcode_seed);
@@ -1123,6 +1186,7 @@ IntegrationReport ExecuteIntegration(const IntegrationOptions& options) {
 
     dump_key("kManifestPublicKey", manifest_pubkey);
     dump_key("kLicensePublicKey", license_pubkey);
+    dump_key("kActivationPublicKey", activation_pubkey);
     dump_key("kPublicKey", manifest_pubkey);
 
     ss << "bool VerifyClientIntegrityAndLicense();\n";
@@ -1275,10 +1339,14 @@ IntegrationReport ExecuteIntegration(const IntegrationOptions& options) {
     ss << "\n  // 4. Activation token retrieval and VM root derivation\n";
     ss << "  rtprotect::licensing::ActivationToken token;\n";
     ss << "  bool token_loaded = false;\n\n";
-    ss << "  // 4a. Check OS secure storage (Windows DPAPI)\n";
+    ss << "  // 4a. Check OS secure storage (Windows DPAPI) with strict cryptographic signature verification\n";
     ss << "  auto cached_tok = rtprotect::licensing::LoadActivationToken(kProductId);\n";
-    ss << "  if (cached_tok.has_value() && (cached_tok->license_id == lic.license_id || cached_tok->license_id.empty())) {\n";
-    ss << "    if (cached_tok->expires_at == 0 || ctx.current_time <= cached_tok->expires_at) {\n";
+    ss << "  if (cached_tok.has_value() && !cached_tok->license_id.empty() && cached_tok->license_id == lic.license_id) {\n";
+    ss << "    bool sig_ok = rtprotect::licensing::VerifyActivationTokenSignature(*cached_tok, kActivationPublicKey);\n";
+    ss << "    bool hw_ok = rtprotect::licensing::VerifyHardwareMatch(cached_tok->device_fingerprint_hash, ctx.current_hardware_id, 0.75);\n";
+    ss << "    bool time_ok = rtprotect::licensing::TrustedTime::ValidateToken(kProductId, cached_tok->issued_at, cached_tok->expires_at);\n";
+    ss << "    bool exp_ok = (cached_tok->expires_at > 0 && ctx.current_time <= cached_tok->expires_at);\n";
+    ss << "    if (sig_ok && hw_ok && time_ok && exp_ok) {\n";
     ss << "      token = *cached_tok;\n";
     ss << "      token_loaded = true;\n";
     ss << "    }\n";
@@ -1287,7 +1355,7 @@ IntegrationReport ExecuteIntegration(const IntegrationOptions& options) {
     ss << "  if (!token_loaded && kActivationServerUrl[0] != '\\0') {\n";
     ss << "    std::string act_err;\n";
     ss << "    auto online_token = rtprotect::licensing::RequestOnlineActivation(\n";
-    ss << "        kActivationServerUrl, lic.license_id, kProductId, kManifestPublicKey, &act_err);\n";
+    ss << "        kActivationServerUrl, lic.license_id, kProductId, kActivationPublicKey, &act_err, kActivationCredential, ctx.current_time);\n";
     ss << "    if (online_token.has_value()) {\n";
     ss << "      token = *online_token;\n";
     ss << "      rtprotect::licensing::SaveActivationToken(kProductId, token);\n";
@@ -1499,17 +1567,55 @@ IntegrationReport ExecuteIntegration(const IntegrationOptions& options) {
     }
     report.license_file = lic_path.string();
     report.generated_files.push_back(lic_path.string());
+  } else if (!options.license_file_path.empty()) {
+    // Explicit pre-issued customer license has highest priority over auto-generation
+    auto ldata = ReadFile(options.license_file_path);
+    if (!ldata.has_value()) {
+      report.success = false;
+      report.state = IntegrationState::kFailed;
+      report.error_message = "Cannot read supplied license file: " + options.license_file_path;
+      return report;
+    }
+    auto lic_opt = licensing::DeserializeLicense(ldata->data(), ldata->size());
+    if (!lic_opt.has_value()) {
+      report.success = false;
+      report.state = IntegrationState::kFailed;
+      report.error_message = "Supplied license file is malformed or corrupted";
+      return report;
+    }
+    const auto& verified_lic = *lic_opt;
+    auto sig_bytes = licensing::SerializeLicenseForSigning(verified_lic);
+    if (!integrity::VerifyManifestSignature(sig_bytes, verified_lic.signature, license_pubkey)) {
+      report.success = false;
+      report.state = IntegrationState::kFailed;
+      report.error_message = "Supplied license file failed cryptographic Ed25519 signature verification against license.pub";
+      return report;
+    }
+    if (verified_lic.product_id != options.product_id) {
+      report.success = false;
+      report.state = IntegrationState::kFailed;
+      report.error_message = "Supplied license product_id (" + verified_lic.product_id + ") does not match target (" + options.product_id + ")";
+      return report;
+    }
+    if (!WriteFile(lic_path.string(), ldata->data(), ldata->size())) {
+      report.success = false;
+      report.state = IntegrationState::kFailed;
+      report.error_message = "Failed to deploy verified license file to project";
+      return report;
+    }
+    report.license_file = lic_path.string();
+    report.generated_files.push_back(lic_path.string());
   } else if (has_license_privkey && license_privkey.has_value()) {
     // Production license issuance workflow via --sign-license-key on vendor infrastructure
     licensing::License lic;
     lic.license_id = "lic-prod-" + std::to_string(timestamp);
     lic.product_id = options.product_id;
-    lic.edition = "Production";
-    lic.customer_id = "authorized-client";
+    lic.edition = options.license_edition.empty() ? "Production" : options.license_edition;
+    lic.customer_id = options.customer_id.empty() ? "authorized-client" : options.customer_id;
     lic.capabilities = licensing::kCapCoreExecution | licensing::kCapCommercialUse | licensing::kCapAdvancedFeatures;
     lic.issued_at = static_cast<std::uint64_t>(std::time(nullptr));
-    lic.expires_at = 0; // Perpetual production license
-    lic.hardware_id = licensing::GetLocalHardwareId();
+    lic.expires_at = options.license_expires_at;
+    lic.hardware_id = ""; // Unbound to build machine; client activation binds device seat
 
     if (!licensing::SignLicense(lic, *license_privkey)) {
       report.success = false;
@@ -1526,33 +1632,6 @@ IntegrationReport ExecuteIntegration(const IntegrationOptions& options) {
     }
     report.license_file = lic_path.string();
     report.generated_files.push_back(lic_path.string());
-  } else if (!options.license_file_path.empty()) {
-    auto ldata = ReadFile(options.license_file_path);
-    if (!ldata.has_value()) {
-      report.success = false;
-      report.state = IntegrationState::kFailed;
-      report.error_message = "Cannot read supplied license file: " + options.license_file_path;
-      return report;
-    }
-    // Verify license against license_pubkey before accepting it
-    licensing::LicenseVerificationContext ctx;
-    ctx.current_time = static_cast<std::uint64_t>(std::time(nullptr));
-    ctx.expected_product_id = options.product_id;
-    ctx.current_hardware_id = licensing::GetLocalHardwareId();
-    licensing::License verified_lic;
-    auto lstatus = licensing::VerifyLicenseBytes(ldata->data(), ldata->size(), license_pubkey, ctx, &verified_lic);
-    if (lstatus != licensing::LicenseStatus::kValid) {
-      report.success = false;
-      report.state = IntegrationState::kFailed;
-      report.error_message = "Supplied license file failed cryptographic verification against license.pub: status " + std::to_string(static_cast<int>(lstatus));
-      return report;
-    }
-    if (!WriteFile(lic_path.string(), ldata->data(), ldata->size())) {
-      report.success = false;
-      report.state = IntegrationState::kFailed;
-      report.error_message = "Failed to deploy verified license file to project";
-      return report;
-    }
     report.license_file = lic_path.string();
     report.generated_files.push_back(lic_path.string());
   } else {
@@ -1712,6 +1791,12 @@ IntegrationReport ExecuteIntegration(const IntegrationOptions& options) {
       fs::copy_file(manifest_path, dest_dir / "release.manifest", fs::copy_options::overwrite_existing, ec);
       fs::copy_file(sig_path, dest_dir / "release.sig", fs::copy_options::overwrite_existing, ec);
       fs::copy_file(manifest_pub_path, dest_dir / "release.pub", fs::copy_options::overwrite_existing, ec);
+      if (fs::exists(license_pub_path)) {
+        fs::copy_file(license_pub_path, dest_dir / "license.pub", fs::copy_options::overwrite_existing, ec);
+      }
+      if (fs::exists(activation_pub_path)) {
+        fs::copy_file(activation_pub_path, dest_dir / "activation.pub", fs::copy_options::overwrite_existing, ec);
+      }
       if (fs::exists(lic_path)) {
         fs::copy_file(lic_path, dest_dir / "client.license", fs::copy_options::overwrite_existing, ec);
       }
@@ -1850,7 +1935,9 @@ bool ExecuteRollback(const std::string& target_project_path,
     "rtprotect_runtime_glue.cpp",
     "release.pub",
     "license.pub",
+    "activation.pub",
     "release.priv",
+    "activation.priv",
     "release.manifest",
     "release.sig",
     "client.license"
@@ -1999,7 +2086,7 @@ bool SignRelease(const std::string& project_dir,
         std::memcpy(lic_pub.data(), lpub_bytes->data(), integrity::kEd25519PublicKeyLen);
         licensing::LicenseVerificationContext ctx;
         ctx.current_time = static_cast<std::uint64_t>(std::time(nullptr));
-        ctx.current_hardware_id = licensing::GetLocalHardwareId();
+        ctx.enforce_hardware_binding = false; // Decoupled from build machine HWID
         licensing::License verified_lic;
         auto lstatus = licensing::VerifyLicenseBytes(ldata->data(), ldata->size(), lic_pub, ctx, &verified_lic);
         if (lstatus != licensing::LicenseStatus::kValid) {
@@ -2030,6 +2117,12 @@ bool SignRelease(const std::string& project_dir,
       if (fs::exists(root / "release.pub")) {
         fs::copy_file(root / "release.pub", cd / "release.pub", fs::copy_options::overwrite_existing, ec);
       }
+      if (fs::exists(root / "license.pub")) {
+        fs::copy_file(root / "license.pub", cd / "license.pub", fs::copy_options::overwrite_existing, ec);
+      }
+      if (fs::exists(root / "activation.pub")) {
+        fs::copy_file(root / "activation.pub", cd / "activation.pub", fs::copy_options::overwrite_existing, ec);
+      }
       if (fs::exists(root / "client.license")) {
         fs::copy_file(root / "client.license", cd / "client.license", fs::copy_options::overwrite_existing, ec);
       }
@@ -2038,7 +2131,8 @@ bool SignRelease(const std::string& project_dir,
 
   // Final mandatory validation check before declaring success
   std::string val_err;
-  if (!ValidateProtectedBuild(root.string(), pub_path.string(), manifest_path.string(), sig_path.string(), &val_err)) {
+  bool req_lic = fs::exists(root / "client.license");
+  if (!ValidateProtectedBuild(root.string(), pub_path.string(), manifest_path.string(), sig_path.string(), &val_err, req_lic)) {
     if (error_out) *error_out = "Post-signing release validation failed: " + val_err;
     fs::remove(sig_path, ec);
     for (const auto& cd : candidate_dirs) {
@@ -2056,7 +2150,10 @@ bool ValidateProtectedBuild(const std::string& project_dir,
                             const std::string& public_key_path,
                             const std::string& manifest_path,
                             const std::string& signature_path,
-                            std::string* error_out) {
+                            std::string* error_out,
+                            bool require_license,
+                            std::uint64_t minimum_release_sequence,
+                            const std::string& expected_product_id) {
   auto pub_bytes = ReadFile(public_key_path);
   if (!pub_bytes.has_value() || pub_bytes->size() != integrity::kEd25519PublicKeyLen) {
     if (error_out) *error_out = "Invalid or missing public key file (32 bytes required): " + public_key_path;
@@ -2094,6 +2191,16 @@ bool ValidateProtectedBuild(const std::string& project_dir,
 
   if (manifest->release_version.empty()) {
     if (error_out) *error_out = "Signed manifest contains empty release_version";
+    return false;
+  }
+
+  if (manifest->release_sequence < minimum_release_sequence) {
+    if (error_out) {
+      *error_out = "Anti-rollback violation: manifest release sequence (" +
+                   std::to_string(manifest->release_sequence) +
+                   ") is less than required minimum (" +
+                   std::to_string(minimum_release_sequence) + ")";
+    }
     return false;
   }
 
@@ -2140,16 +2247,17 @@ bool ValidateProtectedBuild(const std::string& project_dir,
     }
   }
 
-  // Validate license file if present
+  // Validate license file
   fs::path lic_path = root / "client.license";
   fs::path lic_pub_path = root / "license.pub";
+  std::vector<fs::path> candidate_dirs = {
+    root / "build_protected",
+    root / "build_protected" / "Release",
+    root / "build_protected" / "Debug",
+    root / "build"
+  };
+
   if (!fs::exists(lic_path)) {
-    std::vector<fs::path> candidate_dirs = {
-      root / "build_protected",
-      root / "build_protected" / "Release",
-      root / "build_protected" / "Debug",
-      root / "build"
-    };
     for (const auto& cd : candidate_dirs) {
       if (fs::exists(cd / "client.license")) {
         lic_path = cd / "client.license";
@@ -2158,43 +2266,57 @@ bool ValidateProtectedBuild(const std::string& project_dir,
     }
   }
 
+  if (!fs::exists(lic_pub_path)) {
+    for (const auto& cd : candidate_dirs) {
+      if (fs::exists(cd / "license.pub")) {
+        lic_pub_path = cd / "license.pub";
+        break;
+      }
+    }
+  }
+
+  if (require_license) {
+    if (!fs::exists(lic_path)) {
+      if (error_out) *error_out = "Protected build validation failed: missing client.license file";
+      return false;
+    }
+    if (!fs::exists(lic_pub_path)) {
+      if (error_out) *error_out = "Protected build validation failed: missing license.pub file";
+      return false;
+    }
+  }
+
   if (fs::exists(lic_path)) {
-    auto lic_data = ReadFile(lic_path.string());
-    if (!lic_data.has_value()) {
-      if (error_out) *error_out = "Unreadable client.license file";
+    if (!fs::exists(lic_pub_path)) {
+      if (error_out) *error_out = "Found client.license but missing license.pub public key for verification";
       return false;
     }
 
-    if (!fs::exists(lic_pub_path)) {
-      std::vector<fs::path> candidate_dirs = {
-        root / "build_protected",
-        root / "build_protected" / "Release",
-        root / "build_protected" / "Debug",
-        root / "build"
-      };
-      for (const auto& cd : candidate_dirs) {
-        if (fs::exists(cd / "license.pub")) {
-          lic_pub_path = cd / "license.pub";
-          break;
-        }
-      }
+    auto lic_data = ReadFile(lic_path.string());
+    if (!lic_data.has_value()) {
+      if (error_out) *error_out = "Unreadable client.license file: " + lic_path.string();
+      return false;
     }
 
-    if (fs::exists(lic_pub_path)) {
-      auto lpub_bytes = ReadFile(lic_pub_path.string());
-      if (lpub_bytes.has_value() && lpub_bytes->size() == integrity::kEd25519PublicKeyLen) {
-        integrity::Ed25519PublicKey lic_pub{};
-        std::memcpy(lic_pub.data(), lpub_bytes->data(), integrity::kEd25519PublicKeyLen);
-        licensing::LicenseVerificationContext ctx;
-        ctx.current_time = static_cast<std::uint64_t>(std::time(nullptr));
-        ctx.current_hardware_id = licensing::GetLocalHardwareId();
-        licensing::License verified_lic;
-        auto lstatus = licensing::VerifyLicenseBytes(lic_data->data(), lic_data->size(), lic_pub, ctx, &verified_lic);
-        if (lstatus != licensing::LicenseStatus::kValid) {
-          if (error_out) *error_out = "client.license validation failed: status " + std::to_string(static_cast<int>(lstatus));
-          return false;
-        }
-      }
+    auto lpub_bytes = ReadFile(lic_pub_path.string());
+    if (!lpub_bytes.has_value() || lpub_bytes->size() != integrity::kEd25519PublicKeyLen) {
+      if (error_out) *error_out = "Invalid or unreadable license.pub file: " + lic_pub_path.string();
+      return false;
+    }
+
+    integrity::Ed25519PublicKey lic_pub{};
+    std::memcpy(lic_pub.data(), lpub_bytes->data(), integrity::kEd25519PublicKeyLen);
+    licensing::LicenseVerificationContext ctx;
+    ctx.current_time = static_cast<std::uint64_t>(std::time(nullptr));
+    ctx.enforce_hardware_binding = false; // Decoupled build validation from client machine HWID
+    if (!expected_product_id.empty()) {
+      ctx.expected_product_id = expected_product_id;
+    }
+    licensing::License verified_lic;
+    auto lstatus = licensing::VerifyLicenseBytes(lic_data->data(), lic_data->size(), lic_pub, ctx, &verified_lic);
+    if (lstatus != licensing::LicenseStatus::kValid) {
+      if (error_out) *error_out = "client.license validation failed: status " + std::to_string(static_cast<int>(lstatus));
+      return false;
     }
   }
 

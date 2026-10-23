@@ -39,6 +39,7 @@ class CompilationDatabase {
 
 struct ClangFunctionDecl {
   std::string name;
+  std::string signature; // E.g. "calculate(int, int)"
   std::string return_type;
   std::vector<std::string> param_names;
   std::vector<std::string> param_types;

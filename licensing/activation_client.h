@@ -21,7 +21,9 @@ std::optional<ActivationToken> RequestOnlineActivation(
     const std::string& license_key,
     const std::string& product_id,
     const integrity::Ed25519PublicKey& vendor_pubkey,
-    std::string* error_out = nullptr);
+    std::string* error_out = nullptr,
+    const std::string& activation_credential = "",
+    std::uint64_t client_timestamp = 0);
 
 // Requests online token lease renewal from the vendor authority server.
 // Returns renewed token with bumped expiration and identical vm_root.

@@ -24,6 +24,7 @@
 #include "crypto/kdf.h"
 #include "licensing/hardware_id.h"
 #include "licensing/trusted_time.h"
+#include "tooling/simple_json.h"
 
 namespace rtprotect::licensing {
 
@@ -49,43 +50,6 @@ bool HexToBytes(const std::string& hex, std::uint8_t* out, std::size_t expected_
   return true;
 }
 
-std::optional<std::string> ExtractJsonField(const std::string& json, const std::string& field_name) {
-  std::string pattern = "\"" + field_name + "\"";
-  auto pos = json.find(pattern);
-  if (pos == std::string::npos) return std::nullopt;
-  pos += pattern.size();
-  while (pos < json.size() && (json[pos] == ' ' || json[pos] == ':' || json[pos] == '\t')) ++pos;
-  if (pos >= json.size()) return std::nullopt;
-
-  if (json[pos] == '"') {
-    ++pos;
-    std::string val;
-    while (pos < json.size() && json[pos] != '"') {
-      if (json[pos] == '\\' && pos + 1 < json.size()) {
-        ++pos;
-        if (json[pos] == '"') val += '"';
-        else if (json[pos] == '\\') val += '\\';
-        else if (json[pos] == 'n') val += '\n';
-        else if (json[pos] == 'r') val += '\r';
-        else if (json[pos] == 't') val += '\t';
-        else val += json[pos];
-      } else {
-        val += json[pos];
-      }
-      ++pos;
-    }
-    return val;
-  } else {
-    // Non-string field (e.g. true/false/number)
-    std::string val;
-    while (pos < json.size() && json[pos] != ',' && json[pos] != '}' && json[pos] != '\r' && json[pos] != '\n' && json[pos] != ' ') {
-      val += json[pos];
-      ++pos;
-    }
-    return val;
-  }
-}
-
 struct ParsedUrl {
   bool is_https = false;
   std::string host = "127.0.0.1";
@@ -104,6 +68,13 @@ ParsedUrl ParseUrl(const std::string& url_str) {
     res.is_https = false;
     res.port = 80;
     rem = rem.substr(7);
+  } else {
+    return res;
+  }
+
+  // Reject embedded credentials in authority URL
+  if (rem.find('@') != std::string::npos) {
+    return res;
   }
 
   auto slash_pos = rem.find('/');
@@ -116,12 +87,33 @@ ParsedUrl ParseUrl(const std::string& url_str) {
     res.path = "/";
   }
 
-  auto colon_pos = host_port.find(':');
-  if (colon_pos != std::string::npos) {
-    res.host = host_port.substr(0, colon_pos);
-    res.port = static_cast<std::uint16_t>(std::strtoul(host_port.c_str() + colon_pos + 1, nullptr, 10));
+  if (host_port.empty()) return res;
+
+  if (host_port.front() == '[') {
+    // IPv6 bracketed literal: e.g. [::1]:8080 or [2001:db8::1]
+    auto close_bracket = host_port.find(']');
+    if (close_bracket == std::string::npos) return res;
+    res.host = host_port.substr(1, close_bracket - 1);
+    if (close_bracket + 1 < host_port.size()) {
+      if (host_port[close_bracket + 1] != ':') return res;
+      std::string pstr = host_port.substr(close_bracket + 2);
+      char* end = nullptr;
+      long p = std::strtol(pstr.c_str(), &end, 10);
+      if (end != pstr.c_str() + pstr.size() || p <= 0 || p > 65535) return res;
+      res.port = static_cast<std::uint16_t>(p);
+    }
   } else {
-    res.host = host_port;
+    auto colon_pos = host_port.find(':');
+    if (colon_pos != std::string::npos) {
+      res.host = host_port.substr(0, colon_pos);
+      std::string pstr = host_port.substr(colon_pos + 1);
+      char* end = nullptr;
+      long p = std::strtol(pstr.c_str(), &end, 10);
+      if (end != pstr.c_str() + pstr.size() || p <= 0 || p > 65535) return res;
+      res.port = static_cast<std::uint16_t>(p);
+    } else {
+      res.host = host_port;
+    }
   }
 
   return res;
@@ -249,17 +241,45 @@ std::optional<std::string> HttpPostSocket(const ParsedUrl& url, const std::strin
   req_stream << json_body;
 
   std::string req_str = req_stream.str();
-  send(s, req_str.data(), static_cast<int>(req_str.size()), 0);
+  int total_sent = 0;
+  int req_len = static_cast<int>(req_str.size());
+  while (total_sent < req_len) {
+    int n = send(s, req_str.data() + total_sent, req_len - total_sent, 0);
+    if (n <= 0) {
+      closesocket(s);
+      if (error_out) *error_out = "Failed to send request to " + url.host;
+      return std::nullopt;
+    }
+    total_sent += n;
+  }
 
   std::string resp;
   char buf[4096];
+  constexpr std::size_t kMaxResponseBytes = 512 * 1024;
   while (true) {
     int bytes = recv(s, buf, sizeof(buf), 0);
     if (bytes <= 0) break;
     resp.append(buf, bytes);
+    if (resp.size() > kMaxResponseBytes) {
+      closesocket(s);
+      if (error_out) *error_out = "Server response exceeds 512KB safety limit";
+      return std::nullopt;
+    }
   }
 
   closesocket(s);
+
+  auto first_line_end = resp.find("\r\n");
+  if (first_line_end == std::string::npos) {
+    if (error_out) *error_out = "Malformed HTTP status line";
+    return std::nullopt;
+  }
+  std::string status_line = resp.substr(0, first_line_end);
+  auto first_space = status_line.find(' ');
+  int http_code = 0;
+  if (first_space != std::string::npos && first_space + 4 <= status_line.size()) {
+    http_code = std::atoi(status_line.substr(first_space + 1, 3).c_str());
+  }
 
   auto body_pos = resp.find("\r\n\r\n");
   if (body_pos == std::string::npos) {
@@ -267,7 +287,12 @@ std::optional<std::string> HttpPostSocket(const ParsedUrl& url, const std::strin
     return std::nullopt;
   }
 
-  return resp.substr(body_pos + 4);
+  std::string body = resp.substr(body_pos + 4);
+  if (http_code != 200 && http_code != 0) {
+    if (error_out) *error_out = "Server returned HTTP status " + std::to_string(http_code) + ": " + body;
+    return std::nullopt;
+  }
+  return body;
 }
 
 // Native OpenSSL TLS HTTP client with strict certificate verification
@@ -364,21 +389,40 @@ std::optional<std::string> HttpPostTls(const ParsedUrl& url, const std::string& 
   req_stream << json_body;
 
   std::string req_str = req_stream.str();
-  if (SSL_write(ssl, req_str.data(), static_cast<int>(req_str.size())) <= 0) {
-    SSL_shutdown(ssl);
-    SSL_free(ssl);
-    SSL_CTX_free(ctx);
-    closesocket(s);
-    if (error_out) *error_out = "Failed to send request over TLS";
-    return std::nullopt;
+  int total_sent = 0;
+  int req_len = static_cast<int>(req_str.size());
+  while (total_sent < req_len) {
+    int n = SSL_write(ssl, req_str.data() + total_sent, req_len - total_sent);
+    if (n <= 0) {
+      int err = SSL_get_error(ssl, n);
+      if (err == SSL_ERROR_WANT_WRITE || err == SSL_ERROR_WANT_READ) {
+        continue;
+      }
+      SSL_shutdown(ssl);
+      SSL_free(ssl);
+      SSL_CTX_free(ctx);
+      closesocket(s);
+      if (error_out) *error_out = "Failed to send complete request over TLS";
+      return std::nullopt;
+    }
+    total_sent += n;
   }
 
   std::string resp;
   char buf[4096];
+  constexpr std::size_t kMaxResponseBytes = 512 * 1024;
   while (true) {
     int bytes = SSL_read(ssl, buf, sizeof(buf));
     if (bytes <= 0) break;
     resp.append(buf, bytes);
+    if (resp.size() > kMaxResponseBytes) {
+      SSL_shutdown(ssl);
+      SSL_free(ssl);
+      SSL_CTX_free(ctx);
+      closesocket(s);
+      if (error_out) *error_out = "TLS response exceeds 512KB safety limit";
+      return std::nullopt;
+    }
   }
 
   SSL_shutdown(ssl);
@@ -386,13 +430,30 @@ std::optional<std::string> HttpPostTls(const ParsedUrl& url, const std::string& 
   SSL_CTX_free(ctx);
   closesocket(s);
 
+  auto first_line_end = resp.find("\r\n");
+  if (first_line_end == std::string::npos) {
+    if (error_out) *error_out = "Malformed HTTP status line over TLS";
+    return std::nullopt;
+  }
+  std::string status_line = resp.substr(0, first_line_end);
+  auto first_space = status_line.find(' ');
+  int http_code = 0;
+  if (first_space != std::string::npos && first_space + 4 <= status_line.size()) {
+    http_code = std::atoi(status_line.substr(first_space + 1, 3).c_str());
+  }
+
   auto body_pos = resp.find("\r\n\r\n");
   if (body_pos == std::string::npos) {
     if (error_out) *error_out = "Malformed HTTP response over TLS";
     return std::nullopt;
   }
 
-  return resp.substr(body_pos + 4);
+  std::string body = resp.substr(body_pos + 4);
+  if (http_code != 200 && http_code != 0) {
+    if (error_out) *error_out = "Server returned HTTP status " + std::to_string(http_code) + ": " + body;
+    return std::nullopt;
+  }
+  return body;
 }
 
 std::optional<std::string> DispatchHttpPost(const std::string& base_url, const std::string& endpoint, const std::string& body, std::string* error_out) {
@@ -437,8 +498,14 @@ std::optional<ActivationToken> RequestOnlineActivation(
     const std::string& license_key,
     const std::string& product_id,
     const integrity::Ed25519PublicKey& vendor_pubkey,
-    std::string* error_out) {
+    std::string* error_out,
+    const std::string& activation_credential,
+    std::uint64_t client_timestamp) {
   std::string hwid = GetLocalHardwareId();
+
+  if (client_timestamp == 0) {
+    client_timestamp = static_cast<std::uint64_t>(std::time(nullptr));
+  }
 
   std::array<std::uint8_t, 32> client_nonce{};
   if (RAND_bytes(client_nonce.data(), static_cast<int>(client_nonce.size())) != 1) {
@@ -452,40 +519,52 @@ std::optional<ActivationToken> RequestOnlineActivation(
   json_req << "  \"device_fingerprint\": \"" << hwid << "\",\n";
   json_req << "  \"product_id\": \"" << product_id << "\",\n";
   json_req << "  \"client_version\": \"2.0.0\",\n";
+  json_req << "  \"client_timestamp\": " << client_timestamp << ",\n";
+  if (!activation_credential.empty()) {
+    json_req << "  \"activation_credential\": \"" << activation_credential << "\",\n";
+  }
   json_req << "  \"client_nonce\": \"" << BytesToHex(client_nonce.data(), client_nonce.size()) << "\"\n";
   json_req << "}\n";
 
   auto resp_body = DispatchHttpPost(server_url, "/activate", json_req.str(), error_out);
   if (!resp_body.has_value()) return std::nullopt;
 
-  auto status = ExtractJsonField(*resp_body, "status");
-  if (!status.has_value() || *status != "Valid") {
-    auto err = ExtractJsonField(*resp_body, "error");
-    if (error_out) *error_out = err.value_or("Activation rejected by server with status: " + status.value_or("unknown"));
+  auto root = tooling::JsonValue::Parse(*resp_body);
+  if (!root.has_value() || !root->is_object()) {
+    if (error_out) *error_out = "Malformed JSON response from activation authority";
     return std::nullopt;
   }
 
-  auto s_nonce_hex = ExtractJsonField(*resp_body, "server_nonce");
-  auto enc_token_hex = ExtractJsonField(*resp_body, "encrypted_token");
-  if (!s_nonce_hex || !enc_token_hex) {
+  const auto& obj = *root;
+  std::string status = obj["status"].as_string();
+  if (status != "Valid" && status != "valid") {
+    std::string err = obj.contains("error") ? obj["error"].as_string() : "Activation rejected by server with status: " + status;
+    if (error_out) *error_out = err;
+    return std::nullopt;
+  }
+
+  std::string s_nonce_hex = obj["server_nonce"].as_string();
+  std::string enc_token_hex = obj["encrypted_token"].as_string();
+  if (s_nonce_hex.empty() || enc_token_hex.empty()) {
     if (error_out) *error_out = "Server response missing server_nonce or encrypted_token";
     return std::nullopt;
   }
 
   std::array<std::uint8_t, 32> server_nonce{};
-  if (!HexToBytes(*s_nonce_hex, server_nonce.data(), server_nonce.size())) {
+  if (!HexToBytes(s_nonce_hex, server_nonce.data(), server_nonce.size())) {
     if (error_out) *error_out = "Malformed server_nonce in response";
     return std::nullopt;
   }
 
-  auto session_key = DeriveTransportKey(license_key, client_nonce, server_nonce);
+  auto session_key = DeriveTransportKey(!activation_credential.empty() ? activation_credential : license_key,
+                                        client_nonce, server_nonce);
   if (!session_key.has_value()) {
     if (error_out) *error_out = "Failed to derive transport decryption key";
     return std::nullopt;
   }
 
-  std::vector<std::uint8_t> wire_enc(enc_token_hex->size() / 2);
-  if (!HexToBytes(*enc_token_hex, wire_enc.data(), wire_enc.size())) {
+  std::vector<std::uint8_t> wire_enc(enc_token_hex.size() / 2);
+  if (!HexToBytes(enc_token_hex, wire_enc.data(), wire_enc.size())) {
     if (error_out) *error_out = "Malformed encrypted_token hex";
     return std::nullopt;
   }
@@ -547,22 +626,29 @@ std::optional<ActivationToken> RequestOnlineRenewal(
   auto resp_body = DispatchHttpPost(server_url, "/renew", json_req.str(), error_out);
   if (!resp_body.has_value()) return std::nullopt;
 
-  auto status = ExtractJsonField(*resp_body, "status");
-  if (!status.has_value() || *status != "Valid") {
-    auto err = ExtractJsonField(*resp_body, "error");
-    if (error_out) *error_out = err.value_or("Renewal rejected by server with status: " + status.value_or("unknown"));
+  auto root = tooling::JsonValue::Parse(*resp_body);
+  if (!root.has_value() || !root->is_object()) {
+    if (error_out) *error_out = "Malformed JSON renewal response";
     return std::nullopt;
   }
 
-  auto s_nonce_hex = ExtractJsonField(*resp_body, "server_nonce");
-  auto enc_token_hex = ExtractJsonField(*resp_body, "encrypted_token");
-  if (!s_nonce_hex || !enc_token_hex) {
+  const auto& obj = *root;
+  std::string status = obj["status"].as_string();
+  if (status != "Valid" && status != "valid") {
+    std::string err = obj.contains("error") ? obj["error"].as_string() : "Renewal rejected by server with status: " + status;
+    if (error_out) *error_out = err;
+    return std::nullopt;
+  }
+
+  std::string s_nonce_hex = obj["server_nonce"].as_string();
+  std::string enc_token_hex = obj["encrypted_token"].as_string();
+  if (s_nonce_hex.empty() || enc_token_hex.empty()) {
     if (error_out) *error_out = "Server renewal response missing server_nonce or encrypted_token";
     return std::nullopt;
   }
 
   std::array<std::uint8_t, 32> server_nonce{};
-  if (!HexToBytes(*s_nonce_hex, server_nonce.data(), server_nonce.size())) {
+  if (!HexToBytes(s_nonce_hex, server_nonce.data(), server_nonce.size())) {
     if (error_out) *error_out = "Malformed server_nonce in renewal response";
     return std::nullopt;
   }
@@ -573,8 +659,8 @@ std::optional<ActivationToken> RequestOnlineRenewal(
     return std::nullopt;
   }
 
-  std::vector<std::uint8_t> wire_enc(enc_token_hex->size() / 2);
-  if (!HexToBytes(*enc_token_hex, wire_enc.data(), wire_enc.size())) {
+  std::vector<std::uint8_t> wire_enc(enc_token_hex.size() / 2);
+  if (!HexToBytes(enc_token_hex, wire_enc.data(), wire_enc.size())) {
     if (error_out) *error_out = "Malformed encrypted_token hex";
     return std::nullopt;
   }
@@ -627,11 +713,19 @@ bool RequestOnlineDeactivation(
   auto resp_body = DispatchHttpPost(server_url, "/deactivate", json_req.str(), error_out);
   if (!resp_body.has_value()) return false;
 
-  auto succ = ExtractJsonField(*resp_body, "success");
-  if (succ && *succ == "true") return true;
+  auto root = tooling::JsonValue::Parse(*resp_body);
+  if (!root.has_value() || !root->is_object()) {
+    if (error_out) *error_out = "Malformed JSON response from server";
+    return false;
+  }
 
-  auto err = ExtractJsonField(*resp_body, "error");
-  if (error_out) *error_out = err.value_or("Deactivation rejected by server");
+  const auto& obj = *root;
+  if (obj.contains("success") && obj["success"].as_bool()) return true;
+  if (obj.contains("status") && obj["status"].as_string() == "deactivated") return true;
+
+  if (error_out) {
+    *error_out = obj.contains("error") ? obj["error"].as_string() : "Deactivation rejected by server";
+  }
   return false;
 }
 
