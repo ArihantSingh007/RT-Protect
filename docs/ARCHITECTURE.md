@@ -527,6 +527,21 @@ the full explanation.
 
 **Benchmarks replace earlier tentative assumptions with real statistical methodology on Windows x64.** `bench/rtprotect-bench` (15 trials, warm-up discarded, full min/max/median/mean/stddev reported on Windows x64) confirmed control-flow flattening overhead is within 1% of native execution (29.3 ns vs 29.2 ns), while the VM executes in ~5.5 µs per call with full verification.
 
+## Protection Scope & Baseline vs. Experimental Binary Patching
+
+### 1. Production v1 Baseline Scope
+The production baseline of RTProtect is architected around **compiler-assisted source instrumentation** and **hardware-anchored licensing authority**:
+- **Source-Level Clang AST Transformation:** Functions marked with `RTPROTECT_VIRTUALIZE` are transformed at build time into encrypted bytecode programs, executed inside an isolated multi-engine interpreter (Stack, Register-Threaded, or Direct-Threaded).
+- **Compile-Time Obfuscation & Sharding:** String literal encryption, control-flow flattening, and anti-tamper poisoned key derivation (`DeriveTamperBoundKey`).
+- **Cryptographic Licensing & Online Authority:** Ed25519 asymmetric signature verification, Windows DPAPI secret vault storage, token-bucket rate-limiting, and real-time abuse analytics (`/analytics`).
+- **Runtime Anti-Debugging & Hook Watchdogs:** Direct PEB inspection, hardware breakpoint monitoring, and early startup initialization gates.
+
+### 2. Experimental Binary-Level PE Protector (`experimental-protect-binary`)
+The post-build PE binary protection module (`tooling/pe_protector.h`, `antitamper/section_protector.h`):
+- **Current Technical Implementation:** Encrypts designated executable sections (e.g. `.text`) with AES-256-CTR, obfuscates Import Address Table (IAT) names, and embeds a `PeProtectedSectionHeader` descriptor into the DOS stub area. The parser has been hardened with integer-underflow guards, 64-bit RVA overflow protection, a dedicated libFuzzer target (`fuzz/fuzz_pe_protector.cpp`), and a 1,000-iteration deterministic PRNG regression test.
+- **Why Gated as Experimental:** A production-grade binary packer requires a self-contained runtime bootstrap loader stub injected into the PE file to decrypt sections and restore IAT structures before the Windows loader hands execution to the original entry point. Because section encryption alters the binary on disk without a complete bootstrap loader, applying it directly to standard compiled executables interferes with normal Windows loader import binding and Authenticode signatures.
+- **Roadmap:** The binary patching engine remains gated as an experimental research prototype under CLI command `experimental-protect-binary` until the pre-entrypoint loader stub and relocation repair engine are completed and validated.
+
 ## What this project does not cover, project-wide
 
 Collected here rather than scattered across individual notes:
