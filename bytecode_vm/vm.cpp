@@ -493,6 +493,11 @@ RunResult Run(const Program& program,
         double da = BitsToDouble(static_cast<std::uint64_t>(a));
         double db = BitsToDouble(static_cast<std::uint64_t>(b));
         double res = da + db;
+        if (!std::isfinite(res)) {
+          result.error = VmError::kArithmeticOverflow;
+          result.instructions_executed = executed;
+          return result;
+        }
         if (!push(static_cast<std::int64_t>(DoubleToBits(res)))) {
           result.error = VmError::kStackOverflow;
           result.instructions_executed = executed;
@@ -509,6 +514,11 @@ RunResult Run(const Program& program,
         double da = BitsToDouble(static_cast<std::uint64_t>(a));
         double db = BitsToDouble(static_cast<std::uint64_t>(b));
         double res = da - db;
+        if (!std::isfinite(res)) {
+          result.error = VmError::kArithmeticOverflow;
+          result.instructions_executed = executed;
+          return result;
+        }
         if (!push(static_cast<std::int64_t>(DoubleToBits(res)))) {
           result.error = VmError::kStackOverflow;
           result.instructions_executed = executed;
@@ -525,6 +535,11 @@ RunResult Run(const Program& program,
         double da = BitsToDouble(static_cast<std::uint64_t>(a));
         double db = BitsToDouble(static_cast<std::uint64_t>(b));
         double res = da * db;
+        if (!std::isfinite(res)) {
+          result.error = VmError::kArithmeticOverflow;
+          result.instructions_executed = executed;
+          return result;
+        }
         if (!push(static_cast<std::int64_t>(DoubleToBits(res)))) {
           result.error = VmError::kStackOverflow;
           result.instructions_executed = executed;
@@ -546,6 +561,11 @@ RunResult Run(const Program& program,
           return result;
         }
         double res = da / db;
+        if (!std::isfinite(res)) {
+          result.error = VmError::kArithmeticOverflow;
+          result.instructions_executed = executed;
+          return result;
+        }
         if (!push(static_cast<std::int64_t>(DoubleToBits(res)))) {
           result.error = VmError::kStackOverflow;
           result.instructions_executed = executed;
@@ -991,7 +1011,9 @@ RunResult RunRegisterThreaded(const Program& program,
         if (!reg_pop(&b) || !reg_pop(&a)) { result.error = VmError::kStackUnderflow; result.instructions_executed = executed; return result; }
         double da = BitsToDouble(static_cast<std::uint64_t>(a));
         double db = BitsToDouble(static_cast<std::uint64_t>(b));
-        if (!reg_push(static_cast<std::int64_t>(DoubleToBits(da + db)))) {
+        double res = da + db;
+        if (!std::isfinite(res)) { result.error = VmError::kArithmeticOverflow; result.instructions_executed = executed; return result; }
+        if (!reg_push(static_cast<std::int64_t>(DoubleToBits(res)))) {
           result.error = VmError::kStackOverflow; result.instructions_executed = executed; return result;
         }
         break;
@@ -1000,7 +1022,9 @@ RunResult RunRegisterThreaded(const Program& program,
         if (!reg_pop(&b) || !reg_pop(&a)) { result.error = VmError::kStackUnderflow; result.instructions_executed = executed; return result; }
         double da = BitsToDouble(static_cast<std::uint64_t>(a));
         double db = BitsToDouble(static_cast<std::uint64_t>(b));
-        if (!reg_push(static_cast<std::int64_t>(DoubleToBits(da - db)))) {
+        double res = da - db;
+        if (!std::isfinite(res)) { result.error = VmError::kArithmeticOverflow; result.instructions_executed = executed; return result; }
+        if (!reg_push(static_cast<std::int64_t>(DoubleToBits(res)))) {
           result.error = VmError::kStackOverflow; result.instructions_executed = executed; return result;
         }
         break;
@@ -1009,7 +1033,9 @@ RunResult RunRegisterThreaded(const Program& program,
         if (!reg_pop(&b) || !reg_pop(&a)) { result.error = VmError::kStackUnderflow; result.instructions_executed = executed; return result; }
         double da = BitsToDouble(static_cast<std::uint64_t>(a));
         double db = BitsToDouble(static_cast<std::uint64_t>(b));
-        if (!reg_push(static_cast<std::int64_t>(DoubleToBits(da * db)))) {
+        double res = da * db;
+        if (!std::isfinite(res)) { result.error = VmError::kArithmeticOverflow; result.instructions_executed = executed; return result; }
+        if (!reg_push(static_cast<std::int64_t>(DoubleToBits(res)))) {
           result.error = VmError::kStackOverflow; result.instructions_executed = executed; return result;
         }
         break;
@@ -1019,7 +1045,9 @@ RunResult RunRegisterThreaded(const Program& program,
         double da = BitsToDouble(static_cast<std::uint64_t>(a));
         double db = BitsToDouble(static_cast<std::uint64_t>(b));
         if (db == 0.0) { result.error = VmError::kDivisionByZero; result.instructions_executed = executed; return result; }
-        if (!reg_push(static_cast<std::int64_t>(DoubleToBits(da / db)))) {
+        double res = da / db;
+        if (!std::isfinite(res)) { result.error = VmError::kArithmeticOverflow; result.instructions_executed = executed; return result; }
+        if (!reg_push(static_cast<std::int64_t>(DoubleToBits(res)))) {
           result.error = VmError::kStackOverflow; result.instructions_executed = executed; return result;
         }
         break;
@@ -1337,7 +1365,9 @@ VmError H_FAdd(TableContext& ctx, const std::uint8_t*, std::size_t&) {
   if (!ctx.pop(&b) || !ctx.pop(&a)) return VmError::kStackUnderflow;
   double da = BitsToDouble(static_cast<std::uint64_t>(a));
   double db = BitsToDouble(static_cast<std::uint64_t>(b));
-  if (!ctx.push(static_cast<std::int64_t>(DoubleToBits(da + db)))) return VmError::kStackOverflow;
+  double res = da + db;
+  if (!std::isfinite(res)) return VmError::kArithmeticOverflow;
+  if (!ctx.push(static_cast<std::int64_t>(DoubleToBits(res)))) return VmError::kStackOverflow;
   return VmError::kNone;
 }
 
@@ -1346,7 +1376,9 @@ VmError H_FSub(TableContext& ctx, const std::uint8_t*, std::size_t&) {
   if (!ctx.pop(&b) || !ctx.pop(&a)) return VmError::kStackUnderflow;
   double da = BitsToDouble(static_cast<std::uint64_t>(a));
   double db = BitsToDouble(static_cast<std::uint64_t>(b));
-  if (!ctx.push(static_cast<std::int64_t>(DoubleToBits(da - db)))) return VmError::kStackOverflow;
+  double res = da - db;
+  if (!std::isfinite(res)) return VmError::kArithmeticOverflow;
+  if (!ctx.push(static_cast<std::int64_t>(DoubleToBits(res)))) return VmError::kStackOverflow;
   return VmError::kNone;
 }
 
@@ -1355,7 +1387,9 @@ VmError H_FMul(TableContext& ctx, const std::uint8_t*, std::size_t&) {
   if (!ctx.pop(&b) || !ctx.pop(&a)) return VmError::kStackUnderflow;
   double da = BitsToDouble(static_cast<std::uint64_t>(a));
   double db = BitsToDouble(static_cast<std::uint64_t>(b));
-  if (!ctx.push(static_cast<std::int64_t>(DoubleToBits(da * db)))) return VmError::kStackOverflow;
+  double res = da * db;
+  if (!std::isfinite(res)) return VmError::kArithmeticOverflow;
+  if (!ctx.push(static_cast<std::int64_t>(DoubleToBits(res)))) return VmError::kStackOverflow;
   return VmError::kNone;
 }
 
@@ -1365,7 +1399,9 @@ VmError H_FDiv(TableContext& ctx, const std::uint8_t*, std::size_t&) {
   double da = BitsToDouble(static_cast<std::uint64_t>(a));
   double db = BitsToDouble(static_cast<std::uint64_t>(b));
   if (db == 0.0) return VmError::kDivisionByZero;
-  if (!ctx.push(static_cast<std::int64_t>(DoubleToBits(da / db)))) return VmError::kStackOverflow;
+  double res = da / db;
+  if (!std::isfinite(res)) return VmError::kArithmeticOverflow;
+  if (!ctx.push(static_cast<std::int64_t>(DoubleToBits(res)))) return VmError::kStackOverflow;
   return VmError::kNone;
 }
 

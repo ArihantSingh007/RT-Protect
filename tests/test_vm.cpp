@@ -989,6 +989,65 @@ MT_TEST(Vm_FloatingPoint_DivisionByZero) {
   MT_CHECK(r_table.error == VmError::kDivisionByZero);
 }
 
+MT_TEST(Vm_FloatingPoint_ArithmeticOverflow_RejectsNonFinite) {
+  // Test FAdd overflow (1e308 + 1e308 -> +Inf)
+  {
+    ProgramBuilder b(0);
+    b.PushFloat(1e308);
+    b.PushFloat(1e308);
+    b.FAdd();
+    b.Ret();
+    auto p = b.Build();
+
+    auto r_stack = Run(p, {}, nullptr, nullptr, VmEngineFlavor::kStackBased);
+    MT_CHECK(r_stack.error == VmError::kArithmeticOverflow);
+
+    auto r_reg = Run(p, {}, nullptr, nullptr, VmEngineFlavor::kRegisterThreaded);
+    MT_CHECK(r_reg.error == VmError::kArithmeticOverflow);
+
+    auto r_table = Run(p, {}, nullptr, nullptr, VmEngineFlavor::kDirectThreadedTable);
+    MT_CHECK(r_table.error == VmError::kArithmeticOverflow);
+  }
+
+  // Test FSub overflow (-1e308 - 1e308 -> -Inf)
+  {
+    ProgramBuilder b(0);
+    b.PushFloat(-1e308);
+    b.PushFloat(1e308);
+    b.FSub();
+    b.Ret();
+    auto p = b.Build();
+
+    auto r_stack = Run(p, {}, nullptr, nullptr, VmEngineFlavor::kStackBased);
+    MT_CHECK(r_stack.error == VmError::kArithmeticOverflow);
+
+    auto r_reg = Run(p, {}, nullptr, nullptr, VmEngineFlavor::kRegisterThreaded);
+    MT_CHECK(r_reg.error == VmError::kArithmeticOverflow);
+
+    auto r_table = Run(p, {}, nullptr, nullptr, VmEngineFlavor::kDirectThreadedTable);
+    MT_CHECK(r_table.error == VmError::kArithmeticOverflow);
+  }
+
+  // Test FMul overflow (1e200 * 1e200 -> +Inf)
+  {
+    ProgramBuilder b(0);
+    b.PushFloat(1e200);
+    b.PushFloat(1e200);
+    b.FMul();
+    b.Ret();
+    auto p = b.Build();
+
+    auto r_stack = Run(p, {}, nullptr, nullptr, VmEngineFlavor::kStackBased);
+    MT_CHECK(r_stack.error == VmError::kArithmeticOverflow);
+
+    auto r_reg = Run(p, {}, nullptr, nullptr, VmEngineFlavor::kRegisterThreaded);
+    MT_CHECK(r_reg.error == VmError::kArithmeticOverflow);
+
+    auto r_table = Run(p, {}, nullptr, nullptr, VmEngineFlavor::kDirectThreadedTable);
+    MT_CHECK(r_table.error == VmError::kArithmeticOverflow);
+  }
+}
+
 MT_TEST(Vm_DirectThreadedTable_LoopsAndCalls) {
   // Compute sum of 1..N using a loop in DirectThreadedTable
   ProgramBuilder b(2);
