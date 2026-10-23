@@ -19,6 +19,23 @@ namespace rtprotect::licensing {
 
 namespace {
 
+bool ParseU64Strict(const std::string& s, std::uint64_t* out) {
+  if (s.empty()) return false;
+  char* end = nullptr;
+  errno = 0;
+  unsigned long long v = std::strtoull(s.c_str(), &end, 10);
+  if (errno != 0 || end != s.c_str() + s.size()) return false;
+  if (out) *out = static_cast<std::uint64_t>(v);
+  return true;
+}
+
+bool ParseU32Strict(const std::string& s, std::uint32_t* out) {
+  std::uint64_t v = 0;
+  if (!ParseU64Strict(s, &v) || v > 0xFFFFFFFFULL) return false;
+  if (out) *out = static_cast<std::uint32_t>(v);
+  return true;
+}
+
 std::string BytesToHex(const std::uint8_t* data, std::size_t len) {
   std::ostringstream ss;
   for (std::size_t i = 0; i < len; ++i) {
@@ -130,6 +147,7 @@ bool ActivationDatabase::Open(const std::string& db_path) {
   licenses_.clear();
   activations_.clear();
   used_nonces_.clear();
+  events_.clear();
 
   if (db_path_.empty() || !std::filesystem::exists(db_path_)) {
     return true; // Fresh database
@@ -156,14 +174,15 @@ bool ActivationDatabase::Open(const std::string& db_path) {
 
     std::istringstream row(line);
     if (section == "[licenses]") {
-      // Format: license_id|product_id|status|max_seats|vm_root_hex|created_at
-      std::string lic_id, prod_id, status_str, seats_str, root_hex, created_str;
+      // Format: license_id|product_id|status|max_seats|vm_root_hex|created_at[|activation_credential_hash]
+      std::string lic_id, prod_id, status_str, seats_str, root_hex, created_str, cred_hash;
       if (std::getline(row, lic_id, '|') &&
           std::getline(row, prod_id, '|') &&
           std::getline(row, status_str, '|') &&
           std::getline(row, seats_str, '|') &&
           std::getline(row, root_hex, '|') &&
           std::getline(row, created_str, '|')) {
+        std::getline(row, cred_hash);
         LicenseRecord rec;
         rec.license_id = UnescapeField(lic_id);
         rec.product_id = UnescapeField(prod_id);
@@ -173,9 +192,16 @@ bool ActivationDatabase::Open(const std::string& db_path) {
           continue;
         }
         rec.status = *st;
-        rec.max_seats = static_cast<std::uint32_t>(std::strtoul(seats_str.c_str(), nullptr, 10));
-        HexToBytes(root_hex, rec.vm_root.data(), rec.vm_root.size());
-        rec.created_at = std::strtoull(created_str.c_str(), nullptr, 10);
+        if (!ParseU32Strict(seats_str, &rec.max_seats) || rec.max_seats == 0) {
+          continue; // Malformed seat count
+        }
+        if (!HexToBytes(root_hex, rec.vm_root.data(), rec.vm_root.size())) {
+          continue; // Corrupted or truncated vm_root hex
+        }
+        if (!ParseU64Strict(created_str, &rec.created_at)) {
+          continue; // Malformed created timestamp
+        }
+        rec.activation_credential_hash = UnescapeField(cred_hash);
         licenses_[rec.license_id] = rec;
       }
     } else if (section == "[activations]") {
@@ -189,17 +215,21 @@ bool ActivationDatabase::Open(const std::string& db_path) {
         ActivationRecord rec;
         rec.license_id = UnescapeField(lic_id);
         rec.device_fingerprint = UnescapeField(dev_fp);
-        rec.first_seen = std::strtoull(first_str.c_str(), nullptr, 10);
-        rec.last_seen = std::strtoull(last_str.c_str(), nullptr, 10);
-        rec.sequence_number = std::strtoull(seq_str.c_str(), nullptr, 10);
+        if (!ParseU64Strict(first_str, &rec.first_seen) ||
+            !ParseU64Strict(last_str, &rec.last_seen) ||
+            !ParseU64Strict(seq_str, &rec.sequence_number)) {
+          continue; // Malformed numeric activation fields
+        }
         activations_[rec.license_id].push_back(rec);
       }
     } else if (section == "[used_nonces]") {
       // Format: nonce_hex|expires_at
       std::string nonce_hex, exp_str;
       if (std::getline(row, nonce_hex, '|') && std::getline(row, exp_str, '|')) {
-        std::uint64_t exp = std::strtoull(exp_str.c_str(), nullptr, 10);
-        used_nonces_[nonce_hex] = exp;
+        std::uint64_t exp = 0;
+        if (ParseU64Strict(exp_str, &exp)) {
+          used_nonces_[nonce_hex] = exp;
+        }
       }
     } else if (section == "[events]") {
       // Format: timestamp|event_type|license_id|device_fingerprint|ip_address|details
@@ -211,9 +241,10 @@ bool ActivationDatabase::Open(const std::string& db_path) {
           std::getline(row, ip_str, '|') &&
           std::getline(row, details)) {
         auto et = ParseActivationEventType(type_str);
-        if (et.has_value()) {
+        std::uint64_t ts = 0;
+        if (et.has_value() && ParseU64Strict(ts_str, &ts)) {
           ActivationEvent evt;
-          evt.timestamp = std::strtoull(ts_str.c_str(), nullptr, 10);
+          evt.timestamp = ts;
           evt.type = *et;
           evt.license_id = UnescapeField(lic_id);
           evt.device_fingerprint = UnescapeField(dev_fp);
@@ -242,7 +273,11 @@ bool ActivationDatabase::SaveLocked() const {
        << ToString(l.status) << "|"
        << l.max_seats << "|"
        << BytesToHex(l.vm_root.data(), l.vm_root.size()) << "|"
-       << l.created_at << "\n";
+       << l.created_at;
+    if (!l.activation_credential_hash.empty()) {
+      ss << "|" << EscapeField(l.activation_credential_hash);
+    }
+    ss << "\n";
   }
 
   ss << "\n[activations]\n";
@@ -430,11 +465,13 @@ SeatReservationResult ActivationDatabase::ReserveSeatAtomic(
   for (auto& a : acts) {
     if (a.device_fingerprint == device_fingerprint) {
       auto old_last_seen = a.last_seen;
+      res.previous_sequence_number = a.sequence_number;
+      res.previous_last_seen = old_last_seen;
       a.last_seen = current_time;
       a.sequence_number++;
       if (!SaveLocked()) {
         a.last_seen = old_last_seen;
-        a.sequence_number--;
+        a.sequence_number = res.previous_sequence_number;
         res.success = false;
         res.error = "Database write-through persistence failed";
         return res;
@@ -476,6 +513,34 @@ SeatReservationResult ActivationDatabase::ReserveSeatAtomic(
   res.sequence_number = 1;
   res.first_seen = current_time;
   return res;
+}
+
+bool ActivationDatabase::RollbackSeatAtomic(
+    const std::string& license_id,
+    const std::string& device_fingerprint,
+    const SeatReservationResult& reservation) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  auto it = activations_.find(license_id);
+  if (it == activations_.end()) return false;
+  auto& acts = it->second;
+
+  if (reservation.is_new_seat) {
+    for (auto s_it = acts.begin(); s_it != acts.end(); ++s_it) {
+      if (s_it->device_fingerprint == device_fingerprint) {
+        acts.erase(s_it);
+        return SaveLocked();
+      }
+    }
+  } else {
+    for (auto& a : acts) {
+      if (a.device_fingerprint == device_fingerprint) {
+        a.sequence_number = reservation.previous_sequence_number;
+        a.last_seen = reservation.previous_last_seen;
+        return SaveLocked();
+      }
+    }
+  }
+  return false;
 }
 
 bool ActivationDatabase::IsNonceUsed(const std::string& nonce_hex) const {

@@ -16,6 +16,7 @@
 #include "integrity/sha256.h"
 #include "licensing/activation_server.h"
 #include "licensing/hardware_id.h"
+#include "tooling/simple_json.h"
 
 namespace rtprotect::licensing {
 
@@ -39,32 +40,6 @@ bool HexToBytes(const std::string& hex, std::uint8_t* out, std::size_t expected_
     out[i] = static_cast<std::uint8_t>(v);
   }
   return true;
-}
-
-std::optional<std::string> ExtractJsonStringField(const std::string& json, const std::string& field_name) {
-  std::string pattern = "\"" + field_name + "\"";
-  auto pos = json.find(pattern);
-  if (pos == std::string::npos) return std::nullopt;
-  pos += pattern.size();
-  while (pos < json.size() && (json[pos] == ' ' || json[pos] == ':' || json[pos] == '\t')) ++pos;
-  if (pos >= json.size() || json[pos] != '"') return std::nullopt;
-  ++pos;
-  std::string val;
-  while (pos < json.size() && json[pos] != '"') {
-    if (json[pos] == '\\' && pos + 1 < json.size()) {
-      ++pos;
-      if (json[pos] == '"') val += '"';
-      else if (json[pos] == '\\') val += '\\';
-      else if (json[pos] == 'n') val += '\n';
-      else if (json[pos] == 'r') val += '\r';
-      else if (json[pos] == 't') val += '\t';
-      else val += json[pos];
-    } else {
-      val += json[pos];
-    }
-    ++pos;
-  }
-  return val;
 }
 
 std::string EscapeJsonString(const std::string& input) {
@@ -179,6 +154,25 @@ ActivateResponse ActivationService::ProcessActivate(const ActivateRequest& req, 
     return resp;
   }
 
+  // Validate activation credential secret if configured on license
+  if (!lic.activation_credential_hash.empty()) {
+    auto cred_hash = integrity::Sha256(
+        reinterpret_cast<const std::uint8_t*>(req.activation_credential.data()),
+        req.activation_credential.size());
+    if (!cred_hash.has_value()) {
+      resp.status = ActivationStatus::kMalformed;
+      resp.error_message = "Hash computation failure";
+      return resp;
+    }
+    std::string cred_hash_hex = BytesToHex(cred_hash->data(), cred_hash->size());
+    if (cred_hash_hex != lic.activation_credential_hash) {
+      resp.status = ActivationStatus::kLicenseMismatch;
+      resp.error_message = "Invalid activation credential";
+      db_.RecordEvent({current_time, ActivationEventType::kActivationFailed, safe_license_id, req.device_fingerprint, req.client_ip, resp.error_message});
+      return resp;
+    }
+  }
+
   // 2. Anti-replay and validity check on client challenge nonce
   bool nonce_is_all_zero = true;
   for (std::uint8_t b : req.client_nonce) {
@@ -234,7 +228,7 @@ ActivateResponse ActivationService::ProcessActivate(const ActivateRequest& req, 
   token.sequence_number = seat_res.sequence_number;
 
   if (RAND_bytes(resp.server_nonce.data(), static_cast<int>(resp.server_nonce.size())) != 1) {
-    db_.RemoveActivation(safe_license_id, req.device_fingerprint);
+    db_.RollbackSeatAtomic(safe_license_id, req.device_fingerprint, seat_res);
     resp.status = ActivationStatus::kMalformed;
     resp.error_message = "Cryptographic RNG failure generating server nonce";
     return resp;
@@ -242,16 +236,17 @@ ActivateResponse ActivationService::ProcessActivate(const ActivateRequest& req, 
   token.server_nonce = resp.server_nonce;
 
   if (!SignActivationToken(token, signing_key_)) {
-    db_.RemoveActivation(safe_license_id, req.device_fingerprint);
+    db_.RollbackSeatAtomic(safe_license_id, req.device_fingerprint, seat_res);
     resp.status = ActivationStatus::kMalformed;
     resp.error_message = "Internal signing failure";
     return resp;
   }
 
-  // 5. Encrypt token under ephemeral session key
-  auto session_key = DeriveTransportKey(req.license_key, req.client_nonce, resp.server_nonce);
+  // 5. Encrypt token under ephemeral session key (using activation_credential if available, else license_key)
+  auto session_key = DeriveTransportKey(!req.activation_credential.empty() ? req.activation_credential : req.license_key,
+                                        req.client_nonce, resp.server_nonce);
   if (!session_key.has_value()) {
-    db_.RemoveActivation(safe_license_id, req.device_fingerprint);
+    db_.RollbackSeatAtomic(safe_license_id, req.device_fingerprint, seat_res);
     resp.status = ActivationStatus::kMalformed;
     resp.error_message = "Failed to derive transport key";
     return resp;
@@ -260,7 +255,7 @@ ActivateResponse ActivationService::ProcessActivate(const ActivateRequest& req, 
   auto raw_token_bytes = SerializeActivationToken(token);
   auto encrypted = crypto::Encrypt(*session_key, raw_token_bytes.data(), raw_token_bytes.size());
   if (!encrypted.has_value()) {
-    db_.RemoveActivation(safe_license_id, req.device_fingerprint);
+    db_.RollbackSeatAtomic(safe_license_id, req.device_fingerprint, seat_res);
     resp.status = ActivationStatus::kMalformed;
     resp.error_message = "Failed to encrypt activation token";
     return resp;
@@ -268,7 +263,7 @@ ActivateResponse ActivationService::ProcessActivate(const ActivateRequest& req, 
 
   // 6. Transactional commit: consume nonce only now that encryption has succeeded
   if (!db_.ConsumeNonceIfUnused(client_nonce_hex, current_time + 86400, current_time)) {
-    db_.RemoveActivation(safe_license_id, req.device_fingerprint);
+    db_.RollbackSeatAtomic(safe_license_id, req.device_fingerprint, seat_res);
     resp.status = ActivationStatus::kNonceMismatch;
     resp.error_message = "Nonce consumption collision during activation commit";
     return resp;
@@ -386,12 +381,27 @@ RenewResponse ActivationService::ProcessRenew(const RenewRequest& req, std::uint
     return resp;
   }
 
+  // Verify token sequence strictly against current database activation record
+  auto current_act = db_.GetActivation(token.license_id, req.device_fingerprint);
+  if (!current_act.has_value()) {
+    resp.status = ActivationStatus::kRevoked;
+    resp.error_message = "No active seat record found for device";
+    db_.RecordEvent({current_time, ActivationEventType::kRenewalFailed, token.license_id, req.device_fingerprint, req.client_ip, resp.error_message});
+    return resp;
+  }
+  if (token.sequence_number != current_act->sequence_number) {
+    resp.status = ActivationStatus::kRevoked;
+    resp.error_message = "Stale token sequence (supplied=" + std::to_string(token.sequence_number) + ", current=" + std::to_string(current_act->sequence_number) + ")";
+    db_.RecordEvent({current_time, ActivationEventType::kRenewalFailed, token.license_id, req.device_fingerprint, req.client_ip, resp.error_message});
+    return resp;
+  }
+
   // 8. Mint renewed token with identical vm_root and bumped sequence number
   ActivationToken renewed = token;
   renewed.issued_at = current_time;
   renewed.expires_at = current_time + 14 * 86400;
   renewed.grace_expires_at = renewed.expires_at + 3 * 86400;
-  renewed.sequence_number = token.sequence_number + 1;
+  renewed.sequence_number = current_act->sequence_number + 1;
   renewed.vm_root = token.vm_root; // Stable vm_root across renewals
 
   if (RAND_bytes(resp.server_nonce.data(), static_cast<int>(resp.server_nonce.size())) != 1) {
@@ -437,7 +447,11 @@ RenewResponse ActivationService::ProcessRenew(const RenewRequest& req, std::uint
   act.first_seen = token.issued_at;
   act.last_seen = current_time;
   act.sequence_number = renewed.sequence_number;
-  db_.RecordActivation(act);
+  if (!db_.RecordActivation(act)) {
+    resp.status = ActivationStatus::kMalformed;
+    resp.error_message = "Database write-through persistence failed during renewal";
+    return resp;
+  }
 
   auto wire_bytes = encrypted->Serialize();
   resp.encrypted_token_hex = BytesToHex(wire_bytes.data(), wire_bytes.size());
@@ -478,11 +492,28 @@ DeactivateResponse ActivationService::ProcessDeactivate(const DeactivateRequest&
     return resp;
   }
 
-  // Remove activation record to free up the seat
-  db_.RemoveActivation(token_opt->license_id, req.device_fingerprint);
+  // Require current active record and match sequence strictly
+  auto current_act = db_.GetActivation(token_opt->license_id, req.device_fingerprint);
+  if (!current_act.has_value()) {
+    resp.error_message = "No active activation record found for device";
+    return resp;
+  }
+  if (token_opt->sequence_number != current_act->sequence_number) {
+    resp.error_message = "Stale token sequence: cannot deactivate newer activation record";
+    return resp;
+  }
+
+  // Remove activation record to free up the seat with checked persistence
+  if (!db_.RemoveActivation(token_opt->license_id, req.device_fingerprint)) {
+    resp.error_message = "Database write-through persistence failed during deactivation";
+    return resp;
+  }
 
   std::string nonce_hex = BytesToHex(token_opt->server_nonce.data(), token_opt->server_nonce.size());
-  db_.RecordNonce(nonce_hex, current_time + 86400 * 30);
+  if (!db_.RecordNonce(nonce_hex, current_time + 86400 * 30)) {
+    resp.error_message = "Failed to record deactivation nonce";
+    return resp;
+  }
 
   db_.RecordEvent({current_time, ActivationEventType::kDeactivation, token_opt->license_id, req.device_fingerprint, req.client_ip, "Deactivated seat"});
   resp.success = true;
@@ -505,25 +536,29 @@ std::string ActivationService::HandleActivateJson(const std::string& json_body, 
     return ss.str();
   }
 
-  ActivateRequest req;
-  req.client_ip = client_ip;
-  auto lic = ExtractJsonStringField(json_body, "license_key");
-  auto dev = ExtractJsonStringField(json_body, "device_fingerprint");
-  auto prod = ExtractJsonStringField(json_body, "product_id");
-  auto ver = ExtractJsonStringField(json_body, "client_version");
-  auto nonce = ExtractJsonStringField(json_body, "client_nonce");
-  auto ts = ExtractJsonStringField(json_body, "client_timestamp");
-
-  if (!nonce.has_value() || nonce->size() != 64 || !HexToBytes(*nonce, req.client_nonce.data(), req.client_nonce.size())) {
-    return "{\n  \"status\": \"malformed\",\n  \"error\": \"Missing or invalid 32-byte hexadecimal client_nonce\"\n}\n";
+  auto root = tooling::JsonValue::Parse(json_body);
+  if (!root.has_value() || !root->is_object()) {
+    return "{\n  \"status\": \"malformed\",\n  \"error\": \"Malformed or invalid JSON body\"\n}\n";
   }
 
-  if (lic) req.license_key = *lic;
-  if (dev) req.device_fingerprint = *dev;
-  if (prod) req.product_id = *prod;
-  if (ver) req.client_version = *ver;
-  if (ts.has_value() && !ts->empty()) {
-    req.client_timestamp = std::strtoull(ts->c_str(), nullptr, 10);
+  const auto& obj = *root;
+  ActivateRequest req;
+  req.client_ip = client_ip;
+  req.license_key = obj["license_key"].as_string();
+  req.device_fingerprint = obj["device_fingerprint"].as_string();
+  req.product_id = obj["product_id"].as_string();
+  req.client_version = obj.contains("client_version") ? obj["client_version"].as_string() : "1.0.0";
+  req.activation_credential = obj["activation_credential"].as_string();
+  if (req.activation_credential.empty() && obj.contains("activation_secret")) {
+    req.activation_credential = obj["activation_secret"].as_string();
+  }
+  if (obj.contains("client_timestamp")) {
+    req.client_timestamp = static_cast<std::uint64_t>(obj["client_timestamp"].as_int());
+  }
+
+  std::string nonce = obj["client_nonce"].as_string();
+  if (nonce.size() != 64 || !HexToBytes(nonce, req.client_nonce.data(), req.client_nonce.size())) {
+    return "{\n  \"status\": \"malformed\",\n  \"error\": \"Missing or invalid 32-byte hexadecimal client_nonce\"\n}\n";
   }
 
   // Enforce license rate limiting
@@ -569,27 +604,30 @@ std::string ActivationService::HandleRenewJson(const std::string& json_body, std
     return ss.str();
   }
 
+  auto root = tooling::JsonValue::Parse(json_body);
+  if (!root.has_value() || !root->is_object()) {
+    return "{\n  \"status\": \"malformed\",\n  \"error\": \"Malformed or invalid JSON body\"\n}\n";
+  }
+
+  const auto& obj = *root;
   RenewRequest req;
   req.client_ip = client_ip;
-  auto tok = ExtractJsonStringField(json_body, "token");
-  auto dev = ExtractJsonStringField(json_body, "device_fingerprint");
-  auto nonce = ExtractJsonStringField(json_body, "client_nonce");
+  req.token_hex = obj["token"].as_string();
+  req.device_fingerprint = obj["device_fingerprint"].as_string();
 
-  if (!nonce.has_value() || nonce->size() != 64 || !HexToBytes(*nonce, req.client_nonce.data(), req.client_nonce.size())) {
+  std::string nonce = obj["client_nonce"].as_string();
+  if (nonce.size() != 64 || !HexToBytes(nonce, req.client_nonce.data(), req.client_nonce.size())) {
     return "{\n  \"status\": \"malformed\",\n  \"error\": \"Missing or invalid 32-byte hexadecimal client_nonce\"\n}\n";
   }
 
-  if (tok) req.token_hex = *tok;
-  if (dev) req.device_fingerprint = *dev;
-
   // Enforce license rate limiting if token can be parsed
-  if (tok.has_value() && tok->size() >= 64) {
-    std::vector<std::uint8_t> raw_token(tok->size() / 2);
-    if (HexToBytes(*tok, raw_token.data(), raw_token.size())) {
+  if (req.token_hex.size() >= 64) {
+    std::vector<std::uint8_t> raw_token(req.token_hex.size() / 2);
+    if (HexToBytes(req.token_hex, raw_token.data(), raw_token.size())) {
       auto token_opt = DeserializeActivationToken(raw_token.data(), raw_token.size());
       if (token_opt.has_value()) {
         if (!license_rate_limiter_.Allow(token_opt->license_id, 1.0, &retry_after)) {
-          db_.RecordEvent({current_time, ActivationEventType::kRateLimited, token_opt->license_id, dev.value_or(""), client_ip, "License rate limit exceeded"});
+          db_.RecordEvent({current_time, ActivationEventType::kRateLimited, token_opt->license_id, req.device_fingerprint, client_ip, "License rate limit exceeded"});
           std::ostringstream ss;
           ss << "{\n"
              << "  \"status\": \"rate_limited\",\n"
@@ -617,13 +655,16 @@ std::string ActivationService::HandleRenewJson(const std::string& json_body, std
 }
 
 std::string ActivationService::HandleDeactivateJson(const std::string& json_body, std::uint64_t current_time, const std::string& client_ip) {
+  auto root = tooling::JsonValue::Parse(json_body);
+  if (!root.has_value() || !root->is_object()) {
+    return "{\n  \"success\": false,\n  \"error\": \"Malformed or invalid JSON body\"\n}\n";
+  }
+
+  const auto& obj = *root;
   DeactivateRequest req;
   req.client_ip = client_ip;
-  auto tok = ExtractJsonStringField(json_body, "token");
-  auto dev = ExtractJsonStringField(json_body, "device_fingerprint");
-
-  if (tok) req.token_hex = *tok;
-  if (dev) req.device_fingerprint = *dev;
+  req.token_hex = obj["token"].as_string();
+  req.device_fingerprint = obj["device_fingerprint"].as_string();
 
   auto resp = ProcessDeactivate(req, current_time);
 

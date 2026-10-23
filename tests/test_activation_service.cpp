@@ -19,6 +19,7 @@
 #include "crypto/aead.h"
 #include "crypto/kdf.h"
 #include "integrity/keys.h"
+#include "integrity/sha256.h"
 #include "licensing/activation.h"
 #include "licensing/activation_client.h"
 #include "licensing/activation_database.h"
@@ -933,6 +934,224 @@ MT_TEST(HttpServer_FramingSecurity_RejectsMalformedAndChunked) {
   MT_CHECK(bad_cl_resp.find("HTTP/1.1 400 Bad Request") != std::string::npos);
 
   server.Stop();
+  std::filesystem::remove(db_path, ec);
+}
+
+MT_TEST(SecurityAudit_ThreeDistinctKeysSeparation) {
+  std::string db_path = MakeTempDbPath();
+  std::error_code ec;
+  std::filesystem::remove(db_path, ec);
+
+  auto man_kp = MakeKeyPair(); // Key 1: Manifest signing
+  auto lic_kp = MakeKeyPair(); // Key 2: License signing
+  auto act_kp = MakeKeyPair(); // Key 3: Activation signing
+
+  ActivationDatabase db(db_path);
+  LicenseRecord lic;
+  lic.license_id = "lic-3key-separation";
+  lic.product_id = "com.vendor.keys";
+  lic.max_seats = 2;
+  lic.created_at = 1700000000;
+  lic.vm_root.fill(0x77);
+  MT_CHECK(db.RegisterLicense(lic));
+
+  // Server initialized strictly with activation signing key
+  ActivationService service(db, std::move(act_kp.private_key), act_kp.public_key);
+  ActivationServerHttp server(service);
+  MT_CHECK(server.Start(0, "127.0.0.1"));
+  std::string server_url = server.base_url();
+
+  // 1. Verifying against manifest key MUST FAIL
+  std::string err;
+  auto tok_wrong_man = RequestOnlineActivation(server_url, "lic-3key-separation", "com.vendor.keys", man_kp.public_key, &err);
+  MT_CHECK(!tok_wrong_man.has_value());
+  MT_CHECK(err.find("failed verification") != std::string::npos);
+
+  // 2. Verifying against license key MUST FAIL
+  auto tok_wrong_lic = RequestOnlineActivation(server_url, "lic-3key-separation", "com.vendor.keys", lic_kp.public_key, &err);
+  MT_CHECK(!tok_wrong_lic.has_value());
+  MT_CHECK(err.find("failed verification") != std::string::npos);
+
+  // 3. Verifying against dedicated activation key MUST SUCCEED
+  auto tok_valid = RequestOnlineActivation(server_url, "lic-3key-separation", "com.vendor.keys", act_kp.public_key, &err);
+  MT_CHECK(tok_valid.has_value());
+  MT_CHECK(tok_valid->license_id == "lic-3key-separation");
+  MT_CHECK(tok_valid->vm_root == lic.vm_root);
+
+  server.Stop();
+  std::filesystem::remove(db_path, ec);
+}
+
+MT_TEST(SecurityAudit_ActivationCredential_RequiredAndEnforced) {
+  std::string db_path = MakeTempDbPath();
+  std::error_code ec;
+  std::filesystem::remove(db_path, ec);
+
+  auto act_kp = MakeKeyPair();
+  ActivationDatabase db(db_path);
+
+  LicenseRecord lic;
+  lic.license_id = "lic-cred-auth-001";
+  lic.product_id = "com.vendor.secured";
+  lic.max_seats = 1;
+  lic.created_at = 1700000000;
+  lic.vm_root.fill(0x55);
+
+  std::string secret = "SuperSecretActivationPassword#2026";
+  auto cred_hash = rtprotect::integrity::Sha256(reinterpret_cast<const std::uint8_t*>(secret.data()), secret.size());
+  MT_CHECK(cred_hash.has_value());
+  lic.activation_credential_hash = "";
+  for (auto b : *cred_hash) {
+    char h[3];
+    std::snprintf(h, sizeof(h), "%02x", b);
+    lic.activation_credential_hash += h;
+  }
+  MT_CHECK(db.RegisterLicense(lic));
+
+  ActivationService service(db, std::move(act_kp.private_key), act_kp.public_key);
+  ActivationServerHttp server(service);
+  MT_CHECK(server.Start(0, "127.0.0.1"));
+  std::string server_url = server.base_url();
+
+  // 1. Activation with wrong credential fails authentication
+  std::string err;
+  auto tok_bad = RequestOnlineActivation(server_url, "lic-cred-auth-001", "com.vendor.secured", act_kp.public_key, &err, "WrongPassword");
+  MT_CHECK(!tok_bad.has_value());
+
+  // 2. Activation with missing credential fails authentication
+  auto tok_empty = RequestOnlineActivation(server_url, "lic-cred-auth-001", "com.vendor.secured", act_kp.public_key, &err, "");
+  MT_CHECK(!tok_empty.has_value());
+
+  // 3. Activation with correct credential succeeds
+  auto tok_good = RequestOnlineActivation(server_url, "lic-cred-auth-001", "com.vendor.secured", act_kp.public_key, &err, secret);
+  MT_CHECK(tok_good.has_value());
+  MT_CHECK(tok_good->license_id == "lic-cred-auth-001");
+  MT_CHECK(tok_good->vm_root == lic.vm_root);
+
+  server.Stop();
+  std::filesystem::remove(db_path, ec);
+}
+
+MT_TEST(SecurityAudit_SeatPreservation_OnFailedActivation) {
+  std::string db_path = MakeTempDbPath();
+  std::error_code ec;
+  std::filesystem::remove(db_path, ec);
+
+  auto act_kp = MakeKeyPair();
+  ActivationDatabase db(db_path);
+
+  LicenseRecord lic;
+  lic.license_id = "lic-preserve-seat";
+  lic.product_id = "com.vendor.preserve";
+  lic.max_seats = 1;
+  lic.created_at = 1700000000;
+  lic.vm_root.fill(0x33);
+  MT_CHECK(db.RegisterLicense(lic));
+
+  ActivationService service(db, std::move(act_kp.private_key), act_kp.public_key);
+
+  // 1. Device 1 successfully activates
+  ActivateRequest req1{"lic-preserve-seat", "HWID-EXISTING-DEVICE", "com.vendor.preserve", "1.0", 1700000000, {}};
+  req1.client_nonce.fill(0x01);
+  auto resp1 = service.ProcessActivate(req1, 1700000000);
+  MT_CHECK(resp1.status == ActivationStatus::kValid);
+  MT_CHECK(resp1.token.has_value());
+  std::uint64_t initial_seq = resp1.token->sequence_number;
+
+  // Verify seat exists in DB
+  auto act_rec = db.GetActivation("lic-preserve-seat", "HWID-EXISTING-DEVICE");
+  MT_CHECK(act_rec.has_value());
+  MT_CHECK(act_rec->sequence_number == initial_seq);
+
+  // 2. Existing seat submits a failing activation attempt (duplicate nonce triggers replay rejection)
+  ActivateRequest req_replay = req1; // Re-uses exact same nonce 0x01
+  auto resp_replay = service.ProcessActivate(req_replay, 1700000010);
+  MT_CHECK(resp_replay.status == ActivationStatus::kNonceMismatch);
+
+  // 3. Critically: The existing seat MUST NOT be deleted or corrupted!
+  auto act_rec_after = db.GetActivation("lic-preserve-seat", "HWID-EXISTING-DEVICE");
+  MT_CHECK(act_rec_after.has_value());
+  MT_CHECK(act_rec_after->sequence_number == initial_seq);
+  MT_CHECK(act_rec_after->device_fingerprint == "HWID-EXISTING-DEVICE");
+
+  std::filesystem::remove(db_path, ec);
+}
+
+MT_TEST(SecurityAudit_StaleSequenceRejection_RenewAndDeactivate) {
+  std::string db_path = MakeTempDbPath();
+  std::error_code ec;
+  std::filesystem::remove(db_path, ec);
+
+  auto act_kp = MakeKeyPair();
+  ActivationDatabase db(db_path);
+
+  LicenseRecord lic;
+  lic.license_id = "lic-seq-audit";
+  lic.product_id = "com.vendor.seq";
+  lic.max_seats = 1;
+  lic.created_at = 1700000000;
+  lic.vm_root.fill(0x12);
+  MT_CHECK(db.RegisterLicense(lic));
+
+  ActivationService service(db, std::move(act_kp.private_key), act_kp.public_key);
+
+  // 1. Activate initial token (sequence 1)
+  ActivateRequest act_req{"lic-seq-audit", "HWID-SEQ-DEVICE", "com.vendor.seq", "1.0", 1700000000, {}};
+  act_req.client_nonce.fill(0x10);
+  auto act_resp = service.ProcessActivate(act_req, 1700000000);
+  MT_CHECK(act_resp.status == ActivationStatus::kValid);
+  MT_CHECK(act_resp.token->sequence_number == 1);
+  ActivationToken tok_seq1 = *act_resp.token;
+
+  // 2. Renew token (advances sequence to 2)
+  RenewRequest renew_req;
+  auto tok1_bytes = SerializeActivationToken(tok_seq1);
+  for (auto b : tok1_bytes) {
+    char h[3];
+    std::snprintf(h, sizeof(h), "%02x", b);
+    renew_req.token_hex += h;
+  }
+  renew_req.device_fingerprint = "HWID-SEQ-DEVICE";
+  renew_req.client_nonce.fill(0x20);
+
+  auto renew_resp = service.ProcessRenew(renew_req, 1700001000);
+  MT_CHECK(renew_resp.status == ActivationStatus::kValid);
+  MT_CHECK(renew_resp.token->sequence_number == 2);
+  ActivationToken tok_seq2 = *renew_resp.token;
+
+  // 3. Stale token (seq 1) renewal attempt MUST BE REJECTED
+  renew_req.client_nonce.fill(0x21); // New fresh nonce, but stale token sequence 1
+  auto stale_renew = service.ProcessRenew(renew_req, 1700002000);
+  MT_CHECK(stale_renew.status == ActivationStatus::kNonceMismatch);
+
+  // 4. Stale token (seq 1) deactivation attempt MUST BE REJECTED
+  DeactivateRequest deact_stale;
+  deact_stale.token_hex = renew_req.token_hex; // contains tok_seq1
+  deact_stale.device_fingerprint = "HWID-SEQ-DEVICE";
+  auto stale_deact = service.ProcessDeactivate(deact_stale, 1700003000);
+  MT_CHECK(!stale_deact.success);
+
+  // Active seat must still remain active in DB!
+  auto cur_act = db.GetActivation("lic-seq-audit", "HWID-SEQ-DEVICE");
+  MT_CHECK(cur_act.has_value());
+  MT_CHECK(cur_act->sequence_number == 2);
+
+  // 5. Deactivation with current token (seq 2) MUST SUCCEED
+  DeactivateRequest deact_current;
+  auto tok2_bytes = SerializeActivationToken(tok_seq2);
+  for (auto b : tok2_bytes) {
+    char h[3];
+    std::snprintf(h, sizeof(h), "%02x", b);
+    deact_current.token_hex += h;
+  }
+  deact_current.device_fingerprint = "HWID-SEQ-DEVICE";
+  auto current_deact = service.ProcessDeactivate(deact_current, 1700004000);
+  MT_CHECK(current_deact.success);
+
+  // Seat is now removed
+  auto after_deact = db.GetActivation("lic-seq-audit", "HWID-SEQ-DEVICE");
+  MT_CHECK(!after_deact.has_value());
+
   std::filesystem::remove(db_path, ec);
 }
 

@@ -57,11 +57,18 @@ struct IntegrationOptions {
   std::string rtprotect_root;        // Path to RTProtect repository / SDK
   std::string manifest_pubkey_path;  // External manifest public key
   std::string license_pubkey_path;   // External license public key
+  std::string activation_pubkey_path;// External activation token public key (separated from manifest/license)
   std::string sign_manifest_key_path;// Optional vendor release signing private key
   std::string sign_license_key_path; // Optional vendor license signing private key
+  std::string sign_activation_key_path; // Optional activation token signing private key
   std::string license_file_path;     // Optional pre-issued client.license to deploy
   std::string dev_keys_dir;          // Output directory for dev keys (must be outside client project)
   std::string activation_server_url; // Online Activation Authority URL (e.g. "https://license.vendor.com")
+  std::string activation_credential; // Secret activation secret for device activation (separated from public license ID)
+  std::uint64_t minimum_release_sequence = 1; // Monotonically increasing anti-rollback sequence requirement
+  std::string customer_id = "authorized-client";
+  std::string license_edition = "Production";
+  std::uint64_t license_expires_at = 0;
   std::string content_key_path;      // Dedicated content encryption master key (separated from signing key)
   std::string vm_root_file;          // Optional explicit binary file for release VM root
   std::string vm_root_hex;           // Optional explicit 64-char hex string for release VM root
@@ -93,6 +100,7 @@ struct IntegrationReport {
   std::string public_key_file;          // Primary / manifest public key file
   std::string manifest_public_key_file; // Manifest verification public key
   std::string license_public_key_file;  // License verification public key
+  std::string activation_public_key_file; // Activation token verification public key
   std::string private_key_file;         // Populated only in --dev-keys mode (in external dev_keys_dir)
   std::string manifest_file;
   std::string signature_file;
@@ -129,7 +137,10 @@ bool ValidateProtectedBuild(const std::string& project_dir,
                             const std::string& public_key_path,
                             const std::string& manifest_path,
                             const std::string& signature_path,
-                            std::string* error_out = nullptr);
+                            std::string* error_out = nullptr,
+                            bool require_license = true,
+                            std::uint64_t minimum_release_sequence = 1,
+                            const std::string& expected_product_id = "");
 
 // Derives function master key dynamically using HKDF from activation token VM root,
 // manifest public key, product ID, and function-specific salt.

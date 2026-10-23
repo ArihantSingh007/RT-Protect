@@ -127,6 +127,7 @@ void TestDryRunDoesNotModifyDisk() {
   assert(!fs::exists(test_dir / "rtprotect_runtime_glue.cpp"));
   assert(!fs::exists(test_dir / "release.pub"));
   assert(!fs::exists(test_dir / "license.pub"));
+  assert(!fs::exists(test_dir / "activation.pub"));
   assert(!fs::exists(test_dir / "release.priv"));
   assert(!fs::exists(test_dir / "client.license"));
 
@@ -306,6 +307,7 @@ void TestTransactionalExecutionAndRollback() {
   assert(fs::exists(test_dir / "rtprotect_runtime_glue.cpp"));
   assert(fs::exists(test_dir / "release.pub"));
   assert(fs::exists(test_dir / "license.pub"));
+  assert(fs::exists(test_dir / "activation.pub"));
   assert(fs::exists(test_dir / "release.manifest"));
   assert(fs::exists(test_dir / "release.sig"));
   assert(fs::exists(test_dir / "client.license"));
@@ -371,6 +373,7 @@ void TestTransactionalExecutionAndRollback() {
   assert(!fs::exists(test_dir / "rtprotect_runtime_glue.cpp"));
   assert(!fs::exists(test_dir / "release.pub"));
   assert(!fs::exists(test_dir / "license.pub"));
+  assert(!fs::exists(test_dir / "activation.pub"));
   assert(!fs::exists(test_dir / "release.priv"));
   assert(!fs::exists(test_dir / "release.manifest"));
   assert(!fs::exists(test_dir / "release.sig"));
@@ -1016,12 +1019,15 @@ void TestIntegration_OnlineActivationPipeline_EndToEndRoundTrip() {
 
   auto man_kp = integrity::GenerateEd25519KeyPair();
   auto lic_kp = integrity::GenerateEd25519KeyPair();
-  assert(man_kp.has_value() && lic_kp.has_value());
+  auto act_kp = integrity::GenerateEd25519KeyPair();
+  assert(man_kp.has_value() && lic_kp.has_value() && act_kp.has_value());
 
   WriteFile((test_dir / "release.pub").string(), man_kp->public_key.data(), man_kp->public_key.size());
   WriteFile((test_dir / "license.pub").string(), lic_kp->public_key.data(), lic_kp->public_key.size());
+  WriteFile((test_dir / "activation.pub").string(), act_kp->public_key.data(), act_kp->public_key.size());
   WriteFile((test_dir / "release.priv").string(), man_kp->private_key.data(), man_kp->private_key.size());
   WriteFile((test_dir / "license.priv").string(), lic_kp->private_key.data(), lic_kp->private_key.size());
+  WriteFile((test_dir / "activation.priv").string(), act_kp->private_key.data(), act_kp->private_key.size());
 
   // Set up persistent Activation Database and HTTP Authority Server
   std::string db_path = (test_dir / "activations.db").string();
@@ -1041,7 +1047,7 @@ void TestIntegration_OnlineActivationPipeline_EndToEndRoundTrip() {
   lic_rec.vm_root = canonical_vm_root;
   assert(db.RegisterLicense(lic_rec));
 
-  licensing::ActivationService srv_service(db, std::move(man_kp->private_key), man_kp->public_key);
+  licensing::ActivationService srv_service(db, std::move(act_kp->private_key), act_kp->public_key);
   licensing::ActivationServerHttp server(srv_service);
   assert(server.Start(0, "127.0.0.1"));
   std::string server_url = server.base_url();
@@ -1083,6 +1089,7 @@ void TestIntegration_OnlineActivationPipeline_EndToEndRoundTrip() {
   options.activation_server_url = server_url;
   options.manifest_pubkey_path = (test_dir / "release.pub").string();
   options.license_pubkey_path = (test_dir / "license.pub").string();
+  options.activation_pubkey_path = (test_dir / "activation.pub").string();
   options.license_file_path = (test_dir / "client.license").string();
   options.run_build = false; // We test the generated code, headers, and cryptographic VM contract directly
   options.staging_only = false;
@@ -1117,7 +1124,7 @@ void TestIntegration_OnlineActivationPipeline_EndToEndRoundTrip() {
   // Call online activation over network socket against the server
   std::string net_err;
   auto net_token = licensing::RequestOnlineActivation(
-      server_url, "lic-online-e2e-100", "com.vendor.e2eapp", man_kp->public_key, &net_err);
+      server_url, "lic-online-e2e-100", "com.vendor.e2eapp", act_kp->public_key, &net_err);
   assert(net_token.has_value());
   assert(net_token->license_id == "lic-online-e2e-100");
   assert(net_token->vm_root == canonical_vm_root); // Critical: Server issued the exact canonical vm_root!
@@ -1343,13 +1350,16 @@ void TestTargetScopedSourceDiscoveryAndFailClosedVirtualization() {
 
   fs::path man_pub_file = test_dir / "man.pub";
   fs::path lic_pub_file = test_dir / "lic.pub";
+  fs::path act_pub_file = test_dir / "act.pub";
   WriteFile(man_pub_file.string(), kp->public_key.data(), kp->public_key.size());
   WriteFile(lic_pub_file.string(), kp->public_key.data(), kp->public_key.size());
+  WriteFile(act_pub_file.string(), kp->public_key.data(), kp->public_key.size());
 
   IntegrationOptions prod_opts;
   prod_opts.target_project_path = test_dir.string();
   prod_opts.manifest_pubkey_path = man_pub_file.string();
   prod_opts.license_pubkey_path = lic_pub_file.string();
+  prod_opts.activation_pubkey_path = act_pub_file.string();
   prod_opts.content_key_path = content_key_file.string();
   prod_opts.use_dev_keys = false;
   prod_opts.staging_only = true;

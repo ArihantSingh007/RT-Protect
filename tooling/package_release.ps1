@@ -114,6 +114,13 @@ try {
     $GitCommit = (git rev-parse HEAD).Trim()
 } catch {}
 $BuildDate = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
+$CompilerInfo = "Windows C++20 Toolchain"
+if (Test-Path (Join-Path $BuildDir "CMakeCache.txt")) {
+    $cacheContent = Get-Content (Join-Path $BuildDir "CMakeCache.txt") -Raw
+    if ($cacheContent -match "CMAKE_CXX_COMPILER:FILEPATH=([^\r\n]+)") {
+        $CompilerInfo = $matches[1].Trim()
+    }
+}
 $BuildInfo = @"
 ================================================================================
 RTProtect Release Build Information
@@ -123,6 +130,7 @@ Git Commit:     $GitCommit
 Build Date:     $BuildDate
 Target Platform: Windows x64
 Target Standard: C++20
+Compiler:       $CompilerInfo
 NOMINMAX:       Enforced
 Optimization:   Release (O3, Hardening Enabled)
 Dependencies:   OpenSSL 3.4.0 (Crypto & SSL)
@@ -155,7 +163,7 @@ $ToolExe = Find-BuiltFile $BuildDir "tooling" "rtprotect-tool.exe"
 if ($ToolExe) { Copy-Item $ToolExe $ToolsBin } else { throw "rtprotect-tool.exe not found" }
 
 $GuiExe = Find-BuiltFile $BuildDir "tooling" "rtprotect-gui.exe"
-if ($GuiExe) { Copy-Item $GuiExe $ToolsBin }
+if ($GuiExe) { Copy-Item $GuiExe $ToolsBin } else { throw "Fatal: rtprotect-gui.exe not found in build directory $BuildDir" }
 
 $BenchExe = Find-BuiltFile $BuildDir "bench" "rtprotect-bench.exe"
 if ($BenchExe) { Copy-Item $BenchExe $ToolsBin }
@@ -196,7 +204,7 @@ foreach ($libName in $SdkLibNames) {
     if ($found) {
         Copy-Item $found[0].FullName $SdkLib
     } else {
-        Write-Warning "Static library for $libName not found in build directory"
+        throw "Fatal: Static library for $libName not found in build directory $BuildDir"
     }
 }
 
@@ -240,8 +248,14 @@ $SmokeCmakeArgs = @(
     "-DCMAKE_PREFIX_PATH=$SdkPkgDir",
     "-DCMAKE_BUILD_TYPE=Release"
 )
-if ($OpenSslDir) {
+$PackagedOpenSsl = Join-Path $SdkPkgDir "third_party\openssl"
+if (Test-Path $PackagedOpenSsl) {
+    Write-Host "Smoke test using packaged self-contained OpenSSL from SDK: $PackagedOpenSsl"
+    $SmokeCmakeArgs += "-DOPENSSL_ROOT_DIR=$PackagedOpenSsl"
+    $env:PATH = "$PackagedOpenSsl\bin;$env:PATH"
+} elseif ($OpenSslDir) {
     $SmokeCmakeArgs += "-DOPENSSL_ROOT_DIR=$OpenSslDir"
+    $env:PATH = "$OpenSslDir\bin;$env:PATH"
 }
 
 $SmokeGenerator = "Ninja"

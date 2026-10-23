@@ -54,6 +54,7 @@ struct LicenseRecord {
   std::uint32_t max_seats = 1;
   std::array<std::uint8_t, 32> vm_root{};
   std::uint64_t created_at = 0;
+  std::string activation_credential_hash; // SHA-256 hex of secret activation credential (optional)
 };
 
 struct ActivationRecord {
@@ -69,6 +70,8 @@ struct SeatReservationResult {
   bool is_new_seat = false;
   std::uint64_t sequence_number = 1;
   std::uint64_t first_seen = 0;
+  std::uint64_t previous_sequence_number = 0;
+  std::uint64_t previous_last_seen = 0;
   std::string error;
 };
 
@@ -102,6 +105,11 @@ class ActivationDatabase {
                                           std::uint32_t max_seats,
                                           std::uint64_t current_time,
                                           std::uint64_t stale_timeout_seconds = 30 * 86400);
+
+  // Rolls back a reserved seat without corrupting existing valid activations on subsequent failure
+  bool RollbackSeatAtomic(const std::string& license_id,
+                          const std::string& device_fingerprint,
+                          const SeatReservationResult& reservation);
 
   // Anti-replay nonce tracking
   bool IsNonceUsed(const std::string& nonce_hex) const;

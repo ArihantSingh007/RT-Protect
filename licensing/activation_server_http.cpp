@@ -414,11 +414,28 @@ void ActivationServerHttp::HandleClient(uintptr_t client_sock_fd, const std::str
     return recv(client_sock, buf, max_len, 0);
   };
 
-  auto raw_write = [&](const char* buf, int len) -> int {
-    if (ssl) {
-      return SSL_write(ssl, buf, len);
+  auto raw_write = [&](const char* buf, int len) -> bool {
+    int total_sent = 0;
+    while (total_sent < len) {
+      int n = 0;
+      if (ssl) {
+        n = SSL_write(ssl, buf + total_sent, len - total_sent);
+        if (n <= 0) {
+          int err = SSL_get_error(ssl, n);
+          if (err == SSL_ERROR_WANT_WRITE || err == SSL_ERROR_WANT_READ) {
+            continue;
+          }
+          return false;
+        }
+      } else {
+        n = send(client_sock, buf + total_sent, len - total_sent, 0);
+        if (n <= 0) {
+          return false;
+        }
+      }
+      total_sent += n;
     }
-    return send(client_sock, buf, len, 0);
+    return true;
   };
 
   std::string raw_req;
@@ -546,7 +563,7 @@ void ActivationServerHttp::HandleClient(uintptr_t client_sock_fd, const std::str
       resp_body = service_.HandleDeactivateJson(body, 0, client_ip);
     } else if (path == "/health" && method == "GET") {
       resp_body = "{\"status\":\"ok\"}\n";
-    } else if (path.rfind("/events", 0) == 0 && method == "GET") {
+    } else if ((path == "/events" || path.rfind("/events?", 0) == 0) && method == "GET") {
       // Administrative audit event inspection (requires authentication)
       bool authorized = false;
       if (!admin_auth_token_.empty()) {
