@@ -97,12 +97,12 @@ bool TrustedTime::AnchorServerTime(const std::string& product_id, std::uint64_t 
   }
 
   // Anchor server time strictly forward
-  state.last_known_server_time = std::max(state.last_known_server_time, server_timestamp);
+  state.last_known_server_time = (std::max)(state.last_known_server_time, server_timestamp);
 
   auto wall_now = std::chrono::system_clock::now().time_since_epoch();
   std::uint64_t now_wall = static_cast<std::uint64_t>(
       std::chrono::duration_cast<std::chrono::seconds>(wall_now).count());
-  state.last_known_wall_time = std::max(state.last_known_wall_time, now_wall);
+  state.last_known_wall_time = (std::max)(state.last_known_wall_time, now_wall);
 
   auto steady_now = std::chrono::steady_clock::now().time_since_epoch();
   state.last_anchor_steady_seconds = static_cast<std::uint64_t>(
@@ -180,10 +180,10 @@ std::optional<std::uint64_t> TrustedTime::GetTrustedTime(const std::string& prod
   }
 
   // Update last-known wall time
-  state.last_known_wall_time = std::max(state.last_known_wall_time, now_wall);
+  state.last_known_wall_time = (std::max)(state.last_known_wall_time, now_wall);
   SecureStorage::Store(key, SerializeTimeState(state), "rtprotect_time_state");
 
-  return std::max(now_wall, state.last_known_server_time);
+  return (std::max)(now_wall, state.last_known_server_time);
 }
 
 TimeValidationResult TrustedTime::ValidateToken(const std::string& product_id,

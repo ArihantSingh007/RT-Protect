@@ -5,6 +5,46 @@ This project adheres to Semantic Versioning and structured security reporting.
 
 ---
 
+## [2.6.0-hardened] - 2026-10-23
+
+### CI Resolution, Release Packaging Overhaul & Production Hardening
+
+- **MSVC Build Failure Resolution in GitHub Actions CI:**
+  - Added global `add_compile_definitions(NOMINMAX)` in `CMakeLists.txt` and parenthesized all `(std::min)` and `(std::max)` invocations across translation units. Eliminates Windows SDK macro token collision (`error C2589`, `error C2059`) on MSVC Debug and Release configurations.
+  - Added `_CRT_SECURE_NO_WARNINGS` for MSVC and removed redundant `-DCMAKE_BUILD_TYPE` flag from multi-config Visual Studio generator invocation.
+
+- **Release Packaging Pipeline Overhaul & Verification:**
+  - Redesigned `tooling/package_release.ps1` to assemble three distinct, complete Windows x64 distributions:
+    1. `rtprotect-windows-x64.zip`: CLI tool, GUI profiler, benchmark runner, runtime dependencies, docs, and metadata.
+    2. `rtprotect-sdk-windows-x64.zip`: Developer SDK with public C++20 headers, static libraries, exported CMake package configuration (`RTProtectConfig.cmake`), bundled OpenSSL SDK, and consumer sample project.
+    3. `rtprotect-activation-server-windows-x64.zip`: Standalone activation server deployment with OpenSSL runtime DLLs.
+  - Bundled both OpenSSL runtime DLLs (`libcrypto-3-x64.dll` and `libssl-3-x64.dll`) into binary packages.
+  - Generated release metadata: `QUICKSTART.md`, `LICENSE`, `THIRD_PARTY_NOTICES.md`, `VERSION.txt`, `BUILD_INFO.txt`, and SPDX 2.3 `SBOM.spdx.json`.
+  - Implemented automated consumer application smoke test (`examples/consumer_sample`) building against the generated SDK and executing in CI and packaging workflows.
+  - Generated deterministic SHA-256 release checksum manifest (`SHA256SUMS.txt`).
+
+- **Licensing Authority & Transactional Safety:**
+  - Fixed database header parsing to recognize `[events]`, restoring audit event logs and seat churn risk analytics across server restarts.
+  - Hardened `RateLimiter` against zero capacity, validated finite positive cost tokens, and replaced non-deterministic bucket eviction with timestamp-based LRU pruning.
+  - Anonymized license keys via SHA-256 masking (`key:sha256:...`) across all audit logs, memory rate-limiter maps, and server output, preventing bearer token leakage.
+  - Enforced strict transactional commit sequencing in `ProcessActivate` and `ProcessRenew`: seat reservations and replay nonces commit only after AEAD transport encryption succeeds, eliminating seat exhaustion and nonce burning on transient network or cryptographic errors.
+
+- **HTTP Server Framing & Administration Hardening:**
+  - Added case-insensitive `Content-Length` header validation, rejecting duplicate length headers (400 Bad Request) and `Transfer-Encoding: chunked` (501 Not Implemented) to prevent HTTP request smuggling.
+  - Implemented absolute 15-second request deadline preventing Slowloris denial of service.
+  - Added JSON string escaping across all fields in the administrative `/events` endpoint.
+  - Redacted admin bearer tokens in server startup output unless explicitly running with `--insecure-dev-only`; added `--admin-token-file` and `RTPROTECT_ADMIN_TOKEN` environment variable support.
+
+- **Simple JSON Parser RFC 8259 Compliance:**
+  - Enforced complete input consumption (`pos == sv.size()`), rejecting trailing garbage.
+  - Added strict escape validation: validated 4 hex characters on `\uXXXX` sequences, rejected unrecognized escape sequences, and rejected raw unescaped ASCII control characters (< 0x20).
+  - Enforced strict numeric token validation (rejecting lone `-`, leading zeros, trailing decimal points, and incomplete exponent sequences).
+
+- **Clang AST Scanner Subprocess Safety:**
+  - Replaced blocking pipe read in `RunProcessCaptureOutput` with non-blocking `PeekNamedPipe` polling, enforcing a 30-second execution deadline, 64 MB stdout capture ceiling, and `TerminateProcess` cleanup.
+
+---
+
 ## [2.5.0-hardened] - 2026-10-22
 
 ### RTProtect WIP(5) Security Audit Remediations & Production Hardening

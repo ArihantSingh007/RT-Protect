@@ -847,4 +847,93 @@ MT_TEST(HttpServer_RateLimiting_ReturnsHttp429) {
   std::filesystem::remove(db_path, ec);
 }
 
+MT_TEST(Database_EventsAndNonces_RestoredAfterRestart) {
+  std::string db_path = MakeTempDbPath();
+  std::error_code ec;
+  std::filesystem::remove(db_path, ec);
+
+  std::uint64_t now = 1700000000;
+  {
+    ActivationDatabase db(db_path);
+    LicenseRecord lic;
+    lic.license_id = "lic-restart-test";
+    lic.product_id = "prod.test";
+    lic.max_seats = 5;
+    lic.status = LicenseRecordStatus::kActive;
+    MT_CHECK(db.RegisterLicense(lic));
+
+    // Record nonces
+    MT_CHECK(db.ConsumeNonceIfUnused("nonce-restart-01", now + 3600, now));
+    MT_CHECK(db.ConsumeNonceIfUnused("nonce-restart-02", now + 7200, now));
+
+    // Record audit events
+    MT_CHECK(db.RecordEvent({now, ActivationEventType::kActivationSuccess, "lic-restart-test", "HWID-1", "127.0.0.1", "Seat 1 activated"}));
+    MT_CHECK(db.RecordEvent({now + 10, ActivationEventType::kRenewalSuccess, "lic-restart-test", "HWID-1", "127.0.0.1", "Seat 1 renewed"}));
+    MT_CHECK(db.RecordEvent({now + 20, ActivationEventType::kDeactivation, "lic-restart-test", "HWID-1", "127.0.0.1", "Seat 1 deactivated"}));
+    MT_CHECK(db.RecordEvent({now + 30, ActivationEventType::kReplayBlocked, "lic-restart-test", "HWID-1", "127.0.0.1", "Replay blocked"}));
+
+    MT_CHECK(db.Save());
+  }
+
+  // Re-open fresh database instance from the same file
+  {
+    ActivationDatabase db2(db_path);
+    auto lic_opt = db2.GetLicense("lic-restart-test");
+    MT_CHECK(lic_opt.has_value());
+    MT_CHECK(lic_opt->license_id == "lic-restart-test");
+
+    // Nonces must still be marked as used
+    MT_CHECK(db2.IsNonceUsed("nonce-restart-01"));
+    MT_CHECK(db2.IsNonceUsed("nonce-restart-02"));
+    MT_CHECK(!db2.ConsumeNonceIfUnused("nonce-restart-01", now + 3600, now));
+
+    // Audit events must be completely restored
+    auto events = db2.GetRecentEvents("lic-restart-test", 10);
+    MT_CHECK(events.size() == 4);
+    MT_CHECK(events[0].details == "Replay blocked");
+    MT_CHECK(events[1].details == "Seat 1 deactivated");
+    MT_CHECK(events[2].details == "Seat 1 renewed");
+    MT_CHECK(events[3].details == "Seat 1 activated");
+
+    // Seat churn risk must compute identically
+    double risk = db2.ComputeSeatChurnRisk("lic-restart-test", now + 100);
+    MT_CHECK(risk > 0.0);
+  }
+
+  std::filesystem::remove(db_path, ec);
+}
+
+MT_TEST(HttpServer_FramingSecurity_RejectsMalformedAndChunked) {
+  std::string db_path = MakeTempDbPath();
+  std::error_code ec;
+  std::filesystem::remove(db_path, ec);
+
+  auto kp = MakeKeyPair();
+  ActivationDatabase db(db_path);
+  ActivationService service(db, std::move(kp.private_key), kp.public_key);
+  ActivationServerHttp server(service);
+
+  MT_CHECK(server.Start(0, "127.0.0.1"));
+  std::uint16_t port = server.port();
+
+  // 1. Transfer-Encoding: chunked -> 501 Not Implemented
+  std::string te_req = "POST /activate HTTP/1.1\r\nHost: 127.0.0.1\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n0\r\n\r\n";
+  std::string te_resp = SendRawHttpRequest(port, te_req);
+  MT_CHECK(te_resp.find("HTTP/1.1 501 Not Implemented") != std::string::npos);
+
+  // 2. Duplicate Content-Length headers -> 400 Bad Request
+  std::string dup_cl_req = "POST /activate HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: 10\r\nContent-Length: 20\r\nConnection: close\r\n\r\n1234567890";
+  std::string dup_cl_resp = SendRawHttpRequest(port, dup_cl_req);
+  MT_CHECK(dup_cl_resp.find("HTTP/1.1 400 Bad Request") != std::string::npos);
+  MT_CHECK(dup_cl_resp.find("Multiple Content-Length") != std::string::npos);
+
+  // 3. Invalid non-numeric Content-Length -> 400 Bad Request
+  std::string bad_cl_req = "POST /activate HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: abc\r\nConnection: close\r\n\r\n1234567890";
+  std::string bad_cl_resp = SendRawHttpRequest(port, bad_cl_req);
+  MT_CHECK(bad_cl_resp.find("HTTP/1.1 400 Bad Request") != std::string::npos);
+
+  server.Stop();
+  std::filesystem::remove(db_path, ec);
+}
+
 MT_MAIN()

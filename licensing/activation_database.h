@@ -106,7 +106,7 @@ class ActivationDatabase {
   // Anti-replay nonce tracking
   bool IsNonceUsed(const std::string& nonce_hex) const;
   bool RecordNonce(const std::string& nonce_hex, std::uint64_t expires_at);
-  bool ConsumeNonceIfUnused(const std::string& nonce_hex, std::uint64_t expires_at);
+  bool ConsumeNonceIfUnused(const std::string& nonce_hex, std::uint64_t expires_at, std::uint64_t current_time = 0);
   void PruneExpiredNonces(std::uint64_t current_time);
 
   // Structured audit event logging & abuse analytics (Stage 2)

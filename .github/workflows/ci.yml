@@ -38,7 +38,6 @@ jobs:
         shell: powershell
         run: |
           cmake -B build -G "${{ matrix.generator }}" -A x64 `
-            -DCMAKE_BUILD_TYPE=${{ matrix.build_type }} `
             -DOPENSSL_ROOT_DIR="${{ github.workspace }}/third_party/openssl" `
             -DRTPROTECT_BUILD_TESTS=ON
 
@@ -49,3 +48,18 @@ jobs:
       - name: Execute automated test suite
         shell: powershell
         run: ctest --test-dir build -C ${{ matrix.build_type }} --output-on-failure
+
+      - name: Verify release packaging and SDK smoke test
+        if: matrix.build_type == 'Release'
+        shell: powershell
+        run: |
+          powershell -ExecutionPolicy Bypass -File tooling/package_release.ps1 -BuildDir build -OpenSslDir "${{ github.workspace }}/third_party/openssl"
+
+      - name: Archive release packages and checksums
+        if: matrix.build_type == 'Release'
+        uses: actions/upload-artifact@v4
+        with:
+          name: rtprotect-windows-x64-release
+          path: |
+            dist/*.zip
+            dist/SHA256SUMS.txt

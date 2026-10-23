@@ -193,4 +193,40 @@ MT_TEST(SimpleJson_EnforcesRecursionDepthLimit) {
   MT_CHECK(res_shallow->is_array());
 }
 
+MT_TEST(SimpleJson_StrictSyntaxAndValidation) {
+  // 1. Trailing characters after valid JSON must be rejected
+  MT_CHECK(!JsonValue::Parse("{\"key\": 123} trailing").has_value());
+  MT_CHECK(!JsonValue::Parse("[1, 2, 3] extra").has_value());
+  MT_CHECK(!JsonValue::Parse("\"valid string\" ;").has_value());
+
+  // 2. Unescaped control characters in strings (< 0x20) must be rejected
+  std::string raw_ctrl = "\"hello\x05world\"";
+  MT_CHECK(!JsonValue::Parse(raw_ctrl).has_value());
+  std::string raw_tab = "\"hello\tworld\"";
+  MT_CHECK(!JsonValue::Parse(raw_tab).has_value());
+
+  // 3. Invalid escape characters
+  MT_CHECK(!JsonValue::Parse("\"invalid \\x escape\"").has_value());
+  MT_CHECK(!JsonValue::Parse("\"invalid \\q escape\"").has_value());
+
+  // 4. Unicode escape hex validation
+  MT_CHECK(!JsonValue::Parse("\"invalid \\u12G4 hex\"").has_value());
+  MT_CHECK(!JsonValue::Parse("\"short \\u12 hex\"").has_value());
+  MT_CHECK(JsonValue::Parse("\"valid \\u0041 hex\"").has_value());
+
+  // 5. Strict numeric validation
+  MT_CHECK(!JsonValue::Parse("-").has_value());
+  MT_CHECK(!JsonValue::Parse("0123").has_value()); // Leading zero forbidden
+  MT_CHECK(!JsonValue::Parse("12.").has_value());   // Trailing decimal dot forbidden
+  MT_CHECK(!JsonValue::Parse("1e").has_value());    // Incomplete exponent
+  MT_CHECK(!JsonValue::Parse("1e+").has_value());
+
+  // 6. Valid formats must parse correctly
+  auto valid = JsonValue::Parse("{\"num\": -42.5e+2, \"flag\": true, \"nil\": null, \"str\": \"escaped \\\" \\\\ \\/ \\n \\t\"}");
+  MT_CHECK(valid.has_value());
+  MT_CHECK(valid->is_object());
+  MT_CHECK((*valid)["flag"].as_bool() == true);
+  MT_CHECK((*valid)["nil"].is_null());
+}
+
 MT_MAIN()

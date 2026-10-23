@@ -1,0 +1,55 @@
+{
+  "spdxVersion": "SPDX-2.3",
+  "dataLicense": "CC0-1.0",
+  "SPDXID": "SPDXRef-DOCUMENT",
+  "name": "RTProtect-Windows-x64",
+  "documentNamespace": "https://github.com/ArihantSingh007/RT-Protect/spdx/2.0.0",
+  "creationInfo": {
+    "creators": [
+      "Organization: RTProtect",
+      "Tool: RTProtect-Release-Packager-2.0"
+    ],
+    "created": "2026-10-23T00:00:00Z"
+  },
+  "packages": [
+    {
+      "name": "RTProtect",
+      "SPDXID": "SPDXRef-Package-RTProtect",
+      "versionInfo": "2.0.0",
+      "packageFileName": "rtprotect-windows-x64.zip",
+      "supplier": "Organization: RTProtect",
+      "downloadLocation": "https://github.com/ArihantSingh007/RT-Protect/releases/tag/v2.0.0",
+      "filesAnalyzed": false,
+      "licenseConcluded": "MIT",
+      "licenseDeclared": "MIT",
+      "copyrightText": "Copyright (c) 2026 RTProtect Contributors",
+      "summary": "Multi-layer C++ binary protection and hardware-bound node-locked licensing framework for Windows x64",
+      "primaryPackagePurpose": "APPLICATION"
+    },
+    {
+      "name": "OpenSSL",
+      "SPDXID": "SPDXRef-Package-OpenSSL",
+      "versionInfo": "3.4.0",
+      "supplier": "Organization: OpenSSL Project",
+      "downloadLocation": "https://www.openssl.org/source/openssl-3.4.0.tar.gz",
+      "filesAnalyzed": false,
+      "licenseConcluded": "Apache-2.0",
+      "licenseDeclared": "Apache-2.0",
+      "copyrightText": "Copyright (c) 1998-2026 The OpenSSL Project",
+      "summary": "Cryptographic and TLS/SSL toolkit",
+      "primaryPackagePurpose": "LIBRARY"
+    }
+  ],
+  "relationships": [
+    {
+      "spdxElementId": "SPDXRef-DOCUMENT",
+      "relationshipType": "DESCRIBES",
+      "relatedSpdxElement": "SPDXRef-Package-RTProtect"
+    },
+    {
+      "spdxElementId": "SPDXRef-Package-RTProtect",
+      "relationshipType": "DEPENDS_ON",
+      "relatedSpdxElement": "SPDXRef-Package-OpenSSL"
+    }
+  ]
+}

@@ -149,7 +149,7 @@ bool ActivationDatabase::Open(const std::string& db_path) {
     }
     if (line.empty() || line[0] == '#') continue;
 
-    if (line == "[licenses]" || line == "[activations]" || line == "[used_nonces]") {
+    if (line == "[licenses]" || line == "[activations]" || line == "[used_nonces]" || line == "[events]") {
       section = line;
       continue;
     }
@@ -489,20 +489,21 @@ bool ActivationDatabase::RecordNonce(const std::string& nonce_hex, std::uint64_t
   return SaveLocked();
 }
 
-bool ActivationDatabase::ConsumeNonceIfUnused(const std::string& nonce_hex, std::uint64_t expires_at) {
+bool ActivationDatabase::ConsumeNonceIfUnused(const std::string& nonce_hex, std::uint64_t expires_at, std::uint64_t current_time) {
   std::lock_guard<std::mutex> lock(mutex_);
   if (nonce_hex.empty()) return false;
   auto it = used_nonces_.find(nonce_hex);
   if (it != used_nonces_.end()) {
     return false; // Already used (replay attack)
   }
-  // Opportunistically prune expired nonces to prevent unbounded growth
-  std::uint64_t now = (expires_at > 86400) ? (expires_at - 86400) : expires_at;
-  for (auto pit = used_nonces_.begin(); pit != used_nonces_.end();) {
-    if (pit->second <= now) {
-      pit = used_nonces_.erase(pit);
-    } else {
-      ++pit;
+  // Opportunistically prune only nonces whose stored expiry <= current_time
+  if (current_time > 0) {
+    for (auto pit = used_nonces_.begin(); pit != used_nonces_.end();) {
+      if (pit->second <= current_time) {
+        pit = used_nonces_.erase(pit);
+      } else {
+        ++pit;
+      }
     }
   }
   used_nonces_[nonce_hex] = expires_at;
@@ -594,10 +595,10 @@ double ActivationDatabase::ComputeSeatChurnRisk(const std::string& license_id,
     risk += (device_ratio - 1.0) * 0.25;
   }
   if (abuse_events > 0) {
-    risk += std::min(0.5, static_cast<double>(abuse_events) * 0.1);
+    risk += (std::min)(0.5, static_cast<double>(abuse_events) * 0.1);
   }
 
-  return std::min(1.0, std::max(0.0, risk));
+  return (std::min)(1.0, (std::max)(0.0, risk));
 }
 
 void ActivationDatabase::Clear() {

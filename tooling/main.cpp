@@ -922,7 +922,7 @@ int CmdActivateIssue(int argc, char** argv) {
   auto now = static_cast<std::uint64_t>(std::time(nullptr));
   auto req = licensing::CreateActivationRequest(license_id, target_hwid, "1.0.0", now);
 
-  std::uint64_t validity_seconds = static_cast<std::uint64_t>(std::max(1, validity_hours)) * 3600ULL;
+  std::uint64_t validity_seconds = static_cast<std::uint64_t>((std::max)(1, validity_hours)) * 3600ULL;
   auto result = mgr.IssueTicket(req, *priv_key, validity_seconds, now);
   if (result.status != licensing::ActivationStatus::kValid || !result.ticket.has_value()) {
     std::fprintf(stderr, "error: failed to issue activation ticket: %s\n",

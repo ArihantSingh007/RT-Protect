@@ -47,8 +47,9 @@ void PrintUsage() {
             << "  --key <path>                   Ed25519 signing private key file (required or auto-generated)\n"
             << "  --tls-cert <path>              TLS server certificate PEM file\n"
             << "  --tls-key <path>               TLS server private key PEM file\n"
-            << "  --insecure-dev-only            Allow non-loopback binding without TLS (insecure)\n"
+            << "  --insecure-dev-only            Allow non-loopback binding without TLS and print secrets\n"
             << "  --admin-token <token>          Shared secret token for administrative /events endpoint\n"
+            << "  --admin-token-file <path>      File containing administrative shared secret token\n"
             << "  --register-license <id> <prod> <seats> [vm_root_hex]\n"
             << "                                 Register a license and exit\n"
             << "  --revoke-license <id>          Revoke a license and exit\n"
@@ -86,6 +87,7 @@ int main(int argc, char* argv[]) {
   std::string tls_cert_path;
   std::string tls_key_path;
   std::string admin_token;
+  std::string admin_token_file;
   bool insecure_dev_only = false;
 
   std::string reg_lic_id;
@@ -119,6 +121,8 @@ int main(int argc, char* argv[]) {
       insecure_dev_only = true;
     } else if (arg == "--admin-token" && i + 1 < argc) {
       admin_token = argv[++i];
+    } else if (arg == "--admin-token-file" && i + 1 < argc) {
+      admin_token_file = argv[++i];
     } else if (arg == "--register-license" && i + 3 < argc) {
       reg_lic_id = argv[++i];
       reg_prod_id = argv[++i];
@@ -224,6 +228,25 @@ int main(int argc, char* argv[]) {
   ActivationService service(db, std::move(key_pair->private_key), key_pair->public_key);
   ActivationServerHttp server(service);
   server.SetAllowInsecureNonLoopback(insecure_dev_only);
+
+  if (admin_token.empty() && !admin_token_file.empty()) {
+    auto file_bytes = tooling::ReadFile(admin_token_file);
+    if (!file_bytes.has_value()) {
+      std::cerr << "Error: Unable to read admin token file: " << admin_token_file << "\n";
+      return 1;
+    }
+    admin_token.assign(reinterpret_cast<const char*>(file_bytes->data()), file_bytes->size());
+    while (!admin_token.empty() && (admin_token.back() == '\r' || admin_token.back() == '\n' || admin_token.back() == ' ')) {
+      admin_token.pop_back();
+    }
+  }
+  if (admin_token.empty()) {
+    const char* env_token = std::getenv("RTPROTECT_ADMIN_TOKEN");
+    if (env_token && std::strlen(env_token) > 0) {
+      admin_token = env_token;
+    }
+  }
+
   if (!admin_token.empty()) {
     server.SetAdminAuthToken(admin_token);
   }
@@ -256,9 +279,13 @@ int main(int argc, char* argv[]) {
   std::signal(SIGTERM, SignalHandler);
 
   std::cout << "RTProtect Activation Server running at " << server.base_url() << "\n"
-            << "Public Key:  " << BytesToHex(key_pair->public_key.data(), key_pair->public_key.size()) << "\n"
-            << "Admin Token: " << server.admin_auth_token() << "\n"
-            << "Press Ctrl+C to terminate.\n";
+            << "Public Key:  " << BytesToHex(key_pair->public_key.data(), key_pair->public_key.size()) << "\n";
+  if (insecure_dev_only) {
+    std::cout << "Admin Token: " << server.admin_auth_token() << " (insecure-dev-only)\n";
+  } else {
+    std::cout << "Admin Token: [REDACTED; pass --insecure-dev-only to print to stdout]\n";
+  }
+  std::cout << "Press Ctrl+C to terminate.\n";
 
   while (!g_stop_requested.load()) {
     std::this_thread::sleep_for(std::chrono::milliseconds(200));
