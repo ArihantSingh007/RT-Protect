@@ -52,7 +52,7 @@ std::size_t RvaToFileOffset(const IMAGE_NT_HEADERS64* nt,
     const auto& sec = sections[i];
     std::uint32_t sec_rva = sec.VirtualAddress;
     std::uint32_t sec_vsize = sec.Misc.VirtualSize ? sec.Misc.VirtualSize : sec.SizeOfRawData;
-    if (rva >= sec_rva && rva < sec_rva + sec_vsize) {
+    if (rva >= sec_rva && static_cast<std::uint64_t>(rva) < static_cast<std::uint64_t>(sec_rva) + sec_vsize) {
       std::uint32_t offset_in_sec = rva - sec_rva;
       if (static_cast<std::size_t>(offset_in_sec) + required_bytes > sec_vsize) return 0;
       if (sec.PointerToRawData > image_size) return 0;

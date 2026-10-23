@@ -140,7 +140,7 @@ void* ResolveExportByHash(void* module_base, std::uint32_t function_hash) {
 
       // Check for forwarded export (falls inside export directory bounds)
       if (func_rva >= export_dir_entry.VirtualAddress &&
-          func_rva < export_dir_entry.VirtualAddress + export_dir_entry.Size) {
+          static_cast<std::uint64_t>(func_rva) < static_cast<std::uint64_t>(export_dir_entry.VirtualAddress) + export_dir_entry.Size) {
         const char* forwarder = reinterpret_cast<const char*>(base + func_rva);
         std::string forward_str(forwarder);
         auto dot_pos = forward_str.find('.');
