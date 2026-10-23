@@ -62,6 +62,7 @@ function(rtprotect_strip_in_release target)
 endfunction()
 
 if(MSVC)
+  add_compile_definitions(_CRT_SECURE_NO_WARNINGS)
   add_compile_options(/W4 /permissive- /Zc:__cplusplus)
   add_compile_options($<$<CONFIG:Release>:/guard:cf>)
   add_link_options($<$<CONFIG:Release>:/guard:cf>)

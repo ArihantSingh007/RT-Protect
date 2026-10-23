@@ -3,7 +3,8 @@
 // Lightweight, standards-compliant JSON parser for RTProtect tooling.
 // Correctly handles nested objects, arrays, numbers, booleans, null,
 // and string escape sequences (including \", \\, \n, \r, \t, etc.).
-// Completely immune to string escaping desynchronization vulnerabilities.
+// Completely immune to string escaping desynchronization vulnerabilities
+// and protected against stack exhaustion via recursion depth limits.
 
 #pragma once
 
@@ -29,6 +30,8 @@ enum class JsonType {
 
 class JsonValue {
  public:
+  static constexpr std::size_t kDefaultMaxDepth = 128;
+
   JsonValue() : type_(JsonType::kNull) {}
   explicit JsonValue(bool b) : type_(JsonType::kBool), bool_val_(b) {}
   explicit JsonValue(double n) : type_(JsonType::kNumber), num_val_(n) {}
@@ -80,11 +83,11 @@ class JsonValue {
     return arr_val_[idx];
   }
 
-  static std::optional<JsonValue> Parse(std::string_view sv) {
+  static std::optional<JsonValue> Parse(std::string_view sv, std::size_t max_depth = kDefaultMaxDepth) {
     std::size_t pos = 0;
     SkipWhitespace(sv, pos);
     if (pos >= sv.size()) return std::nullopt;
-    auto res = ParseValue(sv, pos);
+    auto res = ParseValue(sv, pos, 0, max_depth);
     if (!res.has_value()) return std::nullopt;
     SkipWhitespace(sv, pos);
     return res;
@@ -137,7 +140,8 @@ class JsonValue {
     return std::nullopt; // unclosed string
   }
 
-  static std::optional<JsonValue> ParseValue(std::string_view sv, std::size_t& pos) {
+  static std::optional<JsonValue> ParseValue(std::string_view sv, std::size_t& pos, std::size_t depth, std::size_t max_depth) {
+    if (depth > max_depth) return std::nullopt;
     SkipWhitespace(sv, pos);
     if (pos >= sv.size()) return std::nullopt;
 
@@ -148,10 +152,10 @@ class JsonValue {
       return JsonValue(*s);
     }
     if (c == '{') {
-      return ParseObject(sv, pos);
+      return ParseObject(sv, pos, depth, max_depth);
     }
     if (c == '[') {
-      return ParseArray(sv, pos);
+      return ParseArray(sv, pos, depth, max_depth);
     }
     if (c == 't' || c == 'f') {
       if (sv.substr(pos, 4) == "true") {
@@ -193,7 +197,8 @@ class JsonValue {
     return std::nullopt;
   }
 
-  static std::optional<JsonValue> ParseArray(std::string_view sv, std::size_t& pos) {
+  static std::optional<JsonValue> ParseArray(std::string_view sv, std::size_t& pos, std::size_t depth, std::size_t max_depth) {
+    if (depth > max_depth) return std::nullopt;
     if (pos >= sv.size() || sv[pos] != '[') return std::nullopt;
     ++pos; // skip '['
     std::vector<JsonValue> elements;
@@ -205,7 +210,7 @@ class JsonValue {
         return JsonValue(std::move(elements));
       }
 
-      auto val = ParseValue(sv, pos);
+      auto val = ParseValue(sv, pos, depth + 1, max_depth);
       if (!val.has_value()) return std::nullopt;
       elements.push_back(std::move(*val));
 
@@ -222,7 +227,8 @@ class JsonValue {
     return std::nullopt;
   }
 
-  static std::optional<JsonValue> ParseObject(std::string_view sv, std::size_t& pos) {
+  static std::optional<JsonValue> ParseObject(std::string_view sv, std::size_t& pos, std::size_t depth, std::size_t max_depth) {
+    if (depth > max_depth) return std::nullopt;
     if (pos >= sv.size() || sv[pos] != '{') return std::nullopt;
     ++pos; // skip '{'
     std::unordered_map<std::string, JsonValue> obj;
@@ -242,7 +248,7 @@ class JsonValue {
       if (pos >= sv.size() || sv[pos] != ':') return std::nullopt;
       ++pos; // skip ':'
 
-      auto val = ParseValue(sv, pos);
+      auto val = ParseValue(sv, pos, depth + 1, max_depth);
       if (!val.has_value()) return std::nullopt;
       obj[std::move(*key)] = std::move(*val);
 

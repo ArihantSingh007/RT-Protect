@@ -1,6 +1,7 @@
 // tests/test_unreal_integration.cpp
 
 #include "tooling/unreal_integration.h"
+#include "tooling/simple_json.h"
 #include "tests/micro_test.h"
 
 #include <filesystem>
@@ -163,6 +164,33 @@ MT_TEST(UnrealIntegration_Execution_CreatesBackupAndDeploysHeaders) {
   MT_CHECK(fs::exists(report.backup_path));
 
   fs::remove_all(dir);
+}
+
+MT_TEST(SimpleJson_EnforcesRecursionDepthLimit) {
+  // Construct deeply nested JSON array: [[[[...]]]]
+  std::string deeply_nested;
+  for (int i = 0; i < 200; ++i) deeply_nested += "[";
+  deeply_nested += "1";
+  for (int i = 0; i < 200; ++i) deeply_nested += "]";
+
+  // Default depth limit is 128, so 200 levels deep must fail cleanly without stack overflow
+  auto res = JsonValue::Parse(deeply_nested);
+  MT_CHECK(!res.has_value());
+
+  // Explicit max_depth override
+  auto res_custom = JsonValue::Parse(deeply_nested, 250);
+  MT_CHECK(res_custom.has_value());
+  MT_CHECK(res_custom->is_array());
+
+  // Shallow nesting must succeed
+  std::string shallow_nested;
+  for (int i = 0; i < 10; ++i) shallow_nested += "[";
+  shallow_nested += "42";
+  for (int i = 0; i < 10; ++i) shallow_nested += "]";
+
+  auto res_shallow = JsonValue::Parse(shallow_nested);
+  MT_CHECK(res_shallow.has_value());
+  MT_CHECK(res_shallow->is_array());
 }
 
 MT_MAIN()
