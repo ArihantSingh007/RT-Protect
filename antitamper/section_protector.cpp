@@ -18,6 +18,7 @@ namespace {
 
 using VirtualProtectFn = BOOL (WINAPI*)(LPVOID, SIZE_T, DWORD, PDWORD);
 using GetModuleHandleAFn = HMODULE (WINAPI*)(LPCSTR);
+using FlushInstructionCacheFn = BOOL (WINAPI*)(HANDLE, LPCVOID, SIZE_T);
 
 std::uint32_t ComputeFnv1a(const std::uint8_t* data, std::size_t len) {
   std::uint32_t hash = 2166136261u;
@@ -64,7 +65,7 @@ const tooling::PeProtectedSectionHeader* FindProtectedSectionHeader(const void* 
   const auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(base_bytes);
   if (dos->e_magic != IMAGE_DOS_SIGNATURE) return nullptr;
 
-  // Primary check: offset 0x40 in DOS stub
+  // Check offset 0x40 in DOS stub padding
   const auto* candidate = reinterpret_cast<const tooling::PeProtectedSectionHeader*>(base_bytes + 0x40);
   if (candidate->magic == tooling::kPeProtectorMagic && candidate->version == 1) {
     return candidate;
@@ -112,13 +113,23 @@ bool DecryptProtectedSectionInMemory(const tooling::PeProtectedSectionHeader& he
   // Copy decrypted code into execution location
   std::memcpy(sec_addr, decrypted.data(), header.section_size);
 
-  // Restore memory page protection
-  DWORD final_protect = header.original_protect ? header.original_protect : PAGE_EXECUTE_READ;
-  DWORD temp = 0;
-  pVirtualProtect(sec_addr, header.section_size, final_protect, &temp);
-
   // Cleanse sensitive decrypted buffer
   OPENSSL_cleanse(decrypted.data(), decrypted.size());
+
+  // Restore memory page protection using the verified PAGE_* constant
+  DWORD final_protect = header.original_protect ? header.original_protect : PAGE_EXECUTE_READ;
+  DWORD temp = 0;
+  if (!pVirtualProtect(sec_addr, header.section_size, final_protect, &temp)) {
+    // Attempt fallback to PAGE_EXECUTE_READ
+    pVirtualProtect(sec_addr, header.section_size, PAGE_EXECUTE_READ, &temp);
+    return false;
+  }
+
+  // Flush instruction cache for the modified executable code range
+  auto pFlushInstructionCache = ResolveApi<FlushInstructionCacheFn>(kHashKernel32, HashApi("FlushInstructionCache"));
+  if (pFlushInstructionCache) {
+    pFlushInstructionCache(GetCurrentProcess(), sec_addr, header.section_size);
+  }
 
   return true;
 }

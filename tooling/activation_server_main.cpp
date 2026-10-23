@@ -57,6 +57,8 @@ void PrintUsage() {
             << "  --admin-token-file <path>      File containing administrative shared secret token\n"
             << "  --register-license <id> <prod> <seats> [vm_root_hex]\n"
             << "                                 Register a license and exit\n"
+            << "  --credential <secret>          Secret activation credential for registered license\n"
+            << "  --generate-credential          Cryptographically generate a random activation credential secret\n"
             << "  --revoke-license <id>          Revoke a license and exit\n"
             << "  --help                         Show this help message\n"
             << "  --version                      Display version information\n";
@@ -104,6 +106,8 @@ int main(int argc, char* argv[]) {
   std::string reg_prod_id;
   std::uint32_t reg_seats = 1;
   std::string reg_vm_root_hex;
+  std::string reg_credential;
+  bool reg_generate_cred = false;
 
   std::string revoke_lic_id;
 
@@ -142,6 +146,10 @@ int main(int argc, char* argv[]) {
       admin_token = argv[++i];
     } else if (arg == "--admin-token-file" && i + 1 < argc) {
       admin_token_file = argv[++i];
+    } else if (arg == "--credential" && i + 1 < argc) {
+      reg_credential = argv[++i];
+    } else if (arg == "--generate-credential") {
+      reg_generate_cred = true;
     } else if (arg == "--register-license" && i + 3 < argc) {
       reg_lic_id = argv[++i];
       reg_prod_id = argv[++i];
@@ -157,6 +165,21 @@ int main(int argc, char* argv[]) {
   ActivationDatabase db(db_path);
 
   if (!reg_lic_id.empty()) {
+    if (reg_credential.empty() && !reg_generate_cred && !insecure_dev_only) {
+      std::cerr << "Error: --register-license requires --credential <secret> or --generate-credential in production mode.\n"
+                << "       (Pass --insecure-dev-only to register credential-free licenses for local testing).\n";
+      return 1;
+    }
+
+    if (reg_generate_cred) {
+      std::array<std::uint8_t, 32> cred_bytes{};
+      if (RAND_bytes(cred_bytes.data(), static_cast<int>(cred_bytes.size())) != 1) {
+        std::cerr << "Error: Cryptographic RNG failure generating activation credential\n";
+        return 1;
+      }
+      reg_credential = BytesToHex(cred_bytes.data(), cred_bytes.size());
+    }
+
     LicenseRecord rec;
     rec.license_id = reg_lic_id;
     rec.product_id = reg_prod_id;
@@ -165,6 +188,17 @@ int main(int argc, char* argv[]) {
     auto now = std::chrono::system_clock::now().time_since_epoch();
     rec.created_at = static_cast<std::uint64_t>(
         std::chrono::duration_cast<std::chrono::seconds>(now).count());
+
+    if (!reg_credential.empty()) {
+      auto cred_hash = integrity::Sha256(
+          reinterpret_cast<const std::uint8_t*>(reg_credential.data()),
+          reg_credential.size());
+      if (!cred_hash.has_value()) {
+        std::cerr << "Error: Failed to compute SHA-256 verifier for activation credential\n";
+        return 1;
+      }
+      rec.activation_credential_hash = BytesToHex(cred_hash->data(), cred_hash->size());
+    }
 
     if (!reg_vm_root_hex.empty()) {
       if (!HexToBytes(reg_vm_root_hex, rec.vm_root.data(), rec.vm_root.size())) {
@@ -187,6 +221,11 @@ int main(int argc, char* argv[]) {
               << " for product " << rec.product_id
               << " with " << rec.max_seats << " seats.\n"
               << "Canonical vm_root: [PROVISIONED: " << BytesToHex(rec.vm_root.data(), 4) << "...redacted]\n";
+    if (!reg_credential.empty()) {
+      std::cout << "Activation Credential: " << reg_credential << "\n"
+                << "Credential Hash (SHA-256): " << rec.activation_credential_hash << "\n"
+                << "[IMPORTANT] Deliver the Activation Credential to licensee; only the hash verifier is stored on server.\n";
+    }
     return 0;
   }
 
@@ -300,6 +339,7 @@ int main(int argc, char* argv[]) {
   }
 
   ActivationService service(db, std::move(key_pair->private_key), key_pair->public_key);
+  service.SetRequireActivationCredentials(!insecure_dev_only);
   ActivationServerHttp server(service);
   server.SetAllowInsecureNonLoopback(insecure_dev_only);
 

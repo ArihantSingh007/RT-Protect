@@ -2,6 +2,7 @@
 
 #include "licensing/secrets_manager.h"
 
+#include <chrono>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
@@ -57,6 +58,16 @@ bool VerifyKeyPairCorrespondence(const integrity::Ed25519PrivateKey& priv,
   return integrity::VerifyManifestSignature(probe, *sig, pub);
 }
 
+bool IsValidKeyIdentifier(const std::string& id) {
+  if (id.empty() || id.size() > 64) return false;
+  for (char c : id) {
+    if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_' || c == '-')) {
+      return false;
+    }
+  }
+  return true;
+}
+
 // -----------------------------------------------------------------------------
 // Windows DPAPI Vault Implementation
 // -----------------------------------------------------------------------------
@@ -92,6 +103,10 @@ class WindowsDpapiVaultProvider : public IServerSecretProvider {
   std::optional<integrity::Ed25519KeyPair> RetrieveSigningKeyPair(
       const std::string& key_identifier,
       std::string* error_out) override {
+    if (!IsValidKeyIdentifier(key_identifier)) {
+      if (error_out) *error_out = "Invalid key identifier (must be 1-64 alphanumeric, '_' or '-'): " + key_identifier;
+      return std::nullopt;
+    }
     fs::path vault_file = fs::path(base_dir_) / (key_identifier + ".vault");
     auto file_bytes = tooling::ReadFile(vault_file.string());
     if (!file_bytes.has_value() || file_bytes->size() < 12) {
@@ -167,6 +182,10 @@ class WindowsDpapiVaultProvider : public IServerSecretProvider {
       const std::string& key_identifier,
       const integrity::Ed25519KeyPair& key_pair,
       std::string* error_out) override {
+    if (!IsValidKeyIdentifier(key_identifier)) {
+      if (error_out) *error_out = "Invalid key identifier (must be 1-64 alphanumeric, '_' or '-'): " + key_identifier;
+      return false;
+    }
     if (!VerifyKeyPairCorrespondence(key_pair.private_key, key_pair.public_key)) {
       if (error_out) *error_out = "Cannot store mismatched key pair";
       return false;
@@ -216,8 +235,17 @@ class WindowsDpapiVaultProvider : public IServerSecretProvider {
     std::memcpy(container.data() + 12, encrypted.data(), encrypted.size());
 
     fs::path vault_file = fs::path(base_dir_) / (key_identifier + ".vault");
-    if (!tooling::WriteSecretFile(vault_file.string(), container.data(), container.size())) {
-      if (error_out) *error_out = "Failed to write vault container file: " + vault_file.string();
+    fs::path tmp_file = fs::path(base_dir_) / (key_identifier + ".tmp." + std::to_string(std::chrono::high_resolution_clock::now().time_since_epoch().count()));
+    if (!tooling::WriteSecretFile(tmp_file.string(), container.data(), container.size())) {
+      if (error_out) *error_out = "Failed to write temporary vault container file: " + tmp_file.string();
+      return false;
+    }
+
+    std::error_code ec;
+    fs::rename(tmp_file, vault_file, ec);
+    if (ec) {
+      fs::remove(tmp_file, ec);
+      if (error_out) *error_out = "Failed to atomically rename vault container file: " + ec.message();
       return false;
     }
 
@@ -227,15 +255,19 @@ class WindowsDpapiVaultProvider : public IServerSecretProvider {
   bool DeleteSigningKeyPair(
       const std::string& key_identifier,
       std::string* error_out) override {
+    if (!IsValidKeyIdentifier(key_identifier)) {
+      if (error_out) *error_out = "Invalid key identifier (must be 1-64 alphanumeric, '_' or '-'): " + key_identifier;
+      return false;
+    }
     fs::path vault_file = fs::path(base_dir_) / (key_identifier + ".vault");
-    (void)error_out;
     std::error_code ec;
-    if (fs::exists(vault_file)) {
-      fs::remove(vault_file, ec);
-      if (ec) {
-        if (error_out) *error_out = "Failed to remove vault file: " + ec.message();
-        return false;
-      }
+    if (!fs::exists(vault_file, ec)) {
+      if (error_out) *error_out = "Vault key file does not exist: " + vault_file.string();
+      return false;
+    }
+    if (!fs::remove(vault_file, ec) || ec) {
+      if (error_out) *error_out = "Failed to remove vault file: " + ec.message();
+      return false;
     }
     return true;
   }
@@ -405,25 +437,48 @@ class GuardedFileSecretProvider : public IServerSecretProvider {
       return false;
     }
     fs::path priv_path(key_identifier);
-    if (!tooling::WriteSecretFile(priv_path.string(), key_pair.private_key.data(), key_pair.private_key.size())) {
-      if (error_out) *error_out = "Failed to write guarded private key: " + priv_path.string();
-      return false;
-    }
     std::string pub_path = priv_path.string();
     if (pub_path.size() >= 5 && pub_path.substr(pub_path.size() - 5) == ".priv") {
       pub_path = pub_path.substr(0, pub_path.size() - 5) + ".pub";
     } else {
       pub_path += ".pub";
     }
-    if (!tooling::WriteFile(pub_path, key_pair.public_key.data(), key_pair.public_key.size())) {
-      if (error_out) *error_out = "Failed to write public key: " + pub_path;
+
+    std::string priv_tmp = priv_path.string() + ".tmp";
+    std::string pub_tmp = pub_path + ".tmp";
+
+    if (!tooling::WriteSecretFile(priv_tmp, key_pair.private_key.data(), key_pair.private_key.size())) {
+      if (error_out) *error_out = "Failed to write guarded private key: " + priv_tmp;
       return false;
     }
+
+    if (!tooling::WriteFile(pub_tmp, key_pair.public_key.data(), key_pair.public_key.size())) {
+      std::error_code ec;
+      fs::remove(priv_tmp, ec);
+      if (error_out) *error_out = "Failed to write public key: " + pub_tmp;
+      return false;
+    }
+
+    std::error_code ec;
+    fs::rename(priv_tmp, priv_path, ec);
+    if (ec) {
+      fs::remove(priv_tmp, ec);
+      fs::remove(pub_tmp, ec);
+      if (error_out) *error_out = "Failed to atomically rename private key: " + ec.message();
+      return false;
+    }
+
+    fs::rename(pub_tmp, pub_path, ec);
+    if (ec) {
+      fs::remove(pub_tmp, ec);
+      if (error_out) *error_out = "Failed to atomically rename public key: " + ec.message();
+      return false;
+    }
+
     return true;
   }
 
   bool DeleteSigningKeyPair(const std::string& key_identifier, std::string* error_out) override {
-    (void)error_out;
     fs::path priv_path(key_identifier);
     std::string pub_path = priv_path.string();
     if (pub_path.size() >= 5 && pub_path.substr(pub_path.size() - 5) == ".priv") {
@@ -432,8 +487,18 @@ class GuardedFileSecretProvider : public IServerSecretProvider {
       pub_path += ".pub";
     }
     std::error_code ec;
-    fs::remove(priv_path, ec);
-    fs::remove(pub_path, ec);
+    bool priv_exists = fs::exists(priv_path, ec);
+    bool pub_exists = fs::exists(pub_path, ec);
+    if (!priv_exists && !pub_exists) {
+      if (error_out) *error_out = "Key files do not exist: " + priv_path.string();
+      return false;
+    }
+    bool priv_del = !priv_exists || fs::remove(priv_path, ec);
+    bool pub_del = !pub_exists || fs::remove(pub_path, ec);
+    if (!priv_del || !pub_del) {
+      if (error_out) *error_out = "Failed to delete key files: " + ec.message();
+      return false;
+    }
     return true;
   }
 };
@@ -451,7 +516,7 @@ const char* ToString(SecretProviderType type) {
 
 std::optional<SecretProviderType> ParseSecretProviderType(const std::string& str) {
   if (str == "dpapi" || str == "cng" || str == "windows") return SecretProviderType::kWindowsDpapiVault;
-  if (str == "env" || str == "environment" || str == "cloud") return SecretProviderType::kEnvironmentVault;
+  if (str == "env" || str == "environment") return SecretProviderType::kEnvironmentVault;
   if (str == "file" || str == "disk") return SecretProviderType::kGuardedFile;
   return std::nullopt;
 }

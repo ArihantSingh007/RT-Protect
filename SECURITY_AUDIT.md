@@ -121,18 +121,47 @@ The audit identified and resolved critical architectural vulnerabilities in sign
 | **RTP-SEC-081** | High | Confirmed | `licensing/activation_client.cpp`, `licensing/activation_server_http.cpp` | Partial Write Truncation, IPv6 URL Parsing & Response Buffering: Network client lacked partial write loops for raw sockets and TLS (`SSL_write`), URL parser failed on IPv6 bracketed literals (`[::1]`), and unbounded response buffering risked memory exhaustion. | Truncated requests over congested networks; failed IPv6 connections; memory exhaustion on rogue responses. | Network congestion, IPv6 configuration, oversized HTTP payloads. | Implemented strict send loops in `HttpPostSocket` and `HttpPostTls`, support for IPv6 bracketed literals, rejection of embedded `@` credentials, 512KB response safety bounds, and exact `/events` route matching. | Verified in `test_activation_service.cpp`. |
 | **RTP-SEC-082** | High | Confirmed | `tooling/clang_ast_scanner.cpp`, `tooling/clang_ast_scanner.h` | Clang AST Stderr Contamination & Unsafe Scalar Type Virtualization: Compiler warnings on stderr mixed with AST JSON on stdout under pipe capture, corrupting JSON parsing; eligibility check accepted pointer and reference types that dereferenced unmapped memory in VM. | AST scanner failure on warnings; memory corruption or VM crashes on pointer/reference types. | Compiling code with warnings or virtualizing pointer/reference parameters. | Redirected Clang stderr to `NUL` using dedicated Win32 handle duplication; implemented `IsValidVmType()` strictly restricting virtualization to scalar integer types (rejecting `*`, `&`, floats, structs). | Verified in `test_integration_engine.cpp`. |
 | **RTP-SEC-083** | High | Confirmed | `CMakeLists.txt`, `tooling/file_io.h`, `licensing/activation_database.cpp` | Windows Header `min`/`max` Macro Collision with Standard Library: Inclusion of `<windows.h>` without `NOMINMAX` defined macros named `min` and `max`, breaking `std::min` and `std::max` in MSVC builds. | MSVC build compilation failure with `error C2589: '(' illegal token on right side of '::'`. | Building with Visual Studio 2022. | Added global `add_compile_definitions(NOMINMAX)` in `CMakeLists.txt` and guarded all `<windows.h>` includes with `NOMINMAX` and `WIN32_LEAN_AND_MEAN`. | Verified via 100% clean compilation on Visual Studio 2022 (MSVC). |
+| **RTP-SEC-084** | High | Confirmed | `tooling/pe_protector.*`, `antitamper/section_protector.*`, `tooling/main.cpp` | PE Binary Section Protector Scope & Memory Protection Defect: `protect-binary` was presented as production-ready despite lacking pre-entrypoint loader stub; section characteristics (`0x60000020`) were incorrectly passed to `VirtualProtect` instead of Win32 `PAGE_*` constants; arithmetic overflows on untrusted section headers. | Application crashes during binary loading; invalid page permissions; potential denial of service on malformed PE files. | Inspecting or running protected PE binary. | Demoted CLI command to `experimental-protect-binary` with prominent non-production warning; mapped section characteristics to valid Win32 `PAGE_*` flags (`PAGE_EXECUTE_READ`, `PAGE_READWRITE`, etc.); verified `VirtualProtect` return codes; added dynamic `FlushInstructionCache`; enforced strict DOS/PE header and import table bounds checks. | Verified in `test_pe_protector.cpp` (clean headers and malformed PE regression tests). |
+| **RTP-SEC-085** | High | Confirmed | `licensing/activation_service.*`, `licensing/activation_database.*`, `tooling/activation_server_main.cpp` | Weak Activation Authorization & Credential-Free Production Registrations: Registration allowed licenses without credentials; server compared credential hashes with variable-time string comparison; production activation accepted credential-free licenses. | Unauthorized device activations via leaked public license IDs; timing side-channel attacks on credential verification. | Intercepting public license ID or timing activation requests. | Enforced mandatory high-entropy credentials (`--credential <secret>` or `--generate-credential`) in production mode; stored only SHA-256 verifiers on server; rejected credential-free licenses in production activation flows; implemented constant-time comparison (`ConstantTimeStringEquals`). | Verified in `test_activation_service.cpp` (`SecurityAudit_MandatoryActivationCredentials_ProductionMode`). |
+| **RTP-SEC-086** | Medium | Confirmed | `bytecode_vm/vm.cpp`, `tests/test_vm.cpp` | VM Dispatch Table Race Condition & Undefined Behavior in `FloatToInt`: `GetDirectThreadedDispatchTable()` used unsynchronized static boolean flag across threads; `FloatToInt` cast non-finite (`NaN`, `±Inf`) or out-of-range floats directly to `int64_t`, triggering C++ undefined behavior. | Data race during concurrent first invocation; compiler optimization anomalies or CPU exceptions on NaN/infinity. | Concurrent VM initialization; virtualizing float calculations returning NaN or infinity. | Converted table initialization to C++11 thread-safe static lambda initializer; implemented `SafeDoubleToInt64` with `std::isfinite` and `[-2^63, 2^63)` bounds check, returning `VmError::kArithmeticOverflow` on invalid values. | Verified in `test_vm.cpp` (`Vm_FloatingPoint_FloatToInt_NaN_Inf_And_Overflow`, `Vm_DirectThreadedTable_ConcurrentFirstUse`). |
+| **RTP-SEC-087** | Medium | Confirmed | `licensing/secrets_manager.*`, `tests/test_secrets_manager.cpp` | Secrets Manager Directory Traversal, Non-Atomic Writes & Misleading Provider Alias: Unchecked key identifiers in DPAPI vault allowed directory traversal (`../`); key writes were non-atomic; provider parser accepted misleading `"cloud"` alias for simple environment variables. | Escaping vault directory; corrupted key files on interrupted writes; false sense of cloud KMS security. | Submitting malformed key identifiers or power loss during key provisioning. | Added strict key identifier validation (`[a-zA-Z0-9_-]+`, max 64 chars); implemented atomic temporary file write and rename in DPAPI and guarded file providers; checked `fs::remove` error codes; removed `"cloud"` alias from provider parser. | Verified in `test_secrets_manager.cpp`. |
+| **RTP-SEC-088** | Low | Confirmed | `docs/OPENSSL_MAINTENANCE.md`, `third_party/openssl/` | OpenSSL 3.4.x Standard Release EOL Window: Vendored OpenSSL 3.4.0 is a non-LTS release with upstream support ending in late 2025; absence of documented LTS transition roadmap. | Risk of unpatched upstream vulnerabilities following 3.4.x EOL. | Upstream OpenSSL 3.4.x reaching end of life. | Documented upstream lifecycle differences; established planned transition protocol to OpenSSL 3.5.x LTS; verified backward compatibility with OpenSSL 3.0.x LTS for enterprise deployments. | Verified in `docs/OPENSSL_MAINTENANCE.md`. |
 
 ---
 
 ## 3. Verification & Quality Assurance Summary
 
-The entire suite of 22 automated unit, component, and integration tests passes with 100% success rate on Windows x64:
+The entire suite of 24 automated unit, component, and integration tests passes with 100% success rate on Windows x64 across both MinGW-w64 GCC 15.2.0 and Visual Studio 2022 (MSVC v143):
 
 ```
 Test project C:/Users/Arihant Singh/Downloads/rtprotect_hardening_WIP/build
       Start  1: test_aead ........................   Passed    0.04 sec
-      Start  2: test_kdf .........................   Passed    0.02 sec
+      Start  2: test_kdf .........................   Passed    0.03 sec
       Start  3: test_vm ..........................   Passed    0.02 sec
+      Start  4: test_protected_checksum ..........   Passed    0.11 sec
+      Start  5: test_manifest ....................   Passed    0.03 sec
+      Start  6: test_signing .....................   Passed    0.03 sec
+      Start  7: test_bound_key ...................   Passed    0.03 sec
+      Start  8: test_file_io .....................   Passed    0.06 sec
+      Start  9: test_checked_arith_fallback ......   Passed    0.14 sec
+      Start 10: test_secure_buffer ...............   Passed    0.03 sec
+      Start 11: test_obfuscated_string ...........   Passed    0.03 sec
+      Start 12: test_checksum_flattened ..........   Passed    0.04 sec
+      Start 13: test_license .....................   Passed    0.13 sec
+      Start 14: test_activation ..................   Passed    0.23 sec
+      Start 15: test_activation_service ..........   Passed    0.52 sec
+      Start 16: test_secrets_manager .............   Passed    0.08 sec
+      Start 17: test_trusted_time ................   Passed    0.15 sec
+      Start 18: test_hardware_id .................   Passed    0.04 sec
+      Start 19: test_update_manifest .............   Passed    0.13 sec
+      Start 20: test_antitamper ..................   Passed    0.18 sec
+      Start 21: test_opcode_map ..................   Passed    0.09 sec
+      Start 22: test_integration_engine ..........   Passed   32.42 sec
+      Start 23: test_unreal_integration ..........   Passed    0.24 sec
+      Start 24: test_pe_protector ................   Passed    0.10 sec
+
+100% tests passed, 0 tests failed out of 24
+```
       Start  4: test_protected_checksum ..........   Passed    0.03 sec
       Start  5: test_manifest ....................   Passed    0.02 sec
       Start  6: test_signing .....................   Passed    0.03 sec

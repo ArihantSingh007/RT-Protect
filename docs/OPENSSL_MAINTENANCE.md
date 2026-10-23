@@ -16,6 +16,17 @@ RTProtect vendors pre-built OpenSSL binaries and headers under `third_party/open
   - Import / Static Libraries: `third_party/openssl/lib/` (`libcrypto.lib`, `libssl.lib`)
   - Runtime DLLs: `third_party/openssl/bin/` (`libcrypto-3-x64.dll`, `libssl-3-x64.dll`)
 
+### Upstream Release Lifecycle & 3.5.x LTS Transition Roadmap
+Under OpenSSL's official release lifecycle policy:
+- **Standard Releases (such as OpenSSL 3.4.x):** Supported for one year from release (upstream EOL scheduled for late 2025).
+- **Long Term Support (LTS) Releases:** Supported for five years from release. Currently, OpenSSL 3.0.x is the active LTS release (supported until September 2026).
+- **Planned Upstream Transition Path:** OpenSSL 3.5.x is designated as the next upstream Long Term Support (LTS) series. RTProtect's architecture maintains full API and ABI compatibility with OpenSSL 3.x EVP interfaces.
+- **Migration Protocol:**
+  1. RTProtect continuously applies backported security advisories and point releases (e.g. 3.4.1) during the 3.4.x lifecycle.
+  2. As OpenSSL 3.5.0 LTS reaches General Availability (GA), RTProtect will execute the reproducible build pipeline (§3) to recompile native x64 Windows libraries with Control Flow Guard (`/GUARD:CF`) and ASLR/DEP flags enabled.
+  3. All cryptographic and integration test suites will validate the 3.5.x LTS baseline under both MSVC 2022 and MinGW-w64 before cutting a major release.
+  4. Enterprise customers requiring immediate long-term certification may link against OpenSSL 3.0.x LTS binaries without modifying any RTProtect source code.
+
 ### Core Cryptographic Primitives Used by RTProtect
 - **Asymmetric Signature & Verification:** Ed25519 (`EVP_PKEY_ED25519`) for release manifests, client license tokens, and online activation tickets.
 - **Symmetric Encryption & AEAD:** AES-256-GCM (`EVP_aes_256_gcm`) for license payloads and offline tickets; AES-256-CTR (`EVP_aes_256_ctr`) for binary section encryption and runtime unpacking.

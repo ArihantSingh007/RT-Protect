@@ -1,5 +1,7 @@
 #include "bytecode_vm/vm.h"
 
+#include <array>
+#include <cmath>
 #include <cstring>
 #include <memory>
 #include "bytecode_vm/checked_arith.h"
@@ -42,6 +44,19 @@ inline double BitsToDouble(std::uint64_t bits) {
   double d = 0.0;
   std::memcpy(&d, &bits, sizeof(d));
   return d;
+}
+
+inline bool SafeDoubleToInt64(double d, std::int64_t* out) {
+  if (!std::isfinite(d)) {
+    return false;
+  }
+  constexpr double kMinInt64 = -9223372036854775808.0;
+  constexpr double kMaxInt64PlusOne = 9223372036854775808.0;
+  if (d < kMinInt64 || d >= kMaxInt64PlusOne) {
+    return false;
+  }
+  *out = static_cast<std::int64_t>(d);
+  return true;
 }
 
 }  // namespace
@@ -604,7 +619,13 @@ RunResult Run(const Program& program,
           return result;
         }
         double da = BitsToDouble(static_cast<std::uint64_t>(a));
-        if (!push(static_cast<std::int64_t>(da))) {
+        std::int64_t converted = 0;
+        if (!SafeDoubleToInt64(da, &converted)) {
+          result.error = VmError::kArithmeticOverflow;
+          result.instructions_executed = executed;
+          return result;
+        }
+        if (!push(converted)) {
           result.error = VmError::kStackOverflow;
           result.instructions_executed = executed;
           return result;
@@ -1033,7 +1054,13 @@ RunResult RunRegisterThreaded(const Program& program,
       case Opcode::kFloatToInt: {
         if (!reg_pop(&a)) { result.error = VmError::kStackUnderflow; result.instructions_executed = executed; return result; }
         double da = BitsToDouble(static_cast<std::uint64_t>(a));
-        if (!reg_push(static_cast<std::int64_t>(da))) { result.error = VmError::kStackOverflow; result.instructions_executed = executed; return result; }
+        std::int64_t converted = 0;
+        if (!SafeDoubleToInt64(da, &converted)) {
+          result.error = VmError::kArithmeticOverflow;
+          result.instructions_executed = executed;
+          return result;
+        }
+        if (!reg_push(converted)) { result.error = VmError::kStackOverflow; result.instructions_executed = executed; return result; }
         break;
       }
     }
@@ -1381,54 +1408,55 @@ VmError H_FloatToInt(TableContext& ctx, const std::uint8_t*, std::size_t&) {
   std::int64_t a = 0;
   if (!ctx.pop(&a)) return VmError::kStackUnderflow;
   double da = BitsToDouble(static_cast<std::uint64_t>(a));
-  if (!ctx.push(static_cast<std::int64_t>(da))) return VmError::kStackOverflow;
+  std::int64_t converted = 0;
+  if (!SafeDoubleToInt64(da, &converted)) return VmError::kArithmeticOverflow;
+  if (!ctx.push(converted)) return VmError::kStackOverflow;
   return VmError::kNone;
 }
 
 const TableOpcodeHandler* GetDirectThreadedDispatchTable() {
-  static TableOpcodeHandler table[256] = {nullptr};
-  static bool initialized = false;
-  if (!initialized) {
-    table[static_cast<std::uint8_t>(Opcode::kPushConst)] = H_PushConst;
-    table[static_cast<std::uint8_t>(Opcode::kPushLocal)] = H_PushLocal;
-    table[static_cast<std::uint8_t>(Opcode::kStoreLocal)] = H_StoreLocal;
-    table[static_cast<std::uint8_t>(Opcode::kDup)] = H_Dup;
-    table[static_cast<std::uint8_t>(Opcode::kPop)] = H_Pop;
-    table[static_cast<std::uint8_t>(Opcode::kAdd)] = H_Add;
-    table[static_cast<std::uint8_t>(Opcode::kSub)] = H_Sub;
-    table[static_cast<std::uint8_t>(Opcode::kMul)] = H_Mul;
-    table[static_cast<std::uint8_t>(Opcode::kDiv)] = H_Div;
-    table[static_cast<std::uint8_t>(Opcode::kMod)] = H_Mod;
-    table[static_cast<std::uint8_t>(Opcode::kAnd)] = H_And;
-    table[static_cast<std::uint8_t>(Opcode::kOr)] = H_Or;
-    table[static_cast<std::uint8_t>(Opcode::kXor)] = H_Xor;
-    table[static_cast<std::uint8_t>(Opcode::kNot)] = H_Not;
-    table[static_cast<std::uint8_t>(Opcode::kCmpEq)] = H_CmpEq;
-    table[static_cast<std::uint8_t>(Opcode::kCmpLt)] = H_CmpLt;
-    table[static_cast<std::uint8_t>(Opcode::kCmpGt)] = H_CmpGt;
-    table[static_cast<std::uint8_t>(Opcode::kJmp)] = H_Jmp;
-    table[static_cast<std::uint8_t>(Opcode::kJz)] = H_Jz;
-    table[static_cast<std::uint8_t>(Opcode::kJnz)] = H_Jnz;
-    table[static_cast<std::uint8_t>(Opcode::kRet)] = H_Ret;
-    table[static_cast<std::uint8_t>(Opcode::kLoadMem8)] = H_LoadMem8;
-    table[static_cast<std::uint8_t>(Opcode::kStoreMem8)] = H_StoreMem8;
-    table[static_cast<std::uint8_t>(Opcode::kLoadMem64)] = H_LoadMem64;
-    table[static_cast<std::uint8_t>(Opcode::kStoreMem64)] = H_StoreMem64;
-    table[static_cast<std::uint8_t>(Opcode::kCall)] = H_Call;
-    table[static_cast<std::uint8_t>(Opcode::kRetSub)] = H_RetSub;
-    table[static_cast<std::uint8_t>(Opcode::kCallProgram)] = H_CallProgram;
-    table[static_cast<std::uint8_t>(Opcode::kFAdd)] = H_FAdd;
-    table[static_cast<std::uint8_t>(Opcode::kFSub)] = H_FSub;
-    table[static_cast<std::uint8_t>(Opcode::kFMul)] = H_FMul;
-    table[static_cast<std::uint8_t>(Opcode::kFDiv)] = H_FDiv;
-    table[static_cast<std::uint8_t>(Opcode::kFCmpEq)] = H_FCmpEq;
-    table[static_cast<std::uint8_t>(Opcode::kFCmpLt)] = H_FCmpLt;
-    table[static_cast<std::uint8_t>(Opcode::kFCmpGt)] = H_FCmpGt;
-    table[static_cast<std::uint8_t>(Opcode::kIntToFloat)] = H_IntToFloat;
-    table[static_cast<std::uint8_t>(Opcode::kFloatToInt)] = H_FloatToInt;
-    initialized = true;
-  }
-  return table;
+  static const auto table = []() {
+    std::array<TableOpcodeHandler, 256> t{};
+    t[static_cast<std::uint8_t>(Opcode::kPushConst)] = H_PushConst;
+    t[static_cast<std::uint8_t>(Opcode::kPushLocal)] = H_PushLocal;
+    t[static_cast<std::uint8_t>(Opcode::kStoreLocal)] = H_StoreLocal;
+    t[static_cast<std::uint8_t>(Opcode::kDup)] = H_Dup;
+    t[static_cast<std::uint8_t>(Opcode::kPop)] = H_Pop;
+    t[static_cast<std::uint8_t>(Opcode::kAdd)] = H_Add;
+    t[static_cast<std::uint8_t>(Opcode::kSub)] = H_Sub;
+    t[static_cast<std::uint8_t>(Opcode::kMul)] = H_Mul;
+    t[static_cast<std::uint8_t>(Opcode::kDiv)] = H_Div;
+    t[static_cast<std::uint8_t>(Opcode::kMod)] = H_Mod;
+    t[static_cast<std::uint8_t>(Opcode::kAnd)] = H_And;
+    t[static_cast<std::uint8_t>(Opcode::kOr)] = H_Or;
+    t[static_cast<std::uint8_t>(Opcode::kXor)] = H_Xor;
+    t[static_cast<std::uint8_t>(Opcode::kNot)] = H_Not;
+    t[static_cast<std::uint8_t>(Opcode::kCmpEq)] = H_CmpEq;
+    t[static_cast<std::uint8_t>(Opcode::kCmpLt)] = H_CmpLt;
+    t[static_cast<std::uint8_t>(Opcode::kCmpGt)] = H_CmpGt;
+    t[static_cast<std::uint8_t>(Opcode::kJmp)] = H_Jmp;
+    t[static_cast<std::uint8_t>(Opcode::kJz)] = H_Jz;
+    t[static_cast<std::uint8_t>(Opcode::kJnz)] = H_Jnz;
+    t[static_cast<std::uint8_t>(Opcode::kRet)] = H_Ret;
+    t[static_cast<std::uint8_t>(Opcode::kLoadMem8)] = H_LoadMem8;
+    t[static_cast<std::uint8_t>(Opcode::kStoreMem8)] = H_StoreMem8;
+    t[static_cast<std::uint8_t>(Opcode::kLoadMem64)] = H_LoadMem64;
+    t[static_cast<std::uint8_t>(Opcode::kStoreMem64)] = H_StoreMem64;
+    t[static_cast<std::uint8_t>(Opcode::kCall)] = H_Call;
+    t[static_cast<std::uint8_t>(Opcode::kRetSub)] = H_RetSub;
+    t[static_cast<std::uint8_t>(Opcode::kCallProgram)] = H_CallProgram;
+    t[static_cast<std::uint8_t>(Opcode::kFAdd)] = H_FAdd;
+    t[static_cast<std::uint8_t>(Opcode::kFSub)] = H_FSub;
+    t[static_cast<std::uint8_t>(Opcode::kFMul)] = H_FMul;
+    t[static_cast<std::uint8_t>(Opcode::kFDiv)] = H_FDiv;
+    t[static_cast<std::uint8_t>(Opcode::kFCmpEq)] = H_FCmpEq;
+    t[static_cast<std::uint8_t>(Opcode::kFCmpLt)] = H_FCmpLt;
+    t[static_cast<std::uint8_t>(Opcode::kFCmpGt)] = H_FCmpGt;
+    t[static_cast<std::uint8_t>(Opcode::kIntToFloat)] = H_IntToFloat;
+    t[static_cast<std::uint8_t>(Opcode::kFloatToInt)] = H_FloatToInt;
+    return t;
+  }();
+  return table.data();
 }
 
 }  // namespace

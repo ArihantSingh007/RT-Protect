@@ -167,8 +167,10 @@ void PrintUsage() {
       "    rtprotect-tool validate-build <project-dir> <pub-key-file> <manifest-file> <sig-file>\n"
       "      Validates integrity of protected build outputs against signed manifest.\n"
       "\n"
-      "    rtprotect-tool protect-binary <input.exe> <output.exe> [options]\n"
-      "      Applies post-build PE section encryption (.text) and IAT import obfuscation.\n"
+      "  Experimental / Research Operations (Non-Production):\n"
+      "    rtprotect-tool experimental-protect-binary <input.exe> <output.exe> [options]\n"
+      "      [EXPERIMENTAL - NOT FOR PRODUCTION USE]\n"
+      "      Prototype for PE code section encryption (.text) and IAT import obfuscation.\n"
       "      --section <name>                  Target PE section to encrypt (default: .text)\n"
       "      --no-encrypt                      Disable section encryption\n"
       "      --no-import-obfuscation           Disable IAT import table obfuscation\n"
@@ -1126,8 +1128,13 @@ int CmdActivateRevoke(int argc, char** argv) {
 }
 
 int CmdProtectBinary(int argc, char** argv) {
+  std::fprintf(stderr,
+      "[WARNING] 'experimental-protect-binary' is an EXPERIMENTAL research prototype and NOT production-ready.\n"
+      "[WARNING] Transformed executables require an experimental runtime bootstrap and will\n"
+      "[WARNING] fail standard Windows loader execution. Do not use in production releases.\n\n");
+
   if (argc < 4) {
-    std::fprintf(stderr, "Usage: rtprotect-tool protect-binary <input.exe> <output.exe> [options]\n\n"
+    std::fprintf(stderr, "Usage: rtprotect-tool experimental-protect-binary <input.exe> <output.exe> [options]\n\n"
                          "Options:\n"
                          "  --section <name>           Target PE section to encrypt (default: .text)\n"
                          "  --no-encrypt               Disable section encryption\n"
@@ -1196,7 +1203,7 @@ int main(int argc, char** argv) {
   if (cmd == "sign-release") return CmdSignRelease(argc, argv);
   if (cmd == "rollback") return CmdRollback(argc, argv);
   if (cmd == "validate-build") return CmdValidateBuild(argc, argv);
-  if (cmd == "protect-binary") return CmdProtectBinary(argc, argv);
+  if (cmd == "experimental-protect-binary" || cmd == "protect-binary") return CmdProtectBinary(argc, argv);
 
   // Licensing & HWID commands
   if (cmd == "license-generate") return CmdLicenseGenerate(argc, argv);

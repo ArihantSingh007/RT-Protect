@@ -42,6 +42,15 @@ bool HexToBytes(const std::string& hex, std::uint8_t* out, std::size_t expected_
   return true;
 }
 
+bool ConstantTimeStringEquals(const std::string& a, const std::string& b) {
+  if (a.size() != b.size()) return false;
+  unsigned char result = 0;
+  for (std::size_t i = 0; i < a.size(); ++i) {
+    result |= static_cast<unsigned char>(a[i] ^ b[i]);
+  }
+  return result == 0;
+}
+
 std::string EscapeJsonString(const std::string& input) {
   std::string out;
   out.reserve(input.size() + 8);
@@ -154,8 +163,21 @@ ActivateResponse ActivationService::ProcessActivate(const ActivateRequest& req, 
     return resp;
   }
 
-  // Validate activation credential secret if configured on license
-  if (!lic.activation_credential_hash.empty()) {
+  // Validate activation credential secret if configured on license or required by server policy
+  if (lic.activation_credential_hash.empty()) {
+    if (require_activation_credentials_) {
+      resp.status = ActivationStatus::kMalformed;
+      resp.error_message = "License record lacks mandatory activation credential verifier in production mode";
+      db_.RecordEvent({current_time, ActivationEventType::kActivationFailed, safe_license_id, req.device_fingerprint, req.client_ip, resp.error_message});
+      return resp;
+    }
+  } else {
+    if (req.activation_credential.empty()) {
+      resp.status = ActivationStatus::kMalformed;
+      resp.error_message = "Activation credential is required for this license";
+      db_.RecordEvent({current_time, ActivationEventType::kActivationFailed, safe_license_id, req.device_fingerprint, req.client_ip, resp.error_message});
+      return resp;
+    }
     auto cred_hash = integrity::Sha256(
         reinterpret_cast<const std::uint8_t*>(req.activation_credential.data()),
         req.activation_credential.size());
@@ -165,7 +187,7 @@ ActivateResponse ActivationService::ProcessActivate(const ActivateRequest& req, 
       return resp;
     }
     std::string cred_hash_hex = BytesToHex(cred_hash->data(), cred_hash->size());
-    if (cred_hash_hex != lic.activation_credential_hash) {
+    if (!ConstantTimeStringEquals(cred_hash_hex, lic.activation_credential_hash)) {
       resp.status = ActivationStatus::kLicenseMismatch;
       resp.error_message = "Invalid activation credential";
       db_.RecordEvent({current_time, ActivationEventType::kActivationFailed, safe_license_id, req.device_fingerprint, req.client_ip, resp.error_message});
