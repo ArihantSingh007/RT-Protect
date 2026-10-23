@@ -77,7 +77,8 @@ struct RunResult {
 // whatever embeds this VM. kMaxExecutedInstructions is generous for the
 enum class VmEngineFlavor {
   kStackBased = 0,
-  kRegisterThreaded = 1
+  kRegisterThreaded = 1,
+  kDirectThreadedTable = 2
 };
 
 class OpcodeMap;
@@ -94,5 +95,11 @@ RunResult RunRegisterThreaded(const Program& program,
                               const OpcodeMap* opcode_map = nullptr,
                               MemoryContext* mem_ctx = nullptr,
                               std::size_t recursion_depth = 0);
+
+RunResult RunDirectThreadedTable(const Program& program,
+                                 const std::vector<std::int64_t>& args,
+                                 const OpcodeMap* opcode_map = nullptr,
+                                 MemoryContext* mem_ctx = nullptr,
+                                 std::size_t recursion_depth = 0);
 
 }  // namespace rtprotect::vm

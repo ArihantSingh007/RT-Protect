@@ -371,7 +371,8 @@ bool IsValidVmType(const std::string& type_str, bool allow_void) {
       "uint8_t", "uint16_t", "uint32_t", "uint64_t",
       "std::int8_t", "std::int16_t", "std::int32_t", "std::int64_t",
       "std::uint8_t", "std::uint16_t", "std::uint32_t", "std::uint64_t",
-      "size_t", "std::size_t"
+      "size_t", "std::size_t",
+      "float", "double"
   };
 
   for (const char* prim : kExactPrimitives) {
@@ -394,14 +395,14 @@ bool ClangAstScanner::ValidateVirtualizationEligibility(const ClangFunctionDecl&
   }
 
   if (!IsValidVmType(fn.return_type, /*allow_void=*/true)) {
-    if (out_reason) *out_reason = "Unsupported return type for bytecode VM (pointers, references, floats, structs are prohibited): " + fn.return_type;
+    if (out_reason) *out_reason = "Unsupported return type for bytecode VM (pointers, references, structs are prohibited): " + fn.return_type;
     return false;
   }
 
   for (std::size_t i = 0; i < fn.param_types.size(); ++i) {
     const auto& pt = fn.param_types[i];
     if (!IsValidVmType(pt, /*allow_void=*/false)) {
-      if (out_reason) *out_reason = "Unsupported parameter " + std::to_string(i + 1) + " type for bytecode VM (must be primitive integer/bool): " + pt;
+      if (out_reason) *out_reason = "Unsupported parameter " + std::to_string(i + 1) + " type for bytecode VM (must be primitive scalar/float): " + pt;
       return false;
     }
   }

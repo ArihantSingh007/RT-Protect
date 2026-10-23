@@ -892,4 +892,137 @@ MT_TEST(Vm_CrossProgramCall_RegistryLifetimeSafety) {
   MT_CHECK(r.value == 15);
 }
 
+// ---------------------------------------------------------------------
+// Floating point opcodes & 3-way VM engine equivalence
+// ---------------------------------------------------------------------
+
+MT_TEST(Vm_FloatingPoint_BasicArithmeticAllEngines) {
+  ProgramBuilder b(0);
+  b.PushFloat(10.5);
+  b.PushFloat(4.5);
+  b.FAdd();       // 15.0
+  b.PushFloat(2.0);
+  b.FMul();       // 30.0
+  b.PushFloat(5.0);
+  b.FDiv();       // 6.0
+  b.PushFloat(1.5);
+  b.FSub();       // 4.5
+  b.Ret();
+  auto p = b.Build();
+
+  double expected = 4.5;
+  std::uint64_t expected_bits = 0;
+  std::memcpy(&expected_bits, &expected, sizeof(expected_bits));
+
+  // Run across all 3 VM engine flavors
+  auto r_stack = Run(p, {}, nullptr, nullptr, VmEngineFlavor::kStackBased);
+  MT_CHECK(r_stack.error == VmError::kNone);
+  MT_CHECK(static_cast<std::uint64_t>(r_stack.value) == expected_bits);
+
+  auto r_reg = Run(p, {}, nullptr, nullptr, VmEngineFlavor::kRegisterThreaded);
+  MT_CHECK(r_reg.error == VmError::kNone);
+  MT_CHECK(static_cast<std::uint64_t>(r_reg.value) == expected_bits);
+
+  auto r_table = Run(p, {}, nullptr, nullptr, VmEngineFlavor::kDirectThreadedTable);
+  MT_CHECK(r_table.error == VmError::kNone);
+  MT_CHECK(static_cast<std::uint64_t>(r_table.value) == expected_bits);
+}
+
+MT_TEST(Vm_FloatingPoint_ComparisonsAndConversions) {
+  // Test FCmpLt, FCmpGt, FCmpEq, IntToFloat, FloatToInt
+  ProgramBuilder b(0);
+  b.PushConst(42);
+  b.IntToFloat();     // 42.0 (as float bits)
+  b.PushFloat(40.0);
+  b.FCmpGt();         // 1
+  b.Ret();
+  auto p = b.Build();
+
+  auto r_stack = Run(p, {}, nullptr, nullptr, VmEngineFlavor::kStackBased);
+  MT_CHECK(r_stack.error == VmError::kNone);
+  MT_CHECK(r_stack.value == 1);
+
+  auto r_reg = Run(p, {}, nullptr, nullptr, VmEngineFlavor::kRegisterThreaded);
+  MT_CHECK(r_reg.error == VmError::kNone);
+  MT_CHECK(r_reg.value == 1);
+
+  auto r_table = Run(p, {}, nullptr, nullptr, VmEngineFlavor::kDirectThreadedTable);
+  MT_CHECK(r_table.error == VmError::kNone);
+  MT_CHECK(r_table.value == 1);
+
+  // FloatToInt
+  ProgramBuilder b2(0);
+  b2.PushFloat(99.7);
+  b2.FloatToInt();    // 99
+  b2.Ret();
+  auto p2 = b2.Build();
+
+  auto r2_stack = Run(p2, {}, nullptr, nullptr, VmEngineFlavor::kStackBased);
+  MT_CHECK(r2_stack.error == VmError::kNone);
+  MT_CHECK(r2_stack.value == 99);
+
+  auto r2_table = Run(p2, {}, nullptr, nullptr, VmEngineFlavor::kDirectThreadedTable);
+  MT_CHECK(r2_table.error == VmError::kNone);
+  MT_CHECK(r2_table.value == 99);
+}
+
+MT_TEST(Vm_FloatingPoint_DivisionByZero) {
+  ProgramBuilder b(0);
+  b.PushFloat(10.0);
+  b.PushFloat(0.0);
+  b.FDiv();
+  b.Ret();
+  auto p = b.Build();
+
+  auto r_stack = Run(p, {}, nullptr, nullptr, VmEngineFlavor::kStackBased);
+  MT_CHECK(r_stack.error == VmError::kDivisionByZero);
+
+  auto r_reg = Run(p, {}, nullptr, nullptr, VmEngineFlavor::kRegisterThreaded);
+  MT_CHECK(r_reg.error == VmError::kDivisionByZero);
+
+  auto r_table = Run(p, {}, nullptr, nullptr, VmEngineFlavor::kDirectThreadedTable);
+  MT_CHECK(r_table.error == VmError::kDivisionByZero);
+}
+
+MT_TEST(Vm_DirectThreadedTable_LoopsAndCalls) {
+  // Compute sum of 1..N using a loop in DirectThreadedTable
+  ProgramBuilder b(2);
+  // local 0 = N, local 1 = sum
+  auto loop_top = b.NewLabel();
+  auto done = b.NewLabel();
+
+  b.Mark(loop_top);
+  b.PushLocal(0);
+  b.Jz(done);
+
+  b.PushLocal(1);
+  b.PushLocal(0);
+  b.Add();
+  b.StoreLocal(1);
+
+  b.PushLocal(0);
+  b.PushConst(1);
+  b.Sub();
+  b.StoreLocal(0);
+  b.Jmp(loop_top);
+
+  b.Mark(done);
+  b.PushLocal(1);
+  b.Ret();
+
+  auto p = b.Build();
+
+  auto r_stack = Run(p, {10, 0}, nullptr, nullptr, VmEngineFlavor::kStackBased);
+  MT_CHECK(r_stack.error == VmError::kNone);
+  MT_CHECK(r_stack.value == 55);
+
+  auto r_reg = Run(p, {10, 0}, nullptr, nullptr, VmEngineFlavor::kRegisterThreaded);
+  MT_CHECK(r_reg.error == VmError::kNone);
+  MT_CHECK(r_reg.value == 55);
+
+  auto r_table = Run(p, {10, 0}, nullptr, nullptr, VmEngineFlavor::kDirectThreadedTable);
+  MT_CHECK(r_table.error == VmError::kNone);
+  MT_CHECK(r_table.value == 55);
+}
+
 MT_MAIN()
