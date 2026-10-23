@@ -23,6 +23,7 @@
 #include "licensing/activation_database.h"
 #include "licensing/activation_server_http.h"
 #include "licensing/activation_service.h"
+#include "licensing/secrets_manager.h"
 #include "tooling/file_io.h"
 
 using namespace rtprotect;
@@ -45,10 +46,14 @@ void PrintUsage() {
             << "  --host <h>                     Listen address (default: 127.0.0.1)\n"
             << "  --db <path>                    Database file path (default: activations.db)\n"
             << "  --key <path>                   Ed25519 signing private key file (required or auto-generated)\n"
+            << "  --key-vault <type>             Vault type: 'dpapi' (default), 'env', or 'file'\n"
+            << "  --vault-id <id>                Retrieve signing key from secret store by ID\n"
+            << "  --vault-dir <path>             Custom directory path for secret vault store\n"
+            << "  --provision-vault <id> <pub>   Generate key directly into vault, export public key to <pub>, and exit\n"
             << "  --tls-cert <path>              TLS server certificate PEM file\n"
             << "  --tls-key <path>               TLS server private key PEM file\n"
             << "  --insecure-dev-only            Allow non-loopback binding without TLS and print secrets\n"
-            << "  --admin-token <token>          Shared secret token for administrative /events endpoint\n"
+            << "  --admin-token <token>          Shared secret token for administrative /events and /analytics endpoints\n"
             << "  --admin-token-file <path>      File containing administrative shared secret token\n"
             << "  --register-license <id> <prod> <seats> [vm_root_hex]\n"
             << "                                 Register a license and exit\n"
@@ -84,6 +89,11 @@ int main(int argc, char* argv[]) {
   std::string host = "127.0.0.1";
   std::string db_path = "activations.db";
   std::string key_path;
+  std::string vault_type_str;
+  std::string vault_id;
+  std::string vault_dir;
+  std::string provision_vault_id;
+  std::string provision_pubkey_path;
   std::string tls_cert_path;
   std::string tls_key_path;
   std::string admin_token;
@@ -113,6 +123,15 @@ int main(int argc, char* argv[]) {
       db_path = argv[++i];
     } else if (arg == "--key" && i + 1 < argc) {
       key_path = argv[++i];
+    } else if (arg == "--key-vault" && i + 1 < argc) {
+      vault_type_str = argv[++i];
+    } else if (arg == "--vault-id" && i + 1 < argc) {
+      vault_id = argv[++i];
+    } else if (arg == "--vault-dir" && i + 1 < argc) {
+      vault_dir = argv[++i];
+    } else if (arg == "--provision-vault" && i + 2 < argc) {
+      provision_vault_id = argv[++i];
+      provision_pubkey_path = argv[++i];
     } else if (arg == "--tls-cert" && i + 1 < argc) {
       tls_cert_path = argv[++i];
     } else if (arg == "--tls-key" && i + 1 < argc) {
@@ -180,9 +199,63 @@ int main(int argc, char* argv[]) {
     return 0;
   }
 
+  // Handle direct vault provisioning command
+  if (!provision_vault_id.empty()) {
+    SecretProviderType ptype = SecretProviderType::kWindowsDpapiVault;
+    if (!vault_type_str.empty()) {
+      auto parsed = ParseSecretProviderType(vault_type_str);
+      if (!parsed) {
+        std::cerr << "Error: Unknown secret vault type: " << vault_type_str
+                  << " (supported: 'dpapi', 'env', 'file')\n";
+        return 1;
+      }
+      ptype = *parsed;
+    }
+    auto provider = CreateSecretProvider(ptype, vault_dir);
+    if (!provider) {
+      std::cerr << "Error: Failed to initialize secret provider " << ToString(ptype) << "\n";
+      return 1;
+    }
+    integrity::Ed25519PublicKey pub{};
+    std::string err;
+    if (!ProvisionSigningKeyInVault(*provider, provision_vault_id, provision_pubkey_path, &pub, &err)) {
+      std::cerr << "Error: Failed to provision key in vault: " << err << "\n";
+      return 1;
+    }
+    std::cout << "Successfully generated and provisioned Ed25519 signing key into "
+              << provider->Name() << " under ID '" << provision_vault_id << "'.\n"
+              << "Exported public verification key to: " << provision_pubkey_path << "\n"
+              << "Public Key (hex): " << BytesToHex(pub.data(), pub.size()) << "\n";
+    return 0;
+  }
+
   // Load or generate Ed25519 signing key
   std::optional<integrity::Ed25519KeyPair> key_pair;
-  if (!key_path.empty()) {
+  if (!vault_id.empty()) {
+    SecretProviderType ptype = SecretProviderType::kWindowsDpapiVault;
+    if (!vault_type_str.empty()) {
+      auto parsed = ParseSecretProviderType(vault_type_str);
+      if (!parsed) {
+        std::cerr << "Error: Unknown secret vault type: " << vault_type_str << "\n";
+        return 1;
+      }
+      ptype = *parsed;
+    }
+    auto provider = CreateSecretProvider(ptype, vault_dir);
+    if (!provider) {
+      std::cerr << "Error: Failed to initialize secret provider " << ToString(ptype) << "\n";
+      return 1;
+    }
+    std::string err;
+    key_pair = provider->RetrieveSigningKeyPair(vault_id, &err);
+    if (!key_pair.has_value()) {
+      std::cerr << "Error: Failed to retrieve signing key '" << vault_id << "' from vault ("
+                << provider->Name() << "): " << err << "\n";
+      return 1;
+    }
+    std::cout << "Securely retrieved signing key from " << provider->Name()
+              << " (Vault ID: " << vault_id << ")\n";
+  } else if (!key_path.empty()) {
     auto kbytes = tooling::ReadFile(key_path);
     if (!kbytes.has_value() || kbytes->size() != integrity::kEd25519PrivateKeyLen) {
       std::cerr << "Error: Unable to read valid Ed25519 private key from " << key_path << "\n";
@@ -217,7 +290,8 @@ int main(int argc, char* argv[]) {
 
     key_pair = integrity::Ed25519KeyPair{std::move(*priv), pub};
   } else {
-    std::cout << "Generating ephemeral Ed25519 signing key pair for development server...\n";
+    std::cout << "Generating ephemeral Ed25519 signing key pair for development server...\n"
+              << "[NOTICE] For production deployments, specify --vault-id to load protected keys from DPAPI or Secrets Manager.\n";
     key_pair = integrity::GenerateEd25519KeyPair();
     if (!key_pair.has_value()) {
       std::cerr << "Error: Failed to generate Ed25519 key pair\n";
