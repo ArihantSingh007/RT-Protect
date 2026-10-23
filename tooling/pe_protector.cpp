@@ -95,7 +95,8 @@ bool PeProtector::IsValidPe64(const std::vector<std::uint8_t>& pe_image) {
   if (dos->e_magic != IMAGE_DOS_SIGNATURE) return false;
 
   if (dos->e_lfanew < static_cast<LONG>(sizeof(IMAGE_DOS_HEADER))) return false;
-  if (static_cast<std::size_t>(dos->e_lfanew) > pe_image.size() - sizeof(IMAGE_NT_HEADERS64)) {
+  if (pe_image.size() < sizeof(IMAGE_NT_HEADERS64) ||
+      static_cast<std::size_t>(dos->e_lfanew) > pe_image.size() - sizeof(IMAGE_NT_HEADERS64)) {
     return false;
   }
 
@@ -110,7 +111,7 @@ bool PeProtector::IsValidPe64(const std::vector<std::uint8_t>& pe_image) {
                                  offsetof(IMAGE_NT_HEADERS64, OptionalHeader) +
                                  nt->FileHeader.SizeOfOptionalHeader;
   std::size_t sec_table_size = static_cast<std::size_t>(nt->FileHeader.NumberOfSections) * sizeof(IMAGE_SECTION_HEADER);
-  if (sec_table_size > pe_image.size() || sec_table_offset > pe_image.size() - sec_table_size) {
+  if (sec_table_offset > pe_image.size() || sec_table_size > pe_image.size() - sec_table_offset) {
     return false;
   }
 
