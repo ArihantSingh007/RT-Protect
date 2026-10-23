@@ -63,9 +63,9 @@ std::optional<std::int64_t> FallbackMul(std::int64_t a, std::int64_t b) {
   return a * b;
 }
 
-// Real __builtin-based path -- what checked_arith.h actually compiles to
-// on this toolchain, i.e. the ground truth the fallback is compared
-// against.
+// Real __builtin-based path (on GCC/Clang) or independent bitwise / 128-bit
+// intrinsic verification path (on MSVC).
+#if defined(__GNUC__) || defined(__clang__)
 std::optional<std::int64_t> BuiltinAdd(std::int64_t a, std::int64_t b) {
   std::int64_t r;
   if (__builtin_add_overflow(a, b, &r)) return std::nullopt;
@@ -81,6 +81,50 @@ std::optional<std::int64_t> BuiltinMul(std::int64_t a, std::int64_t b) {
   if (__builtin_mul_overflow(a, b, &r)) return std::nullopt;
   return r;
 }
+#else
+#if defined(_MSC_VER)
+#include <intrin.h>
+#endif
+std::optional<std::int64_t> BuiltinAdd(std::int64_t a, std::int64_t b) {
+  std::uint64_t ua = static_cast<std::uint64_t>(a);
+  std::uint64_t ub = static_cast<std::uint64_t>(b);
+  std::uint64_t ur = ua + ub;
+  if (((~(ua ^ ub) & (ua ^ ur)) & 0x8000000000000000ULL) != 0) return std::nullopt;
+  return static_cast<std::int64_t>(ur);
+}
+std::optional<std::int64_t> BuiltinSub(std::int64_t a, std::int64_t b) {
+  std::uint64_t ua = static_cast<std::uint64_t>(a);
+  std::uint64_t ub = static_cast<std::uint64_t>(b);
+  std::uint64_t ur = ua - ub;
+  if ((((ua ^ ub) & (ua ^ ur)) & 0x8000000000000000ULL) != 0) return std::nullopt;
+  return static_cast<std::int64_t>(ur);
+}
+std::optional<std::int64_t> BuiltinMul(std::int64_t a, std::int64_t b) {
+#if defined(_MSC_VER) && (defined(_M_X64) || defined(_M_ARM64))
+  std::int64_t high = 0;
+  std::int64_t low = _mul128(a, b, &high);
+  if (high != (low >> 63)) return std::nullopt;
+  return low;
+#else
+  if (a == 0 || b == 0) return 0;
+  if (a > 0) {
+    if (b > 0) {
+      if (a > INT64_MAX / b) return std::nullopt;
+    } else {
+      if (b < INT64_MIN / a) return std::nullopt;
+    }
+  } else {
+    if (b > 0) {
+      if (a < INT64_MIN / b) return std::nullopt;
+    } else {
+      if (a == INT64_MIN || b == INT64_MIN) return std::nullopt;
+      if (a < INT64_MAX / b) return std::nullopt;
+    }
+  }
+  return a * b;
+#endif
+}
+#endif
 
 const std::int64_t kEdgeValues[] = {
     0, 1, -1, 2, -2, INT64_MAX, INT64_MIN, INT64_MAX - 1, INT64_MIN + 1,

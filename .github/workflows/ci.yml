@@ -30,6 +30,10 @@ jobs:
         with:
           arch: x64
 
+      - name: Add OpenSSL bin to PATH
+        shell: powershell
+        run: echo "${{ github.workspace }}/third_party/openssl/bin" >> $env:GITHUB_PATH
+
       - name: Configure CMake (Visual Studio 17 2022 x64)
         shell: powershell
         run: |
