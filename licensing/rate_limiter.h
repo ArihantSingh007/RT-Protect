@@ -6,6 +6,7 @@
 
 #pragma once
 
+#include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
@@ -21,7 +22,7 @@ class RateLimiter {
   // max_tokens: maximum bucket capacity (burst limit)
   // max_entries: maximum active tracked keys to prevent unbounded memory growth
   RateLimiter(double refill_rate_per_sec = 2.0, double max_tokens = 20.0, std::size_t max_entries = 10000)
-      : max_entries_(max_entries) {
+      : max_entries_(max_entries == 0 ? 10000 : max_entries) {
     Configure(refill_rate_per_sec, max_tokens);
   }
 
@@ -39,6 +40,11 @@ class RateLimiter {
   }
 
   bool Allow(const std::string& key, double cost = 1.0, int* retry_after_seconds = nullptr) {
+    if (!std::isfinite(cost) || cost <= 0.0) {
+      if (retry_after_seconds) *retry_after_seconds = 1;
+      return false;
+    }
+
     std::string safe_key = key.empty() ? "<anonymous>" : key;
     std::lock_guard<std::mutex> lock(mu_);
     auto now = std::chrono::steady_clock::now();
@@ -46,8 +52,15 @@ class RateLimiter {
     // Capacity bounding: prune stale buckets when reaching maximum entries limit
     if (buckets_.size() >= max_entries_ && buckets_.find(safe_key) == buckets_.end()) {
       PruneStaleLocked(now);
-      if (buckets_.size() >= max_entries_) {
-        buckets_.erase(buckets_.begin()); // Guarantee strict bounded capacity
+      if (buckets_.size() >= max_entries_ && !buckets_.empty()) {
+        // Deterministic LRU eviction: evict oldest inactive entry
+        auto oldest_it = buckets_.begin();
+        for (auto it = buckets_.begin(); it != buckets_.end(); ++it) {
+          if (it->second.last_refill < oldest_it->second.last_refill) {
+            oldest_it = it;
+          }
+        }
+        buckets_.erase(oldest_it);
       }
     }
 
@@ -57,7 +70,7 @@ class RateLimiter {
       bucket.last_refill = now;
     } else {
       double elapsed_sec = std::chrono::duration<double>(now - bucket.last_refill).count();
-      bucket.tokens = std::min(max_tokens_, bucket.tokens + elapsed_sec * refill_rate_);
+      bucket.tokens = (std::min)(max_tokens_, bucket.tokens + elapsed_sec * refill_rate_);
       bucket.last_refill = now;
     }
 
@@ -69,7 +82,7 @@ class RateLimiter {
 
     if (retry_after_seconds) {
       double needed = cost - bucket.tokens;
-      *retry_after_seconds = std::max(1, static_cast<int>(std::ceil(needed / refill_rate_)));
+      *retry_after_seconds = (std::max)(1, static_cast<int>(std::ceil(needed / refill_rate_)));
     }
     return false;
   }

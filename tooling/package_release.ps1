@@ -1,9 +1,10 @@
 # tooling/package_release.ps1
 #
-# Release packaging script for Windows x64.
-# Builds a Release configuration, runs the full test suite, verifies the CLI,
-# and packages the CLI tool, benchmark runner, headers, libraries, and docs
-# into a dated zip archive under dist/.
+# Release packaging and distribution script for Windows x64.
+# Builds a hardened Release configuration, runs the full test suite,
+# packages three distinct zip distributions (Tools, SDK, Server),
+# generates cryptographic checksums and build provenance, and executes
+# an end-to-end consumer application smoke test against the packaged SDK.
 
 param(
     [string]$BuildDir = "build-release-pkg",
@@ -13,8 +14,10 @@ param(
 
 $ErrorActionPreference = "Stop"
 
-Write-Host "== RTProtect Release Packaging (Windows x64) =="
-Write-Host "Build directory: $BuildDir"
+Write-Host "=========================================================="
+Write-Host "   RTProtect Release Packaging & Verification (Win-x64)   "
+Write-Host "=========================================================="
+Write-Host "Build Directory: $BuildDir"
 
 $RepoRoot = (Get-Item .).FullName
 if (-not $OpenSslDir) {
@@ -24,6 +27,7 @@ if (-not $OpenSslDir) {
     }
 }
 
+# 1. Configure and Build Release
 $CmakeArgs = @("-S", ".", "-B", $BuildDir, "-DCMAKE_BUILD_TYPE=Release", "-DRTPROTECT_HARDEN_RELEASE=ON")
 
 if ($VcpkgRoot) {
@@ -40,90 +44,232 @@ if ($VcpkgRoot) {
     $env:PATH = "$OpenSslDir\bin;$env:PATH"
 }
 
-Write-Host "`n-- Configuring (Release, hardening ON) --"
+Write-Host "`n-- [Step 1/6] Configuring Release Build --"
 cmake @CmakeArgs
 if ($LASTEXITCODE -ne 0) { throw "CMake configure failed" }
 
-Write-Host "`n-- Building --"
+Write-Host "`n-- [Step 2/6] Compiling All Targets --"
 cmake --build $BuildDir --config Release
-if ($LASTEXITCODE -ne 0) { throw "Build failed" }
+if ($LASTEXITCODE -ne 0) { throw "Compilation failed" }
 
-Write-Host "`n-- Running full test suite (packaging aborts on any failure) --"
+Write-Host "`n-- [Step 3/6] Running Full Test Suite (strict fail-closed) --"
 ctest --test-dir $BuildDir -C Release --output-on-failure
-if ($LASTEXITCODE -ne 0) { throw "Tests failed -- aborting packaging" }
+if ($LASTEXITCODE -ne 0) { throw "CTest regression detected -- aborting release packaging" }
 
-Write-Host "`n-- Assembling package --"
-$Version = Get-Date -Format "yyyyMMdd"
-$PkgName = "rtprotect-$Version-windows-x64"
-$PkgDir = Join-Path "dist" $PkgName
-if (Test-Path $PkgDir) { Remove-Item -Recurse -Force $PkgDir }
-New-Item -ItemType Directory -Force -Path (Join-Path $PkgDir "bin") | Out-Null
-New-Item -ItemType Directory -Force -Path (Join-Path $PkgDir "lib") | Out-Null
-New-Item -ItemType Directory -Force -Path (Join-Path $PkgDir "include") | Out-Null
-
-# Locate built binaries (Ninja vs MSVC multi-config)
-$ToolExe = Join-Path $BuildDir "tooling\rtprotect-tool.exe"
-if (-not (Test-Path $ToolExe)) {
-    $ToolExe = Join-Path $BuildDir "tooling\Release\rtprotect-tool.exe"
-}
-Copy-Item $ToolExe (Join-Path $PkgDir "bin")
-
-$BenchExe = Join-Path $BuildDir "bench\rtprotect-bench.exe"
-if (-not (Test-Path $BenchExe)) {
-    $BenchExe = Join-Path $BuildDir "bench\Release\rtprotect-bench.exe"
-}
-if (Test-Path $BenchExe) { Copy-Item $BenchExe (Join-Path $PkgDir "bin") }
-
-$ServerExe = Join-Path $BuildDir "tooling\rtprotect-activation-server.exe"
-if (-not (Test-Path $ServerExe)) {
-    $ServerExe = Join-Path $BuildDir "tooling\Release\rtprotect-activation-server.exe"
-}
-if (Test-Path $ServerExe) { Copy-Item $ServerExe (Join-Path $PkgDir "bin") }
-
-$GuiExe = Join-Path $BuildDir "tooling\rtprotect-gui.exe"
-if (-not (Test-Path $GuiExe)) {
-    $GuiExe = Join-Path $BuildDir "tooling\Release\rtprotect-gui.exe"
-}
-if (Test-Path $GuiExe) { Copy-Item $GuiExe (Join-Path $PkgDir "bin") }
-
-# Include OpenSSL runtime DLL if present
-if ($OpenSslDir -and (Test-Path "$OpenSslDir\bin\libcrypto-3-x64.dll")) {
-    Copy-Item "$OpenSslDir\bin\libcrypto-3-x64.dll" (Join-Path $PkgDir "bin")
+# Helper to find built files across Ninja and MSVC directory layouts
+function Find-BuiltFile ($BaseDir, $SubPath, $FileName) {
+    $p1 = Join-Path $BaseDir "$SubPath\$FileName"
+    if (Test-Path $p1) { return $p1 }
+    $p2 = Join-Path $BaseDir "$SubPath\Release\$FileName"
+    if (Test-Path $p2) { return $p2 }
+    $matches = Get-ChildItem -Path (Join-Path $BaseDir $SubPath) -Recurse -Filter $FileName -ErrorAction SilentlyContinue
+    if ($matches) { return $matches[0].FullName }
+    return $null
 }
 
-# Copy full SDK public headers
-Write-Host "Copying SDK headers..."
-$Modules = @("crypto", "integrity", "licensing", "antitamper", "bytecode_vm", "obfuscation", "tooling")
-foreach ($m in $Modules) {
-    $targetInc = Join-Path $PkgDir "include\$m"
+# Setup output directories
+$DistDir = Join-Path $RepoRoot "dist"
+if (-not (Test-Path $DistDir)) { New-Item -ItemType Directory -Force -Path $DistDir | Out-Null }
+
+$ToolsPkgDir  = Join-Path $DistDir "rtprotect-windows-x64"
+$SdkPkgDir    = Join-Path $DistDir "rtprotect-sdk-windows-x64"
+$ServerPkgDir = Join-Path $DistDir "rtprotect-activation-server-windows-x64"
+
+foreach ($dir in @($ToolsPkgDir, $SdkPkgDir, $ServerPkgDir)) {
+    if (Test-Path $dir) { Remove-Item -Recurse -Force $dir }
+    New-Item -ItemType Directory -Force -Path $dir | Out-Null
+}
+
+# Collect metadata and documentation
+$CommonDocs = @("README.md", "QUICKSTART.md", "LICENSE", "THIRD_PARTY_NOTICES.md", "VERSION.txt", "SBOM.spdx.json")
+foreach ($doc in $CommonDocs) {
+    if (Test-Path (Join-Path $RepoRoot $doc)) {
+        Copy-Item (Join-Path $RepoRoot $doc) $ToolsPkgDir
+        Copy-Item (Join-Path $RepoRoot $doc) $SdkPkgDir
+        Copy-Item (Join-Path $RepoRoot $doc) $ServerPkgDir
+    }
+}
+
+# Generate BUILD_INFO.txt
+$GitCommit = "unknown"
+try {
+    $GitCommit = (git rev-parse HEAD).Trim()
+} catch {}
+$BuildDate = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
+$BuildInfo = @"
+================================================================================
+RTProtect Release Build Information
+================================================================================
+Version:        2.0.0
+Git Commit:     $GitCommit
+Build Date:     $BuildDate
+Target Platform: Windows x64
+Target Standard: C++20
+NOMINMAX:       Enforced
+Optimization:   Release (O3, Hardening Enabled)
+Dependencies:   OpenSSL 3.4.0 (Crypto & SSL)
+================================================================================
+"@
+$BuildInfo | Out-File -FilePath (Join-Path $ToolsPkgDir "BUILD_INFO.txt") -Encoding utf8
+$BuildInfo | Out-File -FilePath (Join-Path $SdkPkgDir "BUILD_INFO.txt") -Encoding utf8
+$BuildInfo | Out-File -FilePath (Join-Path $ServerPkgDir "BUILD_INFO.txt") -Encoding utf8
+
+# Helper to copy OpenSSL runtime dependencies
+function Copy-OpenSslDlls ($TargetBinDir) {
+    if ($OpenSslDir) {
+        $cryptoDll = Join-Path $OpenSslDir "bin\libcrypto-3-x64.dll"
+        $sslDll    = Join-Path $OpenSslDir "bin\libssl-3-x64.dll"
+        if (Test-Path $cryptoDll) { Copy-Item $cryptoDll $TargetBinDir }
+        if (Test-Path $sslDll)    { Copy-Item $sslDll $TargetBinDir }
+    }
+}
+
+Write-Host "`n-- [Step 4/6] Assembling Three Distribution Archives --"
+
+# ---------------------------------------------------------
+# A. Package 1: rtprotect-windows-x64 (Tools & Runtime)
+# ---------------------------------------------------------
+Write-Host "-> Assembling rtprotect-windows-x64 (Tools)..."
+$ToolsBin = Join-Path $ToolsPkgDir "bin"
+New-Item -ItemType Directory -Force -Path $ToolsBin | Out-Null
+
+$ToolExe = Find-BuiltFile $BuildDir "tooling" "rtprotect-tool.exe"
+if ($ToolExe) { Copy-Item $ToolExe $ToolsBin } else { throw "rtprotect-tool.exe not found" }
+
+$GuiExe = Find-BuiltFile $BuildDir "tooling" "rtprotect-gui.exe"
+if ($GuiExe) { Copy-Item $GuiExe $ToolsBin }
+
+$BenchExe = Find-BuiltFile $BuildDir "bench" "rtprotect-bench.exe"
+if ($BenchExe) { Copy-Item $BenchExe $ToolsBin }
+
+Copy-OpenSslDlls $ToolsBin
+
+if (Test-Path (Join-Path $RepoRoot "docs")) {
+    Copy-Item -Recurse (Join-Path $RepoRoot "docs") $ToolsPkgDir
+}
+
+# ---------------------------------------------------------
+# B. Package 2: rtprotect-sdk-windows-x64 (C++ SDK)
+# ---------------------------------------------------------
+Write-Host "-> Assembling rtprotect-sdk-windows-x64 (Developer SDK)..."
+$SdkInc = Join-Path $SdkPkgDir "include"
+$SdkLib = Join-Path $SdkPkgDir "lib"
+$SdkCmake = Join-Path $SdkPkgDir "cmake"
+New-Item -ItemType Directory -Force -Path $SdkInc | Out-Null
+New-Item -ItemType Directory -Force -Path $SdkLib | Out-Null
+New-Item -ItemType Directory -Force -Path $SdkCmake | Out-Null
+
+# Copy public headers
+$SdkModules = @("crypto", "integrity", "licensing", "antitamper", "bytecode_vm", "obfuscation", "tooling")
+foreach ($m in $SdkModules) {
+    $targetInc = Join-Path $SdkInc $m
     New-Item -ItemType Directory -Force -Path $targetInc | Out-Null
-    Copy-Item "$m\*.h" $targetInc
+    Copy-Item (Join-Path $RepoRoot "$m\*.h") $targetInc
 }
 
-# Copy compiled static libraries
-Write-Host "Copying SDK static libraries..."
-Get-ChildItem -Path $BuildDir -Recurse -Include *.a, *.lib | Where-Object { 
-    $_.FullName -notmatch "CMakeFiles|third_party|Testing" 
-} | ForEach-Object {
-    Copy-Item $_.FullName (Join-Path $PkgDir "lib")
+# Copy compiled static libraries (only RTProtect SDK libraries, excluding tests/demos/import libs)
+$SdkLibNames = @("rtprotect_crypto", "rtprotect_integrity", "rtprotect_vm", "rtprotect_licensing", "rtprotect_antitamper", "rtprotect_tooling")
+foreach ($libName in $SdkLibNames) {
+    # Check for GCC .a or MSVC .lib
+    $found = Get-ChildItem -Path $BuildDir -Recurse -File | Where-Object {
+        ($_.Name -eq "lib$libName.a" -or $_.Name -eq "$libName.lib") -and
+        ($_.FullName -notmatch "CMakeFiles|third_party|Testing")
+    }
+    if ($found) {
+        Copy-Item $found[0].FullName $SdkLib
+    } else {
+        Write-Warning "Static library for $libName not found in build directory"
+    }
 }
 
-# Copy documentation and metadata
-Copy-Item "README.md" $PkgDir
-Copy-Item "SECURITY_AUDIT.md" $PkgDir
-Copy-Item "CHANGELOG.md" $PkgDir
-Copy-Item -Recurse "docs" $PkgDir
-if (Test-Path "sdk") {
-    Copy-Item -Recurse "sdk" $PkgDir
+# Copy CMake config
+Copy-Item (Join-Path $RepoRoot "cmake\RTProtectConfig.cmake") $SdkCmake
+
+# Copy consumer sample project
+$SampleDest = Join-Path $SdkPkgDir "examples\consumer_sample"
+New-Item -ItemType Directory -Force -Path $SampleDest | Out-Null
+Copy-Item (Join-Path $RepoRoot "examples\consumer_sample\*") $SampleDest
+
+# Include bundled OpenSSL in SDK for consumer link resolution
+if ($OpenSslDir -and (Test-Path $OpenSslDir)) {
+    $SdkOpenSsl = Join-Path $SdkPkgDir "third_party\openssl"
+    New-Item -ItemType Directory -Force -Path $SdkOpenSsl | Out-Null
+    Copy-Item -Recurse (Join-Path $OpenSslDir "*") $SdkOpenSsl
 }
 
-Write-Host "`n-- Verifying the packaged tool runs --"
-& (Join-Path $PkgDir "bin\rtprotect-tool.exe") --version
+# ---------------------------------------------------------
+# C. Package 3: rtprotect-activation-server-windows-x64
+# ---------------------------------------------------------
+Write-Host "-> Assembling rtprotect-activation-server-windows-x64 (Server)..."
+$ServerBin = Join-Path $ServerPkgDir "bin"
+New-Item -ItemType Directory -Force -Path $ServerBin | Out-Null
 
-Write-Host "`n-- Creating archive --"
-$ZipPath = Join-Path "dist" "$PkgName.zip"
-if (Test-Path $ZipPath) { Remove-Item $ZipPath }
-Compress-Archive -Path $PkgDir -DestinationPath $ZipPath
+$ServerExe = Find-BuiltFile $BuildDir "tooling" "rtprotect-activation-server.exe"
+if ($ServerExe) { Copy-Item $ServerExe $ServerBin } else { throw "rtprotect-activation-server.exe not found" }
 
-Write-Host "`nDone: $ZipPath"
-Get-Item $ZipPath | Format-List Name, Length
+Copy-OpenSslDlls $ServerBin
+
+# ---------------------------------------------------------
+# Smoke Testing SDK against Consumer Sample
+# ---------------------------------------------------------
+Write-Host "`n-- [Step 5/6] Smoke Testing Packaged SDK with Consumer Sample --"
+$SmokeBuildDir = Join-Path $DistDir "smoke_test_consumer_sample"
+if (Test-Path $SmokeBuildDir) { Remove-Item -Recurse -Force $SmokeBuildDir }
+
+$SmokeCmakeArgs = @(
+    "-S", (Join-Path $SdkPkgDir "examples\consumer_sample"),
+    "-B", $SmokeBuildDir,
+    "-DCMAKE_PREFIX_PATH=$SdkPkgDir",
+    "-DCMAKE_BUILD_TYPE=Release"
+)
+if ($OpenSslDir) {
+    $SmokeCmakeArgs += "-DOPENSSL_ROOT_DIR=$OpenSslDir"
+    $SmokeCmakeArgs += @("-G", "Ninja")
+}
+cmake @SmokeCmakeArgs
+if ($LASTEXITCODE -ne 0) { throw "Consumer sample CMake configure failed against packaged SDK" }
+
+cmake --build $SmokeBuildDir --config Release
+if ($LASTEXITCODE -ne 0) { throw "Consumer sample build failed against packaged SDK" }
+
+$SmokeExe = Find-BuiltFile $SmokeBuildDir "" "consumer_sample.exe"
+if (-not $SmokeExe) { throw "consumer_sample.exe was not produced by smoke build" }
+
+Write-Host "Running consumer sample executable: $SmokeExe"
+& $SmokeExe
+if ($LASTEXITCODE -ne 0) { throw "Consumer sample execution failed" }
+Write-Host "[OK] Consumer sample verified successfully!"
+
+# ---------------------------------------------------------
+# Create Zip Archives & SHA256SUMS.txt
+# ---------------------------------------------------------
+Write-Host "`n-- [Step 6/6] Generating Release Archives and Checksums --"
+
+$Zip1 = Join-Path $DistDir "rtprotect-windows-x64.zip"
+$Zip2 = Join-Path $DistDir "rtprotect-sdk-windows-x64.zip"
+$Zip3 = Join-Path $DistDir "rtprotect-activation-server-windows-x64.zip"
+
+foreach ($z in @($Zip1, $Zip2, $Zip3)) {
+    if (Test-Path $z) { Remove-Item -Force $z }
+}
+
+Compress-Archive -Path "$ToolsPkgDir\*" -DestinationPath $Zip1
+Compress-Archive -Path "$SdkPkgDir\*" -DestinationPath $Zip2
+Compress-Archive -Path "$ServerPkgDir\*" -DestinationPath $Zip3
+
+$Checksums = @()
+foreach ($z in @($Zip1, $Zip2, $Zip3)) {
+    $hash = (Get-FileHash -Path $z -Algorithm SHA256).Hash.ToLower()
+    $name = Split-Path $z -Leaf
+    $Checksums += "$hash  $name"
+}
+
+$ChecksumFile = Join-Path $DistDir "SHA256SUMS.txt"
+$Checksums | Out-File -FilePath $ChecksumFile -Encoding ascii
+
+Write-Host "`n=========================================================="
+Write-Host "Package Generation Complete!"
+Write-Host "Artifacts produced in ${DistDir}:"
+Get-ChildItem -Path $DistDir -Filter *.zip | Select-Object Name, Length
+Get-Content $ChecksumFile
+Write-Host "=========================================================="

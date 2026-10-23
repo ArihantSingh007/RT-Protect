@@ -1,6 +1,10 @@
 cmake_minimum_required(VERSION 3.20)
 project(rtprotect LANGUAGES CXX)
 
+if(WIN32)
+  add_compile_definitions(NOMINMAX)
+endif()
+
 if(NOT WIN32)
   message(FATAL_ERROR "RTProtect is supported exclusively on Windows platforms.")
 endif()

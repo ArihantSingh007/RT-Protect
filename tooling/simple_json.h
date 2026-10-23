@@ -90,6 +90,7 @@ class JsonValue {
     auto res = ParseValue(sv, pos, 0, max_depth);
     if (!res.has_value()) return std::nullopt;
     SkipWhitespace(sv, pos);
+    if (pos != sv.size()) return std::nullopt; // Reject trailing unparsed characters
     return res;
   }
 
@@ -111,6 +112,10 @@ class JsonValue {
       if (c == '"') {
         return result; // closing quote
       }
+      // JSON RFC 8259: unescaped control characters < 0x20 are forbidden in strings
+      if (static_cast<unsigned char>(c) < 0x20) {
+        return std::nullopt;
+      }
       if (c == '\\') {
         if (pos >= sv.size()) return std::nullopt;
         char esc = sv[pos++];
@@ -125,13 +130,17 @@ class JsonValue {
           case 't': result.push_back('\t'); break;
           case 'u': {
             if (pos + 4 > sv.size()) return std::nullopt;
-            pos += 4; // skip basic unicode hex
+            for (int i = 0; i < 4; ++i) {
+              if (!std::isxdigit(static_cast<unsigned char>(sv[pos + i]))) {
+                return std::nullopt;
+              }
+            }
+            pos += 4;
             result.push_back('?');
             break;
           }
           default:
-            result.push_back(esc);
-            break;
+            return std::nullopt; // Unrecognized escape sequence
         }
       } else {
         result.push_back(c);
@@ -178,19 +187,34 @@ class JsonValue {
     if (c == '-' || std::isdigit(static_cast<unsigned char>(c))) {
       std::size_t start = pos;
       if (sv[pos] == '-') ++pos;
+      if (pos >= sv.size() || !std::isdigit(static_cast<unsigned char>(sv[pos]))) {
+        return std::nullopt;
+      }
+      if (sv[pos] == '0' && pos + 1 < sv.size() && std::isdigit(static_cast<unsigned char>(sv[pos + 1]))) {
+        return std::nullopt; // Leading zeros disallowed
+      }
       while (pos < sv.size() && std::isdigit(static_cast<unsigned char>(sv[pos]))) ++pos;
       if (pos < sv.size() && sv[pos] == '.') {
         ++pos;
+        if (pos >= sv.size() || !std::isdigit(static_cast<unsigned char>(sv[pos]))) {
+          return std::nullopt;
+        }
         while (pos < sv.size() && std::isdigit(static_cast<unsigned char>(sv[pos]))) ++pos;
       }
       if (pos < sv.size() && (sv[pos] == 'e' || sv[pos] == 'E')) {
         ++pos;
         if (pos < sv.size() && (sv[pos] == '+' || sv[pos] == '-')) ++pos;
+        if (pos >= sv.size() || !std::isdigit(static_cast<unsigned char>(sv[pos]))) {
+          return std::nullopt;
+        }
         while (pos < sv.size() && std::isdigit(static_cast<unsigned char>(sv[pos]))) ++pos;
       }
       std::string num_str(sv.substr(start, pos - start));
       char* end_ptr = nullptr;
       double val = std::strtod(num_str.c_str(), &end_ptr);
+      if (end_ptr != num_str.c_str() + num_str.size()) {
+        return std::nullopt;
+      }
       return JsonValue(val);
     }
 

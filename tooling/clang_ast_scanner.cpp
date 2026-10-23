@@ -117,17 +117,68 @@ bool RunProcessCaptureOutput(const std::string& exe,
     return false;
   }
 
+  constexpr std::size_t kMaxCaptureBytes = 64 * 1024 * 1024; // 64 MB maximum output capture
+  constexpr DWORD kTimeoutMs = 30000;                        // 30 seconds maximum process execution
+
   std::string output;
   char buf[4096];
-  DWORD bytes_read = 0;
-  while (::ReadFile(hReadPipe, buf, sizeof(buf), &bytes_read, nullptr) && bytes_read > 0) {
-    output.append(buf, bytes_read);
+  DWORD start_time = ::GetTickCount();
+  bool timed_out = false;
+  bool exceeded_cap = false;
+
+  while (true) {
+    DWORD elapsed = ::GetTickCount() - start_time;
+    if (elapsed > kTimeoutMs) {
+      timed_out = true;
+      break;
+    }
+
+    DWORD bytes_avail = 0;
+    if (!::PeekNamedPipe(hReadPipe, nullptr, 0, nullptr, &bytes_avail, nullptr)) {
+      break; // Pipe broken / closed by child
+    }
+
+    if (bytes_avail > 0) {
+      DWORD to_read = (bytes_avail > sizeof(buf)) ? sizeof(buf) : bytes_avail;
+      DWORD bytes_read = 0;
+      if (::ReadFile(hReadPipe, buf, to_read, &bytes_read, nullptr) && bytes_read > 0) {
+        output.append(buf, bytes_read);
+        if (output.size() > kMaxCaptureBytes) {
+          exceeded_cap = true;
+          break;
+        }
+      }
+    } else {
+      DWORD wait_res = ::WaitForSingleObject(pi.hProcess, 10);
+      if (wait_res == WAIT_OBJECT_0) {
+        DWORD final_avail = 0;
+        if (::PeekNamedPipe(hReadPipe, nullptr, 0, nullptr, &final_avail, nullptr) && final_avail > 0) {
+          DWORD bytes_read = 0;
+          while (::ReadFile(hReadPipe, buf, sizeof(buf), &bytes_read, nullptr) && bytes_read > 0) {
+            output.append(buf, bytes_read);
+            if (output.size() > kMaxCaptureBytes) {
+              exceeded_cap = true;
+              break;
+            }
+          }
+        }
+        break;
+      }
+    }
   }
 
   ::CloseHandle(hReadPipe);
-  ::WaitForSingleObject(pi.hProcess, 15000);
 
-  DWORD exit_code = 0;
+  if (timed_out || exceeded_cap) {
+    ::TerminateProcess(pi.hProcess, 1);
+    ::WaitForSingleObject(pi.hProcess, 2000);
+    ::CloseHandle(pi.hThread);
+    ::CloseHandle(pi.hProcess);
+    return false;
+  }
+
+  ::WaitForSingleObject(pi.hProcess, 2000);
+  DWORD exit_code = 1;
   ::GetExitCodeProcess(pi.hProcess, &exit_code);
   ::CloseHandle(pi.hThread);
   ::CloseHandle(pi.hProcess);

@@ -13,6 +13,7 @@
 
 #include "crypto/aead.h"
 #include "crypto/kdf.h"
+#include "integrity/sha256.h"
 #include "licensing/activation_server.h"
 #include "licensing/hardware_id.h"
 
@@ -113,6 +114,15 @@ std::optional<crypto::Aes256Key> DeriveTransportKey(
   return crypto::Aes256Key::FromBytes(derived->data(), derived->size());
 }
 
+std::string AnonymizeLicenseKey(const std::string& key) {
+  if (key.empty()) return "<empty>";
+  auto d = integrity::Sha256(reinterpret_cast<const std::uint8_t*>(key.data()), key.size());
+  if (d.has_value()) {
+    return "key:sha256:" + BytesToHex(d->data(), 8);
+  }
+  return "key:masked:" + (key.size() > 4 ? key.substr(0, 4) + "..." : "...");
+}
+
 }  // namespace
 
 ActivationService::ActivationService(
@@ -131,12 +141,14 @@ ActivateResponse ActivationService::ProcessActivate(const ActivateRequest& req, 
     return resp;
   }
 
+  std::string anon_key = AnonymizeLicenseKey(req.license_key);
+
   if (check_rate_limit) {
     int retry_after = 0;
-    if (!license_rate_limiter_.Allow(req.license_key, 1.0, &retry_after)) {
+    if (!license_rate_limiter_.Allow(anon_key, 1.0, &retry_after)) {
       resp.status = ActivationStatus::kConcurrencyLimitExceeded;
       resp.error_message = "Rate limit exceeded for license (retry after " + std::to_string(retry_after) + "s)";
-      db_.RecordEvent({current_time, ActivationEventType::kRateLimited, req.license_key, req.device_fingerprint, req.client_ip, resp.error_message});
+      db_.RecordEvent({current_time, ActivationEventType::kRateLimited, anon_key, req.device_fingerprint, req.client_ip, resp.error_message});
       return resp;
     }
   }
@@ -146,22 +158,24 @@ ActivateResponse ActivationService::ProcessActivate(const ActivateRequest& req, 
   if (!lic_opt.has_value()) {
     resp.status = ActivationStatus::kLicenseMismatch;
     resp.error_message = "License key not found";
-    db_.RecordEvent({current_time, ActivationEventType::kActivationFailed, req.license_key, req.device_fingerprint, req.client_ip, resp.error_message});
+    db_.RecordEvent({current_time, ActivationEventType::kActivationFailed, anon_key, req.device_fingerprint, req.client_ip, resp.error_message});
     return resp;
   }
 
   const auto& lic = *lic_opt;
+  std::string safe_license_id = lic.license_id;
+
   if (lic.product_id != req.product_id) {
     resp.status = ActivationStatus::kLicenseMismatch;
     resp.error_message = "License is not valid for product " + req.product_id;
-    db_.RecordEvent({current_time, ActivationEventType::kActivationFailed, req.license_key, req.device_fingerprint, req.client_ip, resp.error_message});
+    db_.RecordEvent({current_time, ActivationEventType::kActivationFailed, safe_license_id, req.device_fingerprint, req.client_ip, resp.error_message});
     return resp;
   }
 
   if (lic.status != LicenseRecordStatus::kActive) {
     resp.status = ActivationStatus::kRevoked;
     resp.error_message = "License has been " + std::string(ToString(lic.status));
-    db_.RecordEvent({current_time, ActivationEventType::kActivationFailed, req.license_key, req.device_fingerprint, req.client_ip, resp.error_message});
+    db_.RecordEvent({current_time, ActivationEventType::kActivationFailed, safe_license_id, req.device_fingerprint, req.client_ip, resp.error_message});
     return resp;
   }
 
@@ -176,42 +190,42 @@ ActivateResponse ActivationService::ProcessActivate(const ActivateRequest& req, 
   if (nonce_is_all_zero) {
     resp.status = ActivationStatus::kMalformed;
     resp.error_message = "Client challenge nonce cannot be missing or all-zero";
-    db_.RecordEvent({current_time, ActivationEventType::kActivationFailed, req.license_key, req.device_fingerprint, req.client_ip, resp.error_message});
+    db_.RecordEvent({current_time, ActivationEventType::kActivationFailed, safe_license_id, req.device_fingerprint, req.client_ip, resp.error_message});
     return resp;
   }
 
   // Check client timestamp clock drift if timestamp was supplied
   if (req.client_timestamp > 0) {
     std::int64_t drift = std::abs(static_cast<std::int64_t>(current_time) - static_cast<std::int64_t>(req.client_timestamp));
-    if (drift > 900) { // 15-minute maximum drift window (AWS SigV4 standard for distributed clock skew)
+    if (drift > 900) { // 15-minute maximum drift window
       resp.status = ActivationStatus::kMalformed;
       resp.error_message = "Client timestamp clock drift exceeds allowed 900s window";
-      db_.RecordEvent({current_time, ActivationEventType::kActivationFailed, req.license_key, req.device_fingerprint, req.client_ip, resp.error_message});
+      db_.RecordEvent({current_time, ActivationEventType::kActivationFailed, safe_license_id, req.device_fingerprint, req.client_ip, resp.error_message});
       return resp;
     }
   }
 
   std::string client_nonce_hex = BytesToHex(req.client_nonce.data(), req.client_nonce.size());
-  if (!db_.ConsumeNonceIfUnused(client_nonce_hex, current_time + 86400)) {
+  if (db_.IsNonceUsed(client_nonce_hex)) {
     resp.status = ActivationStatus::kNonceMismatch;
     resp.error_message = "Client challenge nonce has already been used (replay detected)";
-    db_.RecordEvent({current_time, ActivationEventType::kReplayBlocked, req.license_key, req.device_fingerprint, req.client_ip, resp.error_message});
+    db_.RecordEvent({current_time, ActivationEventType::kReplayBlocked, safe_license_id, req.device_fingerprint, req.client_ip, resp.error_message});
     return resp;
   }
 
   // 3. Atomic seat limit enforcement and reservation with stale lease recovery
-  auto seat_res = db_.ReserveSeatAtomic(req.license_key, req.device_fingerprint, lic.max_seats, current_time);
+  auto seat_res = db_.ReserveSeatAtomic(safe_license_id, req.device_fingerprint, lic.max_seats, current_time);
   if (!seat_res.success) {
     resp.status = ActivationStatus::kConcurrencyLimitExceeded;
     resp.error_message = seat_res.error;
-    db_.RecordEvent({current_time, ActivationEventType::kSeatLimitExceeded, req.license_key, req.device_fingerprint, req.client_ip, resp.error_message});
+    db_.RecordEvent({current_time, ActivationEventType::kSeatLimitExceeded, safe_license_id, req.device_fingerprint, req.client_ip, resp.error_message});
     return resp;
   }
 
   // 4. Mint signed activation token bound to hardware ID and containing canonical vm_root
   ActivationToken token;
   token.schema_version = kActivationSchemaVersion;
-  token.license_id = req.license_key;
+  token.license_id = safe_license_id;
   token.device_fingerprint_hash = req.device_fingerprint;
   token.issued_at = current_time;
   token.expires_at = current_time + 14 * 86400;              // 14 days
@@ -220,6 +234,7 @@ ActivateResponse ActivationService::ProcessActivate(const ActivateRequest& req, 
   token.sequence_number = seat_res.sequence_number;
 
   if (RAND_bytes(resp.server_nonce.data(), static_cast<int>(resp.server_nonce.size())) != 1) {
+    db_.RemoveActivation(safe_license_id, req.device_fingerprint);
     resp.status = ActivationStatus::kMalformed;
     resp.error_message = "Cryptographic RNG failure generating server nonce";
     return resp;
@@ -227,14 +242,16 @@ ActivateResponse ActivationService::ProcessActivate(const ActivateRequest& req, 
   token.server_nonce = resp.server_nonce;
 
   if (!SignActivationToken(token, signing_key_)) {
+    db_.RemoveActivation(safe_license_id, req.device_fingerprint);
     resp.status = ActivationStatus::kMalformed;
     resp.error_message = "Internal signing failure";
     return resp;
   }
 
-  // 6. Encrypt token under ephemeral session key
+  // 5. Encrypt token under ephemeral session key
   auto session_key = DeriveTransportKey(req.license_key, req.client_nonce, resp.server_nonce);
   if (!session_key.has_value()) {
+    db_.RemoveActivation(safe_license_id, req.device_fingerprint);
     resp.status = ActivationStatus::kMalformed;
     resp.error_message = "Failed to derive transport key";
     return resp;
@@ -243,8 +260,17 @@ ActivateResponse ActivationService::ProcessActivate(const ActivateRequest& req, 
   auto raw_token_bytes = SerializeActivationToken(token);
   auto encrypted = crypto::Encrypt(*session_key, raw_token_bytes.data(), raw_token_bytes.size());
   if (!encrypted.has_value()) {
+    db_.RemoveActivation(safe_license_id, req.device_fingerprint);
     resp.status = ActivationStatus::kMalformed;
     resp.error_message = "Failed to encrypt activation token";
+    return resp;
+  }
+
+  // 6. Transactional commit: consume nonce only now that encryption has succeeded
+  if (!db_.ConsumeNonceIfUnused(client_nonce_hex, current_time + 86400, current_time)) {
+    db_.RemoveActivation(safe_license_id, req.device_fingerprint);
+    resp.status = ActivationStatus::kNonceMismatch;
+    resp.error_message = "Nonce consumption collision during activation commit";
     return resp;
   }
 
@@ -252,7 +278,7 @@ ActivateResponse ActivationService::ProcessActivate(const ActivateRequest& req, 
   resp.encrypted_token_hex = BytesToHex(wire_bytes.data(), wire_bytes.size());
   resp.token = token;
   resp.status = ActivationStatus::kValid;
-  db_.RecordEvent({current_time, ActivationEventType::kActivationSuccess, req.license_key, req.device_fingerprint, req.client_ip, "Activated seat seq=" + std::to_string(seat_res.sequence_number)});
+  db_.RecordEvent({current_time, ActivationEventType::kActivationSuccess, safe_license_id, req.device_fingerprint, req.client_ip, "Activated seat seq=" + std::to_string(seat_res.sequence_number)});
   return resp;
 }
 
@@ -323,16 +349,16 @@ RenewResponse ActivationService::ProcessRenew(const RenewRequest& req, std::uint
     return resp;
   }
   std::string client_nonce_hex = BytesToHex(req.client_nonce.data(), req.client_nonce.size());
-  if (!db_.ConsumeNonceIfUnused(client_nonce_hex, current_time + 86400)) {
+  if (db_.IsNonceUsed(client_nonce_hex)) {
     resp.status = ActivationStatus::kNonceMismatch;
     resp.error_message = "Client challenge nonce has already been used (replay detected)";
     db_.RecordEvent({current_time, ActivationEventType::kReplayBlocked, token.license_id, req.device_fingerprint, req.client_ip, resp.error_message});
     return resp;
   }
 
-  // 5. Atomic anti-replay check and retirement of existing token server_nonce
+  // 5. Anti-replay check of existing token server_nonce
   std::string old_nonce_hex = BytesToHex(token.server_nonce.data(), token.server_nonce.size());
-  if (!db_.ConsumeNonceIfUnused(old_nonce_hex, current_time + 86400 * 30)) {
+  if (db_.IsNonceUsed(old_nonce_hex)) {
     resp.status = ActivationStatus::kNonceMismatch;
     resp.error_message = "Token has already been renewed (anti-replay check failed)";
     db_.RecordEvent({current_time, ActivationEventType::kReplayBlocked, token.license_id, req.device_fingerprint, req.client_ip, resp.error_message});
@@ -381,16 +407,7 @@ RenewResponse ActivationService::ProcessRenew(const RenewRequest& req, std::uint
     return resp;
   }
 
-  // 9. Update database activation record
-  ActivationRecord act;
-  act.license_id = token.license_id;
-  act.device_fingerprint = req.device_fingerprint;
-  act.first_seen = token.issued_at;
-  act.last_seen = current_time;
-  act.sequence_number = renewed.sequence_number;
-  db_.RecordActivation(act);
-
-  // 8. Encrypt renewed token under ephemeral session key
+  // 9. Encrypt renewed token under ephemeral session key
   auto session_key = DeriveTransportKey(token.license_id, req.client_nonce, resp.server_nonce);
   if (!session_key.has_value()) {
     resp.status = ActivationStatus::kMalformed;
@@ -405,6 +422,22 @@ RenewResponse ActivationService::ProcessRenew(const RenewRequest& req, std::uint
     resp.error_message = "Failed to encrypt renewed token";
     return resp;
   }
+
+  // 10. Transactional commit: consume nonces and commit activation record only now that encryption has succeeded
+  if (!db_.ConsumeNonceIfUnused(client_nonce_hex, current_time + 86400, current_time) ||
+      !db_.ConsumeNonceIfUnused(old_nonce_hex, current_time + 86400 * 30, current_time)) {
+    resp.status = ActivationStatus::kNonceMismatch;
+    resp.error_message = "Nonce consumption collision during renewal commit";
+    return resp;
+  }
+
+  ActivationRecord act;
+  act.license_id = token.license_id;
+  act.device_fingerprint = req.device_fingerprint;
+  act.first_seen = token.issued_at;
+  act.last_seen = current_time;
+  act.sequence_number = renewed.sequence_number;
+  db_.RecordActivation(act);
 
   auto wire_bytes = encrypted->Serialize();
   resp.encrypted_token_hex = BytesToHex(wire_bytes.data(), wire_bytes.size());
@@ -494,8 +527,9 @@ std::string ActivationService::HandleActivateJson(const std::string& json_body, 
   }
 
   // Enforce license rate limiting
-  if (!req.license_key.empty() && !license_rate_limiter_.Allow(req.license_key, 1.0, &retry_after)) {
-    db_.RecordEvent({current_time, ActivationEventType::kRateLimited, req.license_key, req.device_fingerprint, client_ip, "License rate limit exceeded"});
+  std::string anon_key = AnonymizeLicenseKey(req.license_key);
+  if (!req.license_key.empty() && !license_rate_limiter_.Allow(anon_key, 1.0, &retry_after)) {
+    db_.RecordEvent({current_time, ActivationEventType::kRateLimited, anon_key, req.device_fingerprint, client_ip, "License rate limit exceeded"});
     std::ostringstream ss;
     ss << "{\n"
        << "  \"status\": \"rate_limited\",\n"

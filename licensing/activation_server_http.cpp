@@ -51,31 +51,60 @@ bool ConstantTimeStringEquals(const std::string& a, const std::string& b) {
   return CRYPTO_memcmp(a.data(), b.data(), a.size()) == 0;
 }
 
+std::string EscapeJsonString(const std::string& input) {
+  std::string out;
+  out.reserve(input.size() + 8);
+  for (char c : input) {
+    switch (c) {
+      case '"': out += "\\\""; break;
+      case '\\': out += "\\\\"; break;
+      case '\b': out += "\\b"; break;
+      case '\f': out += "\\f"; break;
+      case '\n': out += "\\n"; break;
+      case '\r': out += "\\r"; break;
+      case '\t': out += "\\t"; break;
+      default:
+        if (static_cast<unsigned char>(c) < 0x20) {
+          char buf[8];
+          std::snprintf(buf, sizeof(buf), "\\u%04x", static_cast<unsigned char>(c));
+          out += buf;
+        } else {
+          out += c;
+        }
+        break;
+    }
+  }
+  return out;
+}
+
+std::vector<std::string> FindAllHeadersCaseInsensitive(const std::string& headers, const std::string& header_name) {
+  std::vector<std::string> results;
+  std::istringstream iss(headers);
+  std::string line;
+  std::string lower_target = header_name;
+  for (char& c : lower_target) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+
+  while (std::getline(iss, line)) {
+    if (!line.empty() && line.back() == '\r') line.pop_back();
+    auto colon = line.find(':');
+    if (colon == std::string::npos) continue;
+    std::string key = line.substr(0, colon);
+    for (char& c : key) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    if (key == lower_target) {
+      std::size_t val_start = colon + 1;
+      while (val_start < line.size() && (line[val_start] == ' ' || line[val_start] == '\t')) ++val_start;
+      std::size_t val_end = line.size();
+      while (val_end > val_start && (line[val_end - 1] == ' ' || line[val_end - 1] == '\t')) --val_end;
+      results.push_back(line.substr(val_start, val_end - val_start));
+    }
+  }
+  return results;
+}
+
 std::optional<std::string> FindHeaderCaseInsensitive(const std::string& headers, const std::string& header_name) {
-  std::string lower_headers = headers;
-  for (char& c : lower_headers) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
-  std::string lower_name = header_name;
-  for (char& c : lower_name) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
-
-  std::string search = "\n" + lower_name + ":";
-  std::size_t val_start = std::string::npos;
-  auto pos = lower_headers.find(search);
-  if (pos != std::string::npos) {
-    val_start = pos + search.size();
-  } else if (lower_headers.rfind(lower_name + ":", 0) == 0) {
-    val_start = lower_name.size() + 1;
-  }
-
-  if (val_start == std::string::npos) return std::nullopt;
-
-  while (val_start < headers.size() && (headers[val_start] == ' ' || headers[val_start] == '\t')) {
-    ++val_start;
-  }
-  auto end = headers.find("\r", val_start);
-  if (end == std::string::npos) end = headers.find("\n", val_start);
-  if (end == std::string::npos) end = headers.size();
-
-  return headers.substr(val_start, end - val_start);
+  auto all = FindAllHeadersCaseInsensitive(headers, header_name);
+  if (all.empty()) return std::nullopt;
+  return all.front();
 }
 
 }  // namespace
@@ -397,8 +426,18 @@ void ActivationServerHttp::HandleClient(uintptr_t client_sock_fd, const std::str
   std::size_t content_length = 0;
   std::size_t header_end = std::string::npos;
   bool payload_too_large = false;
+  bool framing_error = false;
+  int framing_status_code = 400;
+  std::string framing_error_msg;
+
+  // Absolute request timeout (15s) prevents slow-read denial of service
+  auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(15);
 
   while (running_.load()) {
+    if (std::chrono::steady_clock::now() >= deadline) {
+      break;
+    }
+
     int bytes = raw_read(buf, sizeof(buf));
     if (bytes <= 0) break;
 
@@ -418,16 +457,46 @@ void ActivationServerHttp::HandleClient(uintptr_t client_sock_fd, const std::str
           break;
         }
 
-        auto cl_pos = raw_req.find("Content-Length:");
-        if (cl_pos == std::string::npos) cl_pos = raw_req.find("content-length:");
-        if (cl_pos != std::string::npos && cl_pos < header_end) {
-          cl_pos += 15;
-          while (cl_pos < header_end && (raw_req[cl_pos] == ' ' || raw_req[cl_pos] == '\t')) ++cl_pos;
-          content_length = std::strtoul(raw_req.c_str() + cl_pos, nullptr, 10);
-          if (content_length > kMaxRequestBodyBytes) {
+        std::string headers_part = raw_req.substr(0, header_end);
+
+        // Reject Transfer-Encoding (chunked / request smuggling defense)
+        auto te_list = FindAllHeadersCaseInsensitive(headers_part, "transfer-encoding");
+        if (!te_list.empty()) {
+          framing_error = true;
+          framing_status_code = 501;
+          framing_error_msg = "Transfer-Encoding is not supported";
+          break;
+        }
+
+        // Strict Content-Length validation: case-insensitive, single occurrence only
+        auto cl_list = FindAllHeadersCaseInsensitive(headers_part, "content-length");
+        if (cl_list.size() > 1) {
+          framing_error = true;
+          framing_status_code = 400;
+          framing_error_msg = "Multiple Content-Length headers prohibited";
+          break;
+        } else if (cl_list.size() == 1) {
+          const std::string& cl_str = cl_list[0];
+          if (cl_str.empty()) {
+            framing_error = true;
+            framing_status_code = 400;
+            framing_error_msg = "Empty Content-Length header";
+            break;
+          }
+          char* endptr = nullptr;
+          unsigned long long val = std::strtoull(cl_str.c_str(), &endptr, 10);
+          while (endptr && (*endptr == ' ' || *endptr == '\t')) ++endptr;
+          if (!endptr || *endptr != '\0') {
+            framing_error = true;
+            framing_status_code = 400;
+            framing_error_msg = "Invalid Content-Length header";
+            break;
+          }
+          if (val > kMaxRequestBodyBytes) {
             payload_too_large = true;
             break;
           }
+          content_length = static_cast<std::size_t>(val);
         }
       }
     }
@@ -443,7 +512,10 @@ void ActivationServerHttp::HandleClient(uintptr_t client_sock_fd, const std::str
   std::string retry_after_header;
   std::string extra_headers;
 
-  if (payload_too_large) {
+  if (framing_error) {
+    status_line = (framing_status_code == 501) ? "HTTP/1.1 501 Not Implemented" : "HTTP/1.1 400 Bad Request";
+    resp_body = "{\"error\":\"" + EscapeJsonString(framing_error_msg) + "\"}\n";
+  } else if (payload_too_large) {
     status_line = "HTTP/1.1 413 Payload Too Large";
     resp_body = "{\"error\":\"payload exceeds maximum allowed limit\"}\n";
   } else if (raw_req.empty()) {
@@ -509,11 +581,11 @@ void ActivationServerHttp::HandleClient(uintptr_t client_sock_fd, const std::str
           const auto& e = events[i];
           ess << "    {\n"
               << "      \"timestamp\": " << e.timestamp << ",\n"
-              << "      \"type\": \"" << ToString(e.type) << "\",\n"
-              << "      \"license_id\": \"" << e.license_id << "\",\n"
-              << "      \"device_fingerprint\": \"" << e.device_fingerprint << "\",\n"
-              << "      \"ip\": \"" << e.ip_address << "\",\n"
-              << "      \"details\": \"" << e.details << "\"\n"
+              << "      \"type\": \"" << EscapeJsonString(ToString(e.type)) << "\",\n"
+              << "      \"license_id\": \"" << EscapeJsonString(e.license_id) << "\",\n"
+              << "      \"device_fingerprint\": \"" << EscapeJsonString(e.device_fingerprint) << "\",\n"
+              << "      \"ip\": \"" << EscapeJsonString(e.ip_address) << "\",\n"
+              << "      \"details\": \"" << EscapeJsonString(e.details) << "\"\n"
               << "    }" << (i + 1 < events.size() ? "," : "") << "\n";
         }
         ess << "  ]\n}\n";
