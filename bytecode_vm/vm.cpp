@@ -55,6 +55,9 @@ RunResult Run(const Program& program,
   if (flavor == VmEngineFlavor::kRegisterThreaded) {
     return RunRegisterThreaded(program, args, opcode_map, mem_ctx, recursion_depth);
   }
+  if (flavor == VmEngineFlavor::kDirectThreadedTable) {
+    return RunDirectThreadedTable(program, args, opcode_map, mem_ctx, recursion_depth);
+  }
 
   RunResult result;
   if (recursion_depth >= kMaxProgramRecursionDepth) {
@@ -1037,6 +1040,485 @@ RunResult RunRegisterThreaded(const Program& program,
 
     pc = next_pc;
   }
+}
+
+namespace {
+
+struct TableContext {
+  std::int64_t stack[kMaxStackDepth];
+  std::size_t sp = 0;
+  std::vector<std::int64_t> locals;
+  std::vector<std::size_t> call_stack;
+  const Program& program;
+  const OpcodeMap& map;
+  MemoryContext* mem_ctx = nullptr;
+  std::size_t recursion_depth = 0;
+  std::uint64_t executed = 0;
+  bool halted = false;
+  std::int64_t return_val = 0;
+
+  bool push(std::int64_t v) {
+    if (sp >= kMaxStackDepth) return false;
+    stack[sp++] = v;
+    return true;
+  }
+  bool pop(std::int64_t* out) {
+    if (sp == 0) return false;
+    *out = stack[--sp];
+    return true;
+  }
+};
+
+using TableOpcodeHandler = VmError (*)(TableContext& ctx, const std::uint8_t* operand, std::size_t& next_pc);
+
+VmError H_PushConst(TableContext& ctx, const std::uint8_t* operand, std::size_t&) {
+  std::uint16_t idx = ReadU16(operand);
+  if (!ctx.push(ctx.program.constants[idx])) return VmError::kStackOverflow;
+  return VmError::kNone;
+}
+
+VmError H_PushLocal(TableContext& ctx, const std::uint8_t* operand, std::size_t&) {
+  std::uint8_t idx = operand[0];
+  if (!ctx.push(ctx.locals[idx])) return VmError::kStackOverflow;
+  return VmError::kNone;
+}
+
+VmError H_StoreLocal(TableContext& ctx, const std::uint8_t* operand, std::size_t&) {
+  std::uint8_t idx = operand[0];
+  std::int64_t v = 0;
+  if (!ctx.pop(&v)) return VmError::kStackUnderflow;
+  ctx.locals[idx] = v;
+  return VmError::kNone;
+}
+
+VmError H_Dup(TableContext& ctx, const std::uint8_t*, std::size_t&) {
+  std::int64_t v = 0;
+  if (!ctx.pop(&v)) return VmError::kStackUnderflow;
+  if (!ctx.push(v) || !ctx.push(v)) return VmError::kStackOverflow;
+  return VmError::kNone;
+}
+
+VmError H_Pop(TableContext& ctx, const std::uint8_t*, std::size_t&) {
+  std::int64_t v = 0;
+  if (!ctx.pop(&v)) return VmError::kStackUnderflow;
+  return VmError::kNone;
+}
+
+VmError H_Add(TableContext& ctx, const std::uint8_t*, std::size_t&) {
+  std::int64_t a = 0, b = 0;
+  if (!ctx.pop(&b) || !ctx.pop(&a)) return VmError::kStackUnderflow;
+  auto r = CheckedAdd(a, b);
+  if (!r) return VmError::kArithmeticOverflow;
+  if (!ctx.push(*r)) return VmError::kStackOverflow;
+  return VmError::kNone;
+}
+
+VmError H_Sub(TableContext& ctx, const std::uint8_t*, std::size_t&) {
+  std::int64_t a = 0, b = 0;
+  if (!ctx.pop(&b) || !ctx.pop(&a)) return VmError::kStackUnderflow;
+  auto r = CheckedSub(a, b);
+  if (!r) return VmError::kArithmeticOverflow;
+  if (!ctx.push(*r)) return VmError::kStackOverflow;
+  return VmError::kNone;
+}
+
+VmError H_Mul(TableContext& ctx, const std::uint8_t*, std::size_t&) {
+  std::int64_t a = 0, b = 0;
+  if (!ctx.pop(&b) || !ctx.pop(&a)) return VmError::kStackUnderflow;
+  auto r = CheckedMul(a, b);
+  if (!r) return VmError::kArithmeticOverflow;
+  if (!ctx.push(*r)) return VmError::kStackOverflow;
+  return VmError::kNone;
+}
+
+VmError H_Div(TableContext& ctx, const std::uint8_t*, std::size_t&) {
+  std::int64_t a = 0, b = 0;
+  if (!ctx.pop(&b) || !ctx.pop(&a)) return VmError::kStackUnderflow;
+  if (b == 0) return VmError::kDivisionByZero;
+  auto r = CheckedDiv(a, b);
+  if (!r) return VmError::kArithmeticOverflow;
+  if (!ctx.push(*r)) return VmError::kStackOverflow;
+  return VmError::kNone;
+}
+
+VmError H_Mod(TableContext& ctx, const std::uint8_t*, std::size_t&) {
+  std::int64_t a = 0, b = 0;
+  if (!ctx.pop(&b) || !ctx.pop(&a)) return VmError::kStackUnderflow;
+  if (b == 0) return VmError::kDivisionByZero;
+  auto r = CheckedMod(a, b);
+  if (!r) return VmError::kArithmeticOverflow;
+  if (!ctx.push(*r)) return VmError::kStackOverflow;
+  return VmError::kNone;
+}
+
+VmError H_And(TableContext& ctx, const std::uint8_t*, std::size_t&) {
+  std::int64_t a = 0, b = 0;
+  if (!ctx.pop(&b) || !ctx.pop(&a)) return VmError::kStackUnderflow;
+  if (!ctx.push(a & b)) return VmError::kStackOverflow;
+  return VmError::kNone;
+}
+
+VmError H_Or(TableContext& ctx, const std::uint8_t*, std::size_t&) {
+  std::int64_t a = 0, b = 0;
+  if (!ctx.pop(&b) || !ctx.pop(&a)) return VmError::kStackUnderflow;
+  if (!ctx.push(a | b)) return VmError::kStackOverflow;
+  return VmError::kNone;
+}
+
+VmError H_Xor(TableContext& ctx, const std::uint8_t*, std::size_t&) {
+  std::int64_t a = 0, b = 0;
+  if (!ctx.pop(&b) || !ctx.pop(&a)) return VmError::kStackUnderflow;
+  if (!ctx.push(a ^ b)) return VmError::kStackOverflow;
+  return VmError::kNone;
+}
+
+VmError H_Not(TableContext& ctx, const std::uint8_t*, std::size_t&) {
+  std::int64_t a = 0;
+  if (!ctx.pop(&a)) return VmError::kStackUnderflow;
+  if (!ctx.push(~a)) return VmError::kStackOverflow;
+  return VmError::kNone;
+}
+
+VmError H_CmpEq(TableContext& ctx, const std::uint8_t*, std::size_t&) {
+  std::int64_t a = 0, b = 0;
+  if (!ctx.pop(&b) || !ctx.pop(&a)) return VmError::kStackUnderflow;
+  if (!ctx.push(a == b ? 1 : 0)) return VmError::kStackOverflow;
+  return VmError::kNone;
+}
+
+VmError H_CmpLt(TableContext& ctx, const std::uint8_t*, std::size_t&) {
+  std::int64_t a = 0, b = 0;
+  if (!ctx.pop(&b) || !ctx.pop(&a)) return VmError::kStackUnderflow;
+  if (!ctx.push(a < b ? 1 : 0)) return VmError::kStackOverflow;
+  return VmError::kNone;
+}
+
+VmError H_CmpGt(TableContext& ctx, const std::uint8_t*, std::size_t&) {
+  std::int64_t a = 0, b = 0;
+  if (!ctx.pop(&b) || !ctx.pop(&a)) return VmError::kStackUnderflow;
+  if (!ctx.push(a > b ? 1 : 0)) return VmError::kStackOverflow;
+  return VmError::kNone;
+}
+
+VmError H_Jmp(TableContext&, const std::uint8_t* operand, std::size_t& next_pc) {
+  next_pc = ReadU16(operand);
+  return VmError::kNone;
+}
+
+VmError H_Jz(TableContext& ctx, const std::uint8_t* operand, std::size_t& next_pc) {
+  std::int64_t a = 0;
+  if (!ctx.pop(&a)) return VmError::kStackUnderflow;
+  if (a == 0) next_pc = ReadU16(operand);
+  return VmError::kNone;
+}
+
+VmError H_Jnz(TableContext& ctx, const std::uint8_t* operand, std::size_t& next_pc) {
+  std::int64_t a = 0;
+  if (!ctx.pop(&a)) return VmError::kStackUnderflow;
+  if (a != 0) next_pc = ReadU16(operand);
+  return VmError::kNone;
+}
+
+VmError H_Ret(TableContext& ctx, const std::uint8_t*, std::size_t&) {
+  std::int64_t a = 0;
+  if (!ctx.pop(&a)) return VmError::kStackUnderflow;
+  ctx.return_val = a;
+  ctx.halted = true;
+  return VmError::kNone;
+}
+
+VmError H_LoadMem8(TableContext& ctx, const std::uint8_t*, std::size_t&) {
+  std::int64_t a = 0;
+  if (!ctx.pop(&a)) return VmError::kStackUnderflow;
+  if (!ctx.mem_ctx || a < 0 || static_cast<std::size_t>(a) >= ctx.mem_ctx->data.size()) {
+    return VmError::kMemoryAccessOutOfBounds;
+  }
+  std::uint8_t byte_val = ctx.mem_ctx->data[static_cast<std::size_t>(a)];
+  if (!ctx.push(static_cast<std::int64_t>(byte_val))) return VmError::kStackOverflow;
+  return VmError::kNone;
+}
+
+VmError H_StoreMem8(TableContext& ctx, const std::uint8_t*, std::size_t&) {
+  std::int64_t a = 0, b = 0;
+  if (!ctx.pop(&b) || !ctx.pop(&a)) return VmError::kStackUnderflow;
+  if (!ctx.mem_ctx || a < 0 || static_cast<std::size_t>(a) >= ctx.mem_ctx->data.size()) {
+    return VmError::kMemoryAccessOutOfBounds;
+  }
+  ctx.mem_ctx->data[static_cast<std::size_t>(a)] = static_cast<std::uint8_t>(b & 0xFF);
+  return VmError::kNone;
+}
+
+VmError H_LoadMem64(TableContext& ctx, const std::uint8_t*, std::size_t&) {
+  std::int64_t a = 0;
+  if (!ctx.pop(&a)) return VmError::kStackUnderflow;
+  if (!ctx.mem_ctx || a < 0 || static_cast<std::size_t>(a) + 8 > ctx.mem_ctx->data.size()) {
+    return VmError::kMemoryAccessOutOfBounds;
+  }
+  std::uint64_t uval = 0;
+  const std::uint8_t* p = &ctx.mem_ctx->data[static_cast<std::size_t>(a)];
+  for (int k = 0; k < 8; ++k) uval |= (static_cast<std::uint64_t>(p[k]) << (k * 8));
+  if (!ctx.push(static_cast<std::int64_t>(uval))) return VmError::kStackOverflow;
+  return VmError::kNone;
+}
+
+VmError H_StoreMem64(TableContext& ctx, const std::uint8_t*, std::size_t&) {
+  std::int64_t a = 0, b = 0;
+  if (!ctx.pop(&b) || !ctx.pop(&a)) return VmError::kStackUnderflow;
+  if (!ctx.mem_ctx || a < 0 || static_cast<std::size_t>(a) + 8 > ctx.mem_ctx->data.size()) {
+    return VmError::kMemoryAccessOutOfBounds;
+  }
+  std::uint64_t uval = static_cast<std::uint64_t>(b);
+  std::uint8_t* p = &ctx.mem_ctx->data[static_cast<std::size_t>(a)];
+  for (int k = 0; k < 8; ++k) p[k] = static_cast<std::uint8_t>((uval >> (k * 8)) & 0xFF);
+  return VmError::kNone;
+}
+
+VmError H_Call(TableContext& ctx, const std::uint8_t* operand, std::size_t& next_pc) {
+  if (ctx.call_stack.size() >= 64) return VmError::kCallStackOverflow;
+  ctx.call_stack.push_back(next_pc);
+  next_pc = ReadU16(operand);
+  return VmError::kNone;
+}
+
+VmError H_RetSub(TableContext& ctx, const std::uint8_t*, std::size_t& next_pc) {
+  if (ctx.call_stack.empty()) return VmError::kCallStackUnderflow;
+  next_pc = ctx.call_stack.back();
+  ctx.call_stack.pop_back();
+  return VmError::kNone;
+}
+
+VmError H_CallProgram(TableContext& ctx, const std::uint8_t* operand, std::size_t&) {
+  if (ctx.recursion_depth >= kMaxProgramRecursionDepth) return VmError::kCallStackOverflow;
+  std::uint16_t prog_id = ReadU16(operand);
+  std::shared_ptr<const Program> callee = ProgramRegistry::Get(prog_id);
+  if (!callee) return VmError::kVerificationFailed;
+  std::vector<std::int64_t> callee_args(callee->num_locals, 0);
+  for (int k = static_cast<int>(callee->num_locals) - 1; k >= 0; --k) {
+    std::int64_t arg_val = 0;
+    if (!ctx.pop(&arg_val)) return VmError::kStackUnderflow;
+    callee_args[k] = arg_val;
+  }
+  auto sub_res = RunDirectThreadedTable(*callee, callee_args, &ctx.map, ctx.mem_ctx, ctx.recursion_depth + 1);
+  if (sub_res.error != VmError::kNone) return sub_res.error;
+  ctx.executed += sub_res.instructions_executed;
+  if (!ctx.push(sub_res.value)) return VmError::kStackOverflow;
+  return VmError::kNone;
+}
+
+VmError H_FAdd(TableContext& ctx, const std::uint8_t*, std::size_t&) {
+  std::int64_t a = 0, b = 0;
+  if (!ctx.pop(&b) || !ctx.pop(&a)) return VmError::kStackUnderflow;
+  double da = BitsToDouble(static_cast<std::uint64_t>(a));
+  double db = BitsToDouble(static_cast<std::uint64_t>(b));
+  if (!ctx.push(static_cast<std::int64_t>(DoubleToBits(da + db)))) return VmError::kStackOverflow;
+  return VmError::kNone;
+}
+
+VmError H_FSub(TableContext& ctx, const std::uint8_t*, std::size_t&) {
+  std::int64_t a = 0, b = 0;
+  if (!ctx.pop(&b) || !ctx.pop(&a)) return VmError::kStackUnderflow;
+  double da = BitsToDouble(static_cast<std::uint64_t>(a));
+  double db = BitsToDouble(static_cast<std::uint64_t>(b));
+  if (!ctx.push(static_cast<std::int64_t>(DoubleToBits(da - db)))) return VmError::kStackOverflow;
+  return VmError::kNone;
+}
+
+VmError H_FMul(TableContext& ctx, const std::uint8_t*, std::size_t&) {
+  std::int64_t a = 0, b = 0;
+  if (!ctx.pop(&b) || !ctx.pop(&a)) return VmError::kStackUnderflow;
+  double da = BitsToDouble(static_cast<std::uint64_t>(a));
+  double db = BitsToDouble(static_cast<std::uint64_t>(b));
+  if (!ctx.push(static_cast<std::int64_t>(DoubleToBits(da * db)))) return VmError::kStackOverflow;
+  return VmError::kNone;
+}
+
+VmError H_FDiv(TableContext& ctx, const std::uint8_t*, std::size_t&) {
+  std::int64_t a = 0, b = 0;
+  if (!ctx.pop(&b) || !ctx.pop(&a)) return VmError::kStackUnderflow;
+  double da = BitsToDouble(static_cast<std::uint64_t>(a));
+  double db = BitsToDouble(static_cast<std::uint64_t>(b));
+  if (db == 0.0) return VmError::kDivisionByZero;
+  if (!ctx.push(static_cast<std::int64_t>(DoubleToBits(da / db)))) return VmError::kStackOverflow;
+  return VmError::kNone;
+}
+
+VmError H_FCmpEq(TableContext& ctx, const std::uint8_t*, std::size_t&) {
+  std::int64_t a = 0, b = 0;
+  if (!ctx.pop(&b) || !ctx.pop(&a)) return VmError::kStackUnderflow;
+  double da = BitsToDouble(static_cast<std::uint64_t>(a));
+  double db = BitsToDouble(static_cast<std::uint64_t>(b));
+  if (!ctx.push(da == db ? 1 : 0)) return VmError::kStackOverflow;
+  return VmError::kNone;
+}
+
+VmError H_FCmpLt(TableContext& ctx, const std::uint8_t*, std::size_t&) {
+  std::int64_t a = 0, b = 0;
+  if (!ctx.pop(&b) || !ctx.pop(&a)) return VmError::kStackUnderflow;
+  double da = BitsToDouble(static_cast<std::uint64_t>(a));
+  double db = BitsToDouble(static_cast<std::uint64_t>(b));
+  if (!ctx.push(da < db ? 1 : 0)) return VmError::kStackOverflow;
+  return VmError::kNone;
+}
+
+VmError H_FCmpGt(TableContext& ctx, const std::uint8_t*, std::size_t&) {
+  std::int64_t a = 0, b = 0;
+  if (!ctx.pop(&b) || !ctx.pop(&a)) return VmError::kStackUnderflow;
+  double da = BitsToDouble(static_cast<std::uint64_t>(a));
+  double db = BitsToDouble(static_cast<std::uint64_t>(b));
+  if (!ctx.push(da > db ? 1 : 0)) return VmError::kStackOverflow;
+  return VmError::kNone;
+}
+
+VmError H_IntToFloat(TableContext& ctx, const std::uint8_t*, std::size_t&) {
+  std::int64_t a = 0;
+  if (!ctx.pop(&a)) return VmError::kStackUnderflow;
+  double da = static_cast<double>(a);
+  if (!ctx.push(static_cast<std::int64_t>(DoubleToBits(da)))) return VmError::kStackOverflow;
+  return VmError::kNone;
+}
+
+VmError H_FloatToInt(TableContext& ctx, const std::uint8_t*, std::size_t&) {
+  std::int64_t a = 0;
+  if (!ctx.pop(&a)) return VmError::kStackUnderflow;
+  double da = BitsToDouble(static_cast<std::uint64_t>(a));
+  if (!ctx.push(static_cast<std::int64_t>(da))) return VmError::kStackOverflow;
+  return VmError::kNone;
+}
+
+const TableOpcodeHandler* GetDirectThreadedDispatchTable() {
+  static TableOpcodeHandler table[256] = {nullptr};
+  static bool initialized = false;
+  if (!initialized) {
+    table[static_cast<std::uint8_t>(Opcode::kPushConst)] = H_PushConst;
+    table[static_cast<std::uint8_t>(Opcode::kPushLocal)] = H_PushLocal;
+    table[static_cast<std::uint8_t>(Opcode::kStoreLocal)] = H_StoreLocal;
+    table[static_cast<std::uint8_t>(Opcode::kDup)] = H_Dup;
+    table[static_cast<std::uint8_t>(Opcode::kPop)] = H_Pop;
+    table[static_cast<std::uint8_t>(Opcode::kAdd)] = H_Add;
+    table[static_cast<std::uint8_t>(Opcode::kSub)] = H_Sub;
+    table[static_cast<std::uint8_t>(Opcode::kMul)] = H_Mul;
+    table[static_cast<std::uint8_t>(Opcode::kDiv)] = H_Div;
+    table[static_cast<std::uint8_t>(Opcode::kMod)] = H_Mod;
+    table[static_cast<std::uint8_t>(Opcode::kAnd)] = H_And;
+    table[static_cast<std::uint8_t>(Opcode::kOr)] = H_Or;
+    table[static_cast<std::uint8_t>(Opcode::kXor)] = H_Xor;
+    table[static_cast<std::uint8_t>(Opcode::kNot)] = H_Not;
+    table[static_cast<std::uint8_t>(Opcode::kCmpEq)] = H_CmpEq;
+    table[static_cast<std::uint8_t>(Opcode::kCmpLt)] = H_CmpLt;
+    table[static_cast<std::uint8_t>(Opcode::kCmpGt)] = H_CmpGt;
+    table[static_cast<std::uint8_t>(Opcode::kJmp)] = H_Jmp;
+    table[static_cast<std::uint8_t>(Opcode::kJz)] = H_Jz;
+    table[static_cast<std::uint8_t>(Opcode::kJnz)] = H_Jnz;
+    table[static_cast<std::uint8_t>(Opcode::kRet)] = H_Ret;
+    table[static_cast<std::uint8_t>(Opcode::kLoadMem8)] = H_LoadMem8;
+    table[static_cast<std::uint8_t>(Opcode::kStoreMem8)] = H_StoreMem8;
+    table[static_cast<std::uint8_t>(Opcode::kLoadMem64)] = H_LoadMem64;
+    table[static_cast<std::uint8_t>(Opcode::kStoreMem64)] = H_StoreMem64;
+    table[static_cast<std::uint8_t>(Opcode::kCall)] = H_Call;
+    table[static_cast<std::uint8_t>(Opcode::kRetSub)] = H_RetSub;
+    table[static_cast<std::uint8_t>(Opcode::kCallProgram)] = H_CallProgram;
+    table[static_cast<std::uint8_t>(Opcode::kFAdd)] = H_FAdd;
+    table[static_cast<std::uint8_t>(Opcode::kFSub)] = H_FSub;
+    table[static_cast<std::uint8_t>(Opcode::kFMul)] = H_FMul;
+    table[static_cast<std::uint8_t>(Opcode::kFDiv)] = H_FDiv;
+    table[static_cast<std::uint8_t>(Opcode::kFCmpEq)] = H_FCmpEq;
+    table[static_cast<std::uint8_t>(Opcode::kFCmpLt)] = H_FCmpLt;
+    table[static_cast<std::uint8_t>(Opcode::kFCmpGt)] = H_FCmpGt;
+    table[static_cast<std::uint8_t>(Opcode::kIntToFloat)] = H_IntToFloat;
+    table[static_cast<std::uint8_t>(Opcode::kFloatToInt)] = H_FloatToInt;
+    initialized = true;
+  }
+  return table;
+}
+
+}  // namespace
+
+RunResult RunDirectThreadedTable(const Program& program,
+                                 const std::vector<std::int64_t>& args,
+                                 const OpcodeMap* opcode_map,
+                                 MemoryContext* mem_ctx,
+                                 std::size_t recursion_depth) {
+  // Direct-Threaded Jump-Table Engine (Flavor 3):
+  // Eliminates compiler-generated central switch tables and monolithic loops.
+  // Instead, individual opcode handlers are directly dispatched via a table of
+  // function pointers, creating a completely different decompiler control-flow
+  // structure that resists automated deobfuscation scripts.
+  RunResult result;
+  if (recursion_depth >= kMaxProgramRecursionDepth) {
+    result.error = VmError::kCallStackOverflow;
+    return result;
+  }
+
+  VerifyError verr = VerifyError::kNone;
+  auto instruction_starts = VerifyProgram(program, &verr, opcode_map);
+  if (!instruction_starts.has_value()) {
+    result.error = VmError::kVerificationFailed;
+    result.verify_error = verr;
+    return result;
+  }
+
+  if (args.size() > program.num_locals) {
+    result.error = VmError::kWrongNumberOfArgs;
+    return result;
+  }
+
+  static const OpcodeMap kDefaultOpcodeMap;
+  const OpcodeMap& map = opcode_map ? *opcode_map : kDefaultOpcodeMap;
+  const TableOpcodeHandler* dispatch_table = GetDirectThreadedDispatchTable();
+
+  TableContext ctx{
+      {},
+      0,
+      std::vector<std::int64_t>(program.num_locals, 0),
+      {},
+      program,
+      map,
+      mem_ctx,
+      recursion_depth,
+      0,
+      false,
+      0};
+
+  for (std::size_t k = 0; k < args.size(); ++k) ctx.locals[k] = args[k];
+
+  const auto& code = program.code;
+  std::size_t pc = 0;
+
+  while (!ctx.halted) {
+    if (ctx.executed >= kMaxExecutedInstructions) {
+      result.error = VmError::kInstructionBudgetExceeded;
+      result.instructions_executed = ctx.executed;
+      return result;
+    }
+    ++ctx.executed;
+
+    auto decoded_op = map.Decode(code[pc]);
+    Opcode op = *decoded_op;
+    const std::uint8_t* operand = (pc + 1 < code.size()) ? &code[pc + 1] : nullptr;
+    int operand_len = OperandBytes(op);
+    std::size_t next_pc = pc + 1 + static_cast<std::size_t>(operand_len);
+
+    TableOpcodeHandler handler = dispatch_table[static_cast<std::uint8_t>(op)];
+    if (!handler) {
+      result.error = VmError::kVerificationFailed;
+      result.instructions_executed = ctx.executed;
+      return result;
+    }
+
+    VmError err = handler(ctx, operand, next_pc);
+    if (err != VmError::kNone) {
+      result.error = err;
+      result.instructions_executed = ctx.executed;
+      return result;
+    }
+
+    pc = next_pc;
+  }
+
+  result.error = VmError::kNone;
+  result.value = ctx.return_val;
+  result.instructions_executed = ctx.executed;
+  return result;
 }
 
 }  // namespace rtprotect::vm
