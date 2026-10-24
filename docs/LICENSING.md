@@ -261,9 +261,11 @@ Over a rolling evaluation window (default 7 days), the engine correlates activat
 |---|---|---|
 | `SHARED_KEY_SYNDROME` | Distinct hardware fingerprints exceed licensed seat quota ($H > S$). | High to Critical (+0.15 to +0.50 score) |
 | `SUBNET_DISPERSION` | Activations originate from disparate /24 or /48 network subnets. | Medium to High (+0.10 to +0.35 score) |
-| `RAPID_SEAT_CHURN` | Abnormal seat deactivation/reallocation churn ($C > S \times 3$). | Medium (+0.05 to +0.25 score) |
+| `RAPID_SEAT_CHURN` | Abnormal seat deactivation/reallocation churn ($C > S \times 3$). | Medium (+0.15 to +0.25 score) |
 | `REPLAY_OR_BRUTE_FORCE_SPIKE` | Cryptographic nonce reuse or 429 rate limit triggers detected. | High (+0.15 per replay, +0.03 per 429) |
 | `SEAT_LIMIT_EXHAUSTION_SPIKE` | Repeated blocked activations exceeding available capacity. | Medium (+0.05 to +0.25 score) |
+| `ACTIVATION_FAILURE_BURST` | Repeated failed activation or renewal attempts ($\ge 5$). | Medium to High (+0.20 to +0.35 score) |
+| `REVOKED_LICENSE_ACTIVITY` | Active sessions or activation requests on a revoked/refunded key. | High to Critical (+0.30 to +0.50 score; forces `SUSPEND_LICENSE`) |
 
 ### 9.2 Automated Thresholds & Recommended Actions
 Based on cumulative risk scoring ($0.0$ to $1.0$):

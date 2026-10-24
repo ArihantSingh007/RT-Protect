@@ -86,4 +86,9 @@ class AbuseAnalyticsEngine {
   static std::string ToJson(const AbuseAnalyticsSummary& summary);
 };
 
+namespace internal {
+// Extracts normalized network prefix (/24 for IPv4, /48 for IPv6) for subnet clustering
+std::string ExtractSubnet(const std::string& ip);
+}  // namespace internal
+
 }  // namespace rtprotect::licensing

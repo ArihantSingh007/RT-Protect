@@ -647,13 +647,15 @@ double ActivationDatabase::ComputeSeatChurnRisk(const std::string& license_id,
   std::size_t abuse_events = 0;
 
   for (const auto& e : events_) {
-    if (e.license_id == license_id && e.timestamp >= window_start) {
+    if (e.license_id == license_id && e.timestamp >= window_start && e.timestamp <= current_time) {
       if (!e.device_fingerprint.empty()) {
         distinct_devices.insert(e.device_fingerprint);
       }
       if (e.type == ActivationEventType::kRateLimited ||
           e.type == ActivationEventType::kReplayBlocked ||
-          e.type == ActivationEventType::kSeatLimitExceeded) {
+          e.type == ActivationEventType::kSeatLimitExceeded ||
+          e.type == ActivationEventType::kActivationFailed ||
+          e.type == ActivationEventType::kRenewalFailed) {
         abuse_events++;
       }
     }
@@ -662,7 +664,7 @@ double ActivationDatabase::ComputeSeatChurnRisk(const std::string& license_id,
   auto act_it = activations_.find(license_id);
   if (act_it != activations_.end()) {
     for (const auto& a : act_it->second) {
-      if (a.last_seen >= window_start) {
+      if (a.last_seen >= window_start && a.last_seen <= current_time) {
         distinct_devices.insert(a.device_fingerprint);
       }
     }

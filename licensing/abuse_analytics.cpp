@@ -13,7 +13,7 @@
 
 namespace rtprotect::licensing {
 
-namespace {
+namespace internal {
 
 std::string ExtractSubnet(const std::string& ip) {
   if (ip.empty() || ip == "127.0.0.1" || ip == "localhost" || ip == "::1") {
@@ -30,23 +30,44 @@ std::string ExtractSubnet(const std::string& ip) {
       }
     }
   }
-  // IPv6 prefix extraction
-  std::size_t colon3 = 0;
-  int colon_count = 0;
-  for (std::size_t i = 0; i < ip.size(); ++i) {
-    if (ip[i] == ':') {
-      colon_count++;
-      if (colon_count == 3) {
-        colon3 = i;
-        break;
+  // IPv6 /48 prefix extraction
+  if (ip.find(':') != std::string::npos) {
+    std::size_t dcolon = ip.find("::");
+    std::size_t colon3 = std::string::npos;
+    int colon_count = 0;
+    for (std::size_t i = 0; i < ip.size(); ++i) {
+      if (ip[i] == ':') {
+        colon_count++;
+        if (colon_count == 3) {
+          colon3 = i;
+          break;
+        }
       }
     }
-  }
-  if (colon3 > 0) {
-    return ip.substr(0, colon3) + "::/48";
+    if (colon3 != std::string::npos && (dcolon == std::string::npos || colon3 <= dcolon)) {
+      std::string prefix = ip.substr(0, colon3);
+      while (!prefix.empty() && prefix.back() == ':') {
+        prefix.pop_back();
+      }
+      return prefix + "::/48";
+    }
+    if (dcolon != std::string::npos) {
+      if (dcolon == 0) {
+        return "::/48";
+      }
+      std::string prefix = ip.substr(0, dcolon);
+      while (!prefix.empty() && prefix.back() == ':') {
+        prefix.pop_back();
+      }
+      return prefix + "::/48";
+    }
   }
   return ip;
 }
+
+}  // namespace internal
+
+namespace {
 
 std::string EscapeJson(const std::string& s) {
   std::ostringstream o;
@@ -129,6 +150,7 @@ LicenseRiskReport AbuseAnalyticsEngine::AnalyzeLicense(
   std::size_t rate_limit_count = 0;
   std::size_t seat_exhaust_count = 0;
   std::size_t churn_swaps = 0;
+  std::size_t failed_activations = 0;
 
   for (const auto& ev : events) {
     if (ev.timestamp >= window_start && ev.timestamp <= current_time) {
@@ -137,7 +159,7 @@ LicenseRiskReport AbuseAnalyticsEngine::AnalyzeLicense(
         devices_in_window.insert(ev.device_fingerprint);
       }
       if (!ev.ip_address.empty()) {
-        subnets_in_window.insert(ExtractSubnet(ev.ip_address));
+        subnets_in_window.insert(internal::ExtractSubnet(ev.ip_address));
       }
 
       if (ev.type == ActivationEventType::kReplayBlocked) {
@@ -150,6 +172,10 @@ LicenseRiskReport AbuseAnalyticsEngine::AnalyzeLicense(
         seat_exhaust_count++;
         abuse_events++;
       } else if (ev.type == ActivationEventType::kActivationFailed) {
+        failed_activations++;
+        abuse_events++;
+      } else if (ev.type == ActivationEventType::kRenewalFailed) {
+        failed_activations++;
         abuse_events++;
       } else if (ev.type == ActivationEventType::kDeactivation) {
         churn_swaps++;
@@ -193,8 +219,10 @@ LicenseRiskReport AbuseAnalyticsEngine::AnalyzeLicense(
   }
 
   // 3. Rapid Seat Churn Detection
-  if (static_cast<std::uint64_t>(churn_swaps) > static_cast<std::uint64_t>(report.max_seats) * 3ULL) {
-    double impact = (std::min)(0.25, static_cast<double>(churn_swaps) * 0.05);
+  std::uint64_t churn_threshold = static_cast<std::uint64_t>(report.max_seats) * 3ULL;
+  if (static_cast<std::uint64_t>(churn_swaps) > churn_threshold) {
+    double churn_ratio = static_cast<double>(churn_swaps) / static_cast<double>(report.max_seats);
+    double impact = (std::min)(0.25, 0.15 + (churn_ratio - 3.0) * 0.05);
     raw_score += impact;
     LicenseAnomalyFlag flag;
     flag.flag_code = "RAPID_SEAT_CHURN";
@@ -228,6 +256,32 @@ LicenseRiskReport AbuseAnalyticsEngine::AnalyzeLicense(
     report.anomaly_flags.push_back(flag);
   }
 
+  // 6. Activation / Renewal Failure Bursts (Credential Stuffing or Key Tampering)
+  if (failed_activations >= 5) {
+    double impact = (std::min)(0.35, static_cast<double>(failed_activations) * 0.04);
+    raw_score += impact;
+    LicenseAnomalyFlag flag;
+    flag.flag_code = "ACTIVATION_FAILURE_BURST";
+    flag.description = "Repeated failed activation or renewal attempts (" + std::to_string(failed_activations) +
+                       " failed requests)";
+    flag.score_impact = impact;
+    report.anomaly_flags.push_back(flag);
+  }
+
+  // 7. Activity on Revoked or Refunded License
+  if (lic_opt.has_value() && lic_opt->status != LicenseRecordStatus::kActive) {
+    if (total_events > 0 || report.active_seats > 0) {
+      double impact = (std::min)(0.50, 0.30 + static_cast<double>(report.active_seats) * 0.10);
+      raw_score += impact;
+      LicenseAnomalyFlag flag;
+      flag.flag_code = "REVOKED_LICENSE_ACTIVITY";
+      flag.description = "Active seat sessions or activation attempts for " +
+                         std::string(ToString(lic_opt->status)) + " license";
+      flag.score_impact = impact;
+      report.anomaly_flags.push_back(flag);
+    }
+  }
+
   report.risk_score = (std::min)(1.0, (std::max)(0.0, raw_score));
 
   // Determine Severity and Action
@@ -243,6 +297,13 @@ LicenseRiskReport AbuseAnalyticsEngine::AnalyzeLicense(
   } else {
     report.severity = RiskSeverity::kLow;
     report.action = RecommendedAction::kAllow;
+  }
+
+  // Hard override: A revoked or refunded license can NEVER have an ALLOW or MONITOR recommendation
+  if (lic_opt.has_value() && lic_opt->status != LicenseRecordStatus::kActive) {
+    if (report.action == RecommendedAction::kAllow || report.action == RecommendedAction::kMonitor) {
+      report.action = RecommendedAction::kSuspendLicense;
+    }
   }
 
   return report;

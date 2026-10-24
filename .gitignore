@@ -9,3 +9,8 @@ dist/
 *.tmp
 __pycache__/
 *.pyc
+fuzz_artifacts/
+crash-*
+leak-*
+timeout-*
+oom-*

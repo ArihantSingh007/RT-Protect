@@ -105,6 +105,7 @@ jobs:
   windows-clang-fuzzing:
     name: Windows Clang libFuzzer + ASan/UBSan
     runs-on: windows-2022
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -135,21 +136,43 @@ jobs:
           $asanDll = (Get-ChildItem -Path "C:\Program Files\LLVM" -Filter "clang_rt.asan_dynamic-x86_64.dll" -Recurse | Select-Object -First 1).DirectoryName
           $env:PATH = "$asanDll;${{ github.workspace }}/third_party/openssl/bin;$env:PATH"
           
-          Write-Host "Running fuzz_pe_protector..."
-          .\build-fuzz\fuzz\fuzz_pe_protector.exe -max_total_time=20
-          
-          Write-Host "Running fuzz_json_parser..."
-          .\build-fuzz\fuzz\fuzz_json_parser.exe -max_total_time=20
-          
-          Write-Host "Running fuzz_manifest_deserialize..."
-          .\build-fuzz\fuzz\fuzz_manifest_deserialize.exe -max_total_time=20
-          
-          Write-Host "Running fuzz_vm_deserialize_and_verify..."
-          .\build-fuzz\fuzz\fuzz_vm_deserialize_and_verify.exe -max_total_time=20
-          
-          Write-Host "Running fuzz_encrypted_message_deserialize..."
-          .\build-fuzz\fuzz\fuzz_encrypted_message_deserialize.exe -max_total_time=20
-          
-          Write-Host "Running fuzz_source_scanner..."
-          .\build-fuzz\fuzz\fuzz_source_scanner.exe -max_total_time=20
+          New-Item -ItemType Directory -Force -Path fuzz_artifacts | Out-Null
+          $fuzzTargets = @(
+            "fuzz_pe_protector",
+            "fuzz_json_parser",
+            "fuzz_manifest_deserialize",
+            "fuzz_vm_deserialize_and_verify",
+            "fuzz_encrypted_message_deserialize",
+            "fuzz_source_scanner"
+          )
+          $failed = $false
+          $failedTargets = @()
+
+          foreach ($target in $fuzzTargets) {
+            Write-Host "`n=== Running $target (bounded pass) ===" -ForegroundColor Cyan
+            & ".\build-fuzz\fuzz\$target.exe" -artifact_prefix=fuzz_artifacts/ -max_total_time=20
+            if ($LASTEXITCODE -ne 0) {
+              Write-Error "Fuzzer $target reported a finding/crash (exit code $LASTEXITCODE)!"
+              $failed = $true
+              $failedTargets += $target
+            }
+          }
+
+          if ($failed) {
+            Write-Error "Scheduled fuzzing detected failures in: $($failedTargets -join ', ')"
+            exit 1
+          }
+
+      - name: Upload Fuzzing Crash Artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-crash-artifacts
+          path: |
+            fuzz_artifacts/*
+            crash-*
+            leak-*
+            timeout-*
+            oom-*
+          if-no-files-found: ignore
 

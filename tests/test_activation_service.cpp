@@ -1319,6 +1319,113 @@ MT_TEST(AbuseAnalytics_AnomalyDetectionAndScoring) {
   std::filesystem::remove(db_path, ec);
 }
 
+MT_TEST(AbuseAnalytics_EdgeCasesAndHardenedScoring) {
+  // 1. Verify Subnet Extraction across IPv4, IPv6 compressed, and loopback
+  MT_CHECK(rtprotect::licensing::internal::ExtractSubnet("192.168.1.100") == "192.168.1.0/24");
+  MT_CHECK(rtprotect::licensing::internal::ExtractSubnet("10.50.2.1") == "10.50.2.0/24");
+  MT_CHECK(rtprotect::licensing::internal::ExtractSubnet("127.0.0.1") == "127.0.0.0/8");
+  MT_CHECK(rtprotect::licensing::internal::ExtractSubnet("localhost") == "127.0.0.0/8");
+  MT_CHECK(rtprotect::licensing::internal::ExtractSubnet("::1") == "127.0.0.0/8");
+  MT_CHECK(rtprotect::licensing::internal::ExtractSubnet("") == "127.0.0.0/8");
+  MT_CHECK(rtprotect::licensing::internal::ExtractSubnet("2001:0db8:85a3:0000:0000:8a2e:0370:7334") == "2001:0db8:85a3::/48");
+  MT_CHECK(rtprotect::licensing::internal::ExtractSubnet("2001:db8::1") == "2001:db8::/48");
+  MT_CHECK(rtprotect::licensing::internal::ExtractSubnet("fe80::1") == "fe80::/48");
+  MT_CHECK(rtprotect::licensing::internal::ExtractSubnet("fe80::2") == "fe80::/48");
+
+  std::string db_path = MakeTempDbPath();
+  std::error_code ec;
+  std::filesystem::remove(db_path, ec);
+
+  ActivationDatabase db(db_path);
+
+  // 2. Activation and Renewal Failure Burst Detection
+  LicenseRecord lic_burst;
+  lic_burst.license_id = "lic-burst";
+  lic_burst.product_id = "com.vendor.product";
+  lic_burst.max_seats = 1;
+  lic_burst.created_at = 1700000000;
+  lic_burst.vm_root.fill(0x55);
+  MT_CHECK(db.RegisterLicense(lic_burst));
+
+  for (int i = 1; i <= 4; ++i) {
+    db.RecordEvent(ActivationEvent{1700001000ULL + i, ActivationEventType::kActivationFailed, "lic-burst", "DEV-STUFF", "192.168.1.50", "Invalid cred"});
+  }
+  db.RecordEvent(ActivationEvent{1700001010ULL, ActivationEventType::kRenewalFailed, "lic-burst", "DEV-STUFF", "192.168.1.50", "Token expired"});
+  db.RecordEvent(ActivationEvent{1700001011ULL, ActivationEventType::kRenewalFailed, "lic-burst", "DEV-STUFF", "192.168.1.50", "Token tampered"});
+
+  auto rep_burst = AbuseAnalyticsEngine::AnalyzeLicense(db, "lic-burst", 1700002000, 86400);
+  bool found_burst_flag = false;
+  for (const auto& f : rep_burst.anomaly_flags) {
+    if (f.flag_code == "ACTIVATION_FAILURE_BURST") {
+      found_burst_flag = true;
+      MT_CHECK(f.score_impact > 0.20);
+    }
+  }
+  MT_CHECK(found_burst_flag);
+  MT_CHECK(rep_burst.abuse_events_count == 6);
+
+  // 3. Revoked License with Activity
+  LicenseRecord lic_revoked;
+  lic_revoked.license_id = "lic-revoked";
+  lic_revoked.product_id = "com.vendor.product";
+  lic_revoked.status = LicenseRecordStatus::kRevoked;
+  lic_revoked.max_seats = 1;
+  lic_revoked.created_at = 1700000000;
+  lic_revoked.vm_root.fill(0x66);
+  MT_CHECK(db.RegisterLicense(lic_revoked));
+  db.RecordEvent(ActivationEvent{1700001050ULL, ActivationEventType::kActivationFailed, "lic-revoked", "DEV-PIRATE", "10.0.0.1", "Revoked"});
+
+  auto rep_revoked = AbuseAnalyticsEngine::AnalyzeLicense(db, "lic-revoked", 1700002000, 86400);
+  MT_CHECK(rep_revoked.action == RecommendedAction::kSuspendLicense);
+  bool found_revoked_flag = false;
+  for (const auto& f : rep_revoked.anomaly_flags) {
+    if (f.flag_code == "REVOKED_LICENSE_ACTIVITY") {
+      found_revoked_flag = true;
+    }
+  }
+  MT_CHECK(found_revoked_flag);
+
+  // 4. Multi-seat Churn Proportional Scaling
+  LicenseRecord lic_multi;
+  lic_multi.license_id = "lic-multi";
+  lic_multi.product_id = "com.vendor.product";
+  lic_multi.max_seats = 10;
+  lic_multi.created_at = 1700000000;
+  lic_multi.vm_root.fill(0x77);
+  MT_CHECK(db.RegisterLicense(lic_multi));
+  // 31 deactivations on 10 seats (threshold is 30, excess is 1)
+  for (int i = 1; i <= 31; ++i) {
+    db.RecordEvent(ActivationEvent{1700001000ULL + i, ActivationEventType::kDeactivation, "lic-multi", "DEV-" + std::to_string(i), "192.168.1.1", "Deactivated"});
+  }
+  auto rep_multi = AbuseAnalyticsEngine::AnalyzeLicense(db, "lic-multi", 1700002000, 86400);
+  bool found_churn = false;
+  for (const auto& f : rep_multi.anomaly_flags) {
+    if (f.flag_code == "RAPID_SEAT_CHURN") {
+      found_churn = true;
+      // Normalized churn ratio of 3.1 on 10 seats yields ~0.155 impact, NOT max capped 0.25
+      MT_CHECK(f.score_impact >= 0.150 && f.score_impact <= 0.160);
+    }
+  }
+  MT_CHECK(found_churn);
+
+  // 5. Unknown License handling
+  auto rep_unknown = AbuseAnalyticsEngine::AnalyzeLicense(db, "lic-nonexistent", 1700002000, 86400);
+  MT_CHECK(rep_unknown.severity == RiskSeverity::kLow);
+  MT_CHECK(rep_unknown.action == RecommendedAction::kAllow);
+
+  // 6. Future Timestamp Events Ignored
+  db.RecordEvent(ActivationEvent{1700009999ULL, ActivationEventType::kReplayBlocked, "lic-burst", "DEV-FUTURE", "192.168.1.1", "Future"});
+  auto rep_future = AbuseAnalyticsEngine::AnalyzeLicense(db, "lic-burst", 1700002000, 86400);
+  // Replay count should still be 0 within the evaluation time 1700002000
+  bool found_replay = false;
+  for (const auto& f : rep_future.anomaly_flags) {
+    if (f.flag_code == "REPLAY_OR_BRUTE_FORCE_SPIKE") found_replay = true;
+  }
+  MT_CHECK(!found_replay);
+
+  std::filesystem::remove(db_path, ec);
+}
+
 MT_TEST(HttpServer_Analytics_AdminAuthRequired) {
   std::string db_path = MakeTempDbPath();
   std::error_code ec;
