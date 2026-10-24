@@ -24,6 +24,7 @@ const char* ToString(VmError error) {
     case VmError::kMemoryAccessOutOfBounds: return "memory access out of bounds";
     case VmError::kCallStackOverflow: return "subroutine call stack overflow";
     case VmError::kCallStackUnderflow: return "return from subroutine without call frame";
+    case VmError::kInvalidNativeCall: return "invalid native function call";
   }
   return "unknown VmError";
 }
@@ -66,12 +67,16 @@ RunResult Run(const Program& program,
               const OpcodeMap* opcode_map,
               MemoryContext* mem_ctx,
               VmEngineFlavor flavor,
-              std::size_t recursion_depth) {
+              std::size_t recursion_depth,
+              const NativeFunctionTable* native_table) {
   if (flavor == VmEngineFlavor::kRegisterThreaded) {
-    return RunRegisterThreaded(program, args, opcode_map, mem_ctx, recursion_depth);
+    return RunRegisterThreaded(program, args, opcode_map, mem_ctx, recursion_depth, native_table);
   }
   if (flavor == VmEngineFlavor::kDirectThreadedTable) {
-    return RunDirectThreadedTable(program, args, opcode_map, mem_ctx, recursion_depth);
+    return RunDirectThreadedTable(program, args, opcode_map, mem_ctx, recursion_depth, native_table);
+  }
+  if (flavor == VmEngineFlavor::kIndirectTokenThreaded) {
+    return RunIndirectTokenThreaded(program, args, opcode_map, mem_ctx, recursion_depth, native_table);
   }
 
   RunResult result;
@@ -484,6 +489,37 @@ RunResult Run(const Program& program,
         }
         break;
       }
+      case Opcode::kCallNative: {
+        std::uint16_t native_id = ReadU16(operand);
+        if (!native_table) {
+          result.error = VmError::kInvalidNativeCall;
+          result.instructions_executed = executed;
+          return result;
+        }
+        std::int64_t arg = 0;
+        if (!pop(&arg)) {
+          result.error = VmError::kStackUnderflow;
+          result.instructions_executed = executed;
+          return result;
+        }
+        auto native_res = native_table->Invoke(native_id, arg);
+        if (!native_res.has_value()) {
+          result.error = VmError::kInvalidNativeCall;
+          result.instructions_executed = executed;
+          return result;
+        }
+        if (!push(*native_res)) {
+          result.error = VmError::kStackOverflow;
+          result.instructions_executed = executed;
+          return result;
+        }
+        break;
+      }
+      case Opcode::kInertNop1:
+      case Opcode::kInertNop2:
+      case Opcode::kInertNop3: {
+        break;
+      }
       case Opcode::kFAdd: {
         if (!pop(&b) || !pop(&a)) {
           result.error = VmError::kStackUnderflow;
@@ -662,7 +698,8 @@ RunResult RunRegisterThreaded(const Program& program,
                               const std::vector<std::int64_t>& args,
                               const OpcodeMap* opcode_map,
                               MemoryContext* mem_ctx,
-                              std::size_t recursion_depth) {
+                              std::size_t recursion_depth,
+                              const NativeFunctionTable* native_table) {
   // Register-Threaded Engine (Flavor 2):
   // Uses an internal 8-slot register window (R0..R7) and accumulator (acc)
   // with threaded execution semantics, creating completely different
@@ -1007,6 +1044,37 @@ RunResult RunRegisterThreaded(const Program& program,
         }
         break;
       }
+      case Opcode::kCallNative: {
+        std::uint16_t native_id = ReadU16(operand);
+        if (!native_table) {
+          result.error = VmError::kInvalidNativeCall;
+          result.instructions_executed = executed;
+          return result;
+        }
+        std::int64_t arg = 0;
+        if (!reg_pop(&arg)) {
+          result.error = VmError::kStackUnderflow;
+          result.instructions_executed = executed;
+          return result;
+        }
+        auto native_res = native_table->Invoke(native_id, arg);
+        if (!native_res.has_value()) {
+          result.error = VmError::kInvalidNativeCall;
+          result.instructions_executed = executed;
+          return result;
+        }
+        if (!reg_push(*native_res)) {
+          result.error = VmError::kStackOverflow;
+          result.instructions_executed = executed;
+          return result;
+        }
+        break;
+      }
+      case Opcode::kInertNop1:
+      case Opcode::kInertNop2:
+      case Opcode::kInertNop3: {
+        break;
+      }
       case Opcode::kFAdd: {
         if (!reg_pop(&b) || !reg_pop(&a)) { result.error = VmError::kStackUnderflow; result.instructions_executed = executed; return result; }
         double da = BitsToDouble(static_cast<std::uint64_t>(a));
@@ -1108,6 +1176,7 @@ struct TableContext {
   const OpcodeMap& map;
   MemoryContext* mem_ctx = nullptr;
   std::size_t recursion_depth = 0;
+  const NativeFunctionTable* native_table = nullptr;
   std::uint64_t executed = 0;
   bool halted = false;
   std::int64_t return_val = 0;
@@ -1450,6 +1519,21 @@ VmError H_FloatToInt(TableContext& ctx, const std::uint8_t*, std::size_t&) {
   return VmError::kNone;
 }
 
+VmError H_CallNative(TableContext& ctx, const std::uint8_t* operand, std::size_t&) {
+  if (!ctx.native_table) return VmError::kInvalidNativeCall;
+  std::uint16_t native_id = ReadU16(operand);
+  std::int64_t arg = 0;
+  if (!ctx.pop(&arg)) return VmError::kStackUnderflow;
+  auto native_res = ctx.native_table->Invoke(native_id, arg);
+  if (!native_res.has_value()) return VmError::kInvalidNativeCall;
+  if (!ctx.push(*native_res)) return VmError::kStackOverflow;
+  return VmError::kNone;
+}
+
+VmError H_InertNop(TableContext&, const std::uint8_t*, std::size_t&) {
+  return VmError::kNone;
+}
+
 const TableOpcodeHandler* GetDirectThreadedDispatchTable() {
   static const auto table = []() {
     std::array<TableOpcodeHandler, 256> t{};
@@ -1481,6 +1565,7 @@ const TableOpcodeHandler* GetDirectThreadedDispatchTable() {
     t[static_cast<std::uint8_t>(Opcode::kCall)] = H_Call;
     t[static_cast<std::uint8_t>(Opcode::kRetSub)] = H_RetSub;
     t[static_cast<std::uint8_t>(Opcode::kCallProgram)] = H_CallProgram;
+    t[static_cast<std::uint8_t>(Opcode::kCallNative)] = H_CallNative;
     t[static_cast<std::uint8_t>(Opcode::kFAdd)] = H_FAdd;
     t[static_cast<std::uint8_t>(Opcode::kFSub)] = H_FSub;
     t[static_cast<std::uint8_t>(Opcode::kFMul)] = H_FMul;
@@ -1490,6 +1575,9 @@ const TableOpcodeHandler* GetDirectThreadedDispatchTable() {
     t[static_cast<std::uint8_t>(Opcode::kFCmpGt)] = H_FCmpGt;
     t[static_cast<std::uint8_t>(Opcode::kIntToFloat)] = H_IntToFloat;
     t[static_cast<std::uint8_t>(Opcode::kFloatToInt)] = H_FloatToInt;
+    t[static_cast<std::uint8_t>(Opcode::kInertNop1)] = H_InertNop;
+    t[static_cast<std::uint8_t>(Opcode::kInertNop2)] = H_InertNop;
+    t[static_cast<std::uint8_t>(Opcode::kInertNop3)] = H_InertNop;
     return t;
   }();
   return table.data();
@@ -1501,7 +1589,8 @@ RunResult RunDirectThreadedTable(const Program& program,
                                  const std::vector<std::int64_t>& args,
                                  const OpcodeMap* opcode_map,
                                  MemoryContext* mem_ctx,
-                                 std::size_t recursion_depth) {
+                                 std::size_t recursion_depth,
+                                 const NativeFunctionTable* native_table) {
   // Direct-Threaded Jump-Table Engine (Flavor 3):
   // Eliminates compiler-generated central switch tables and monolithic loops.
   // Instead, individual opcode handlers are directly dispatched via a table of
@@ -1539,6 +1628,7 @@ RunResult RunDirectThreadedTable(const Program& program,
       map,
       mem_ctx,
       recursion_depth,
+      native_table,
       0,
       false,
       0};
@@ -1577,6 +1667,513 @@ RunResult RunDirectThreadedTable(const Program& program,
     }
 
     pc = next_pc;
+  }
+
+  result.error = VmError::kNone;
+  result.value = ctx.return_val;
+  result.instructions_executed = ctx.executed;
+  return result;
+}
+
+namespace {
+
+struct TokenContext;
+using TokenHandler = VmError (*)(TokenContext& ctx, std::uint64_t imm);
+
+struct TokenInstruction {
+  TokenHandler handler = nullptr;
+  std::uint64_t imm = 0;
+};
+
+struct TokenContext {
+  std::int64_t stack[kMaxStackDepth];
+  std::size_t sp = 0;
+  std::vector<std::int64_t> locals;
+  std::vector<std::size_t> call_stack;
+  MemoryContext* mem_ctx = nullptr;
+  const NativeFunctionTable* native_table = nullptr;
+  std::size_t recursion_depth = 0;
+  const OpcodeMap* opcode_map = nullptr;
+  std::uint64_t executed = 0;
+  bool halted = false;
+  std::int64_t return_val = 0;
+  std::size_t tip = 0;
+
+  bool push(std::int64_t v) {
+    if (sp >= kMaxStackDepth) return false;
+    stack[sp++] = v;
+    return true;
+  }
+  bool pop(std::int64_t* out) {
+    if (sp == 0) return false;
+    *out = stack[--sp];
+    return true;
+  }
+};
+
+VmError TH_PushConst(TokenContext& ctx, std::uint64_t imm) {
+  if (!ctx.push(static_cast<std::int64_t>(imm))) return VmError::kStackOverflow;
+  return VmError::kNone;
+}
+VmError TH_PushLocal(TokenContext& ctx, std::uint64_t imm) {
+  if (imm >= ctx.locals.size()) return VmError::kVerificationFailed;
+  if (!ctx.push(ctx.locals[imm])) return VmError::kStackOverflow;
+  return VmError::kNone;
+}
+VmError TH_StoreLocal(TokenContext& ctx, std::uint64_t imm) {
+  if (imm >= ctx.locals.size()) return VmError::kVerificationFailed;
+  std::int64_t v = 0;
+  if (!ctx.pop(&v)) return VmError::kStackUnderflow;
+  ctx.locals[imm] = v;
+  return VmError::kNone;
+}
+VmError TH_Dup(TokenContext& ctx, std::uint64_t) {
+  if (ctx.sp == 0) return VmError::kStackUnderflow;
+  if (ctx.sp >= kMaxStackDepth) return VmError::kStackOverflow;
+  ctx.stack[ctx.sp] = ctx.stack[ctx.sp - 1];
+  ++ctx.sp;
+  return VmError::kNone;
+}
+VmError TH_Pop(TokenContext& ctx, std::uint64_t) {
+  if (ctx.sp == 0) return VmError::kStackUnderflow;
+  --ctx.sp;
+  return VmError::kNone;
+}
+VmError TH_Add(TokenContext& ctx, std::uint64_t) {
+  std::int64_t b = 0, a = 0;
+  if (!ctx.pop(&b) || !ctx.pop(&a)) return VmError::kStackUnderflow;
+  auto res = CheckedAdd(a, b);
+  if (!res.has_value()) return VmError::kArithmeticOverflow;
+  if (!ctx.push(*res)) return VmError::kStackOverflow;
+  return VmError::kNone;
+}
+VmError TH_Sub(TokenContext& ctx, std::uint64_t) {
+  std::int64_t b = 0, a = 0;
+  if (!ctx.pop(&b) || !ctx.pop(&a)) return VmError::kStackUnderflow;
+  auto res = CheckedSub(a, b);
+  if (!res.has_value()) return VmError::kArithmeticOverflow;
+  if (!ctx.push(*res)) return VmError::kStackOverflow;
+  return VmError::kNone;
+}
+VmError TH_Mul(TokenContext& ctx, std::uint64_t) {
+  std::int64_t b = 0, a = 0;
+  if (!ctx.pop(&b) || !ctx.pop(&a)) return VmError::kStackUnderflow;
+  auto res = CheckedMul(a, b);
+  if (!res.has_value()) return VmError::kArithmeticOverflow;
+  if (!ctx.push(*res)) return VmError::kStackOverflow;
+  return VmError::kNone;
+}
+VmError TH_Div(TokenContext& ctx, std::uint64_t) {
+  std::int64_t b = 0, a = 0;
+  if (!ctx.pop(&b) || !ctx.pop(&a)) return VmError::kStackUnderflow;
+  if (b == 0) return VmError::kDivisionByZero;
+  auto res = CheckedDiv(a, b);
+  if (!res.has_value()) return VmError::kArithmeticOverflow;
+  if (!ctx.push(*res)) return VmError::kStackOverflow;
+  return VmError::kNone;
+}
+VmError TH_Mod(TokenContext& ctx, std::uint64_t) {
+  std::int64_t b = 0, a = 0;
+  if (!ctx.pop(&b) || !ctx.pop(&a)) return VmError::kStackUnderflow;
+  if (b == 0) return VmError::kDivisionByZero;
+  auto res = CheckedMod(a, b);
+  if (!res.has_value()) return VmError::kArithmeticOverflow;
+  if (!ctx.push(*res)) return VmError::kStackOverflow;
+  return VmError::kNone;
+}
+VmError TH_And(TokenContext& ctx, std::uint64_t) {
+  std::int64_t b = 0, a = 0;
+  if (!ctx.pop(&b) || !ctx.pop(&a)) return VmError::kStackUnderflow;
+  if (!ctx.push(a & b)) return VmError::kStackOverflow;
+  return VmError::kNone;
+}
+VmError TH_Or(TokenContext& ctx, std::uint64_t) {
+  std::int64_t b = 0, a = 0;
+  if (!ctx.pop(&b) || !ctx.pop(&a)) return VmError::kStackUnderflow;
+  if (!ctx.push(a | b)) return VmError::kStackOverflow;
+  return VmError::kNone;
+}
+VmError TH_Xor(TokenContext& ctx, std::uint64_t) {
+  std::int64_t b = 0, a = 0;
+  if (!ctx.pop(&b) || !ctx.pop(&a)) return VmError::kStackUnderflow;
+  if (!ctx.push(a ^ b)) return VmError::kStackOverflow;
+  return VmError::kNone;
+}
+VmError TH_Not(TokenContext& ctx, std::uint64_t) {
+  std::int64_t a = 0;
+  if (!ctx.pop(&a)) return VmError::kStackUnderflow;
+  if (!ctx.push(~a)) return VmError::kStackOverflow;
+  return VmError::kNone;
+}
+VmError TH_CmpEq(TokenContext& ctx, std::uint64_t) {
+  std::int64_t b = 0, a = 0;
+  if (!ctx.pop(&b) || !ctx.pop(&a)) return VmError::kStackUnderflow;
+  if (!ctx.push((a == b) ? 1 : 0)) return VmError::kStackOverflow;
+  return VmError::kNone;
+}
+VmError TH_CmpLt(TokenContext& ctx, std::uint64_t) {
+  std::int64_t b = 0, a = 0;
+  if (!ctx.pop(&b) || !ctx.pop(&a)) return VmError::kStackUnderflow;
+  if (!ctx.push((a < b) ? 1 : 0)) return VmError::kStackOverflow;
+  return VmError::kNone;
+}
+VmError TH_CmpGt(TokenContext& ctx, std::uint64_t) {
+  std::int64_t b = 0, a = 0;
+  if (!ctx.pop(&b) || !ctx.pop(&a)) return VmError::kStackUnderflow;
+  if (!ctx.push((a > b) ? 1 : 0)) return VmError::kStackOverflow;
+  return VmError::kNone;
+}
+VmError TH_Jmp(TokenContext& ctx, std::uint64_t imm) {
+  ctx.tip = static_cast<std::size_t>(imm);
+  return VmError::kNone;
+}
+VmError TH_Jz(TokenContext& ctx, std::uint64_t imm) {
+  std::int64_t a = 0;
+  if (!ctx.pop(&a)) return VmError::kStackUnderflow;
+  if (a == 0) ctx.tip = static_cast<std::size_t>(imm);
+  return VmError::kNone;
+}
+VmError TH_Jnz(TokenContext& ctx, std::uint64_t imm) {
+  std::int64_t a = 0;
+  if (!ctx.pop(&a)) return VmError::kStackUnderflow;
+  if (a != 0) ctx.tip = static_cast<std::size_t>(imm);
+  return VmError::kNone;
+}
+VmError TH_Ret(TokenContext& ctx, std::uint64_t) {
+  std::int64_t val = 0;
+  if (!ctx.pop(&val)) return VmError::kStackUnderflow;
+  ctx.return_val = val;
+  ctx.halted = true;
+  return VmError::kNone;
+}
+VmError TH_LoadMem8(TokenContext& ctx, std::uint64_t) {
+  if (!ctx.mem_ctx) return VmError::kMemoryAccessOutOfBounds;
+  std::int64_t addr = 0;
+  if (!ctx.pop(&addr)) return VmError::kStackUnderflow;
+  if (addr < 0 || static_cast<std::size_t>(addr) >= ctx.mem_ctx->data.size()) return VmError::kMemoryAccessOutOfBounds;
+  if (!ctx.push(ctx.mem_ctx->data[static_cast<std::size_t>(addr)])) return VmError::kStackOverflow;
+  return VmError::kNone;
+}
+VmError TH_StoreMem8(TokenContext& ctx, std::uint64_t) {
+  if (!ctx.mem_ctx) return VmError::kMemoryAccessOutOfBounds;
+  std::int64_t val = 0, addr = 0;
+  if (!ctx.pop(&val) || !ctx.pop(&addr)) return VmError::kStackUnderflow;
+  if (addr < 0 || static_cast<std::size_t>(addr) >= ctx.mem_ctx->data.size()) return VmError::kMemoryAccessOutOfBounds;
+  ctx.mem_ctx->data[static_cast<std::size_t>(addr)] = static_cast<std::uint8_t>(val & 0xFF);
+  return VmError::kNone;
+}
+VmError TH_LoadMem64(TokenContext& ctx, std::uint64_t) {
+  if (!ctx.mem_ctx) return VmError::kMemoryAccessOutOfBounds;
+  std::int64_t addr = 0;
+  if (!ctx.pop(&addr)) return VmError::kStackUnderflow;
+  if (addr < 0 || static_cast<std::size_t>(addr) + 8 > ctx.mem_ctx->data.size()) return VmError::kMemoryAccessOutOfBounds;
+  std::uint64_t raw = 0;
+  std::memcpy(&raw, &ctx.mem_ctx->data[static_cast<std::size_t>(addr)], 8);
+  if (!ctx.push(static_cast<std::int64_t>(raw))) return VmError::kStackOverflow;
+  return VmError::kNone;
+}
+VmError TH_StoreMem64(TokenContext& ctx, std::uint64_t) {
+  if (!ctx.mem_ctx) return VmError::kMemoryAccessOutOfBounds;
+  std::int64_t val = 0, addr = 0;
+  if (!ctx.pop(&val) || !ctx.pop(&addr)) return VmError::kStackUnderflow;
+  if (addr < 0 || static_cast<std::size_t>(addr) + 8 > ctx.mem_ctx->data.size()) return VmError::kMemoryAccessOutOfBounds;
+  std::uint64_t raw = static_cast<std::uint64_t>(val);
+  std::memcpy(&ctx.mem_ctx->data[static_cast<std::size_t>(addr)], &raw, 8);
+  return VmError::kNone;
+}
+VmError TH_Call(TokenContext& ctx, std::uint64_t imm) {
+  if (ctx.call_stack.size() >= kMaxProgramRecursionDepth) return VmError::kCallStackOverflow;
+  ctx.call_stack.push_back(ctx.tip);
+  ctx.tip = static_cast<std::size_t>(imm);
+  return VmError::kNone;
+}
+VmError TH_RetSub(TokenContext& ctx, std::uint64_t) {
+  if (ctx.call_stack.empty()) return VmError::kCallStackUnderflow;
+  ctx.tip = ctx.call_stack.back();
+  ctx.call_stack.pop_back();
+  return VmError::kNone;
+}
+VmError TH_CallProgram(TokenContext& ctx, std::uint64_t imm) {
+  if (ctx.recursion_depth >= kMaxProgramRecursionDepth) return VmError::kCallStackOverflow;
+  std::shared_ptr<const Program> callee = ProgramRegistry::Get(static_cast<std::uint16_t>(imm));
+  if (!callee) return VmError::kVerificationFailed;
+  std::vector<std::int64_t> callee_args(callee->num_locals, 0);
+  for (int k = static_cast<int>(callee->num_locals) - 1; k >= 0; --k) {
+    std::int64_t arg_val = 0;
+    if (!ctx.pop(&arg_val)) return VmError::kStackUnderflow;
+    callee_args[k] = arg_val;
+  }
+  auto sub_res = Run(*callee, callee_args, ctx.opcode_map, ctx.mem_ctx, VmEngineFlavor::kIndirectTokenThreaded, ctx.recursion_depth + 1, ctx.native_table);
+  if (sub_res.error != VmError::kNone) return sub_res.error;
+  ctx.executed += sub_res.instructions_executed;
+  if (!ctx.push(sub_res.value)) return VmError::kStackOverflow;
+  return VmError::kNone;
+}
+VmError TH_CallNative(TokenContext& ctx, std::uint64_t imm) {
+  if (!ctx.native_table) return VmError::kInvalidNativeCall;
+  std::int64_t arg = 0;
+  if (!ctx.pop(&arg)) return VmError::kStackUnderflow;
+  auto native_res = ctx.native_table->Invoke(static_cast<std::uint16_t>(imm), arg);
+  if (!native_res.has_value()) return VmError::kInvalidNativeCall;
+  if (!ctx.push(*native_res)) return VmError::kStackOverflow;
+  return VmError::kNone;
+}
+VmError TH_FAdd(TokenContext& ctx, std::uint64_t) {
+  std::int64_t b = 0, a = 0;
+  if (!ctx.pop(&b) || !ctx.pop(&a)) return VmError::kStackUnderflow;
+  double da = BitsToDouble(static_cast<std::uint64_t>(a));
+  double db = BitsToDouble(static_cast<std::uint64_t>(b));
+  double res = da + db;
+  if (!std::isfinite(res)) return VmError::kArithmeticOverflow;
+  if (!ctx.push(static_cast<std::int64_t>(DoubleToBits(res)))) return VmError::kStackOverflow;
+  return VmError::kNone;
+}
+VmError TH_FSub(TokenContext& ctx, std::uint64_t) {
+  std::int64_t b = 0, a = 0;
+  if (!ctx.pop(&b) || !ctx.pop(&a)) return VmError::kStackUnderflow;
+  double da = BitsToDouble(static_cast<std::uint64_t>(a));
+  double db = BitsToDouble(static_cast<std::uint64_t>(b));
+  double res = da - db;
+  if (!std::isfinite(res)) return VmError::kArithmeticOverflow;
+  if (!ctx.push(static_cast<std::int64_t>(DoubleToBits(res)))) return VmError::kStackOverflow;
+  return VmError::kNone;
+}
+VmError TH_FMul(TokenContext& ctx, std::uint64_t) {
+  std::int64_t b = 0, a = 0;
+  if (!ctx.pop(&b) || !ctx.pop(&a)) return VmError::kStackUnderflow;
+  double da = BitsToDouble(static_cast<std::uint64_t>(a));
+  double db = BitsToDouble(static_cast<std::uint64_t>(b));
+  double res = da * db;
+  if (!std::isfinite(res)) return VmError::kArithmeticOverflow;
+  if (!ctx.push(static_cast<std::int64_t>(DoubleToBits(res)))) return VmError::kStackOverflow;
+  return VmError::kNone;
+}
+VmError TH_FDiv(TokenContext& ctx, std::uint64_t) {
+  std::int64_t b = 0, a = 0;
+  if (!ctx.pop(&b) || !ctx.pop(&a)) return VmError::kStackUnderflow;
+  double da = BitsToDouble(static_cast<std::uint64_t>(a));
+  double db = BitsToDouble(static_cast<std::uint64_t>(b));
+  if (db == 0.0) return VmError::kDivisionByZero;
+  double res = da / db;
+  if (!std::isfinite(res)) return VmError::kArithmeticOverflow;
+  if (!ctx.push(static_cast<std::int64_t>(DoubleToBits(res)))) return VmError::kStackOverflow;
+  return VmError::kNone;
+}
+VmError TH_FCmpEq(TokenContext& ctx, std::uint64_t) {
+  std::int64_t b = 0, a = 0;
+  if (!ctx.pop(&b) || !ctx.pop(&a)) return VmError::kStackUnderflow;
+  double da = BitsToDouble(static_cast<std::uint64_t>(a));
+  double db = BitsToDouble(static_cast<std::uint64_t>(b));
+  if (!ctx.push((da == db) ? 1 : 0)) return VmError::kStackOverflow;
+  return VmError::kNone;
+}
+VmError TH_FCmpLt(TokenContext& ctx, std::uint64_t) {
+  std::int64_t b = 0, a = 0;
+  if (!ctx.pop(&b) || !ctx.pop(&a)) return VmError::kStackUnderflow;
+  double da = BitsToDouble(static_cast<std::uint64_t>(a));
+  double db = BitsToDouble(static_cast<std::uint64_t>(b));
+  if (!ctx.push((da < db) ? 1 : 0)) return VmError::kStackOverflow;
+  return VmError::kNone;
+}
+VmError TH_FCmpGt(TokenContext& ctx, std::uint64_t) {
+  std::int64_t b = 0, a = 0;
+  if (!ctx.pop(&b) || !ctx.pop(&a)) return VmError::kStackUnderflow;
+  double da = BitsToDouble(static_cast<std::uint64_t>(a));
+  double db = BitsToDouble(static_cast<std::uint64_t>(b));
+  if (!ctx.push((da > db) ? 1 : 0)) return VmError::kStackOverflow;
+  return VmError::kNone;
+}
+VmError TH_IntToFloat(TokenContext& ctx, std::uint64_t) {
+  std::int64_t a = 0;
+  if (!ctx.pop(&a)) return VmError::kStackUnderflow;
+  double da = static_cast<double>(a);
+  if (!ctx.push(static_cast<std::int64_t>(DoubleToBits(da)))) return VmError::kStackOverflow;
+  return VmError::kNone;
+}
+VmError TH_FloatToInt(TokenContext& ctx, std::uint64_t) {
+  std::int64_t a = 0;
+  if (!ctx.pop(&a)) return VmError::kStackUnderflow;
+  double da = BitsToDouble(static_cast<std::uint64_t>(a));
+  std::int64_t res = 0;
+  if (!SafeDoubleToInt64(da, &res)) return VmError::kArithmeticOverflow;
+  if (!ctx.push(res)) return VmError::kStackOverflow;
+  return VmError::kNone;
+}
+VmError TH_InertNop(TokenContext&, std::uint64_t) {
+  return VmError::kNone;
+}
+
+}  // namespace
+
+RunResult RunIndirectTokenThreaded(const Program& program,
+                                   const std::vector<std::int64_t>& args,
+                                   const OpcodeMap* opcode_map,
+                                   MemoryContext* mem_ctx,
+                                   std::size_t recursion_depth,
+                                   const NativeFunctionTable* native_table) {
+  // Indirect Token-Threaded Engine (Flavor 4):
+  // Translates the bytecode array upfront into an array of function pointer closures
+  // and direct operand tokens. Eliminates runtime instruction decoding loops, switch tables,
+  // and opcode dispatching entirely, defeating binary pattern-matching and linear devirtualizers.
+  RunResult result;
+  if (recursion_depth >= kMaxProgramRecursionDepth) {
+    result.error = VmError::kCallStackOverflow;
+    return result;
+  }
+
+  VerifyError verr = VerifyError::kNone;
+  auto instruction_starts = VerifyProgram(program, &verr, opcode_map);
+  if (!instruction_starts.has_value()) {
+    result.error = VmError::kVerificationFailed;
+    result.verify_error = verr;
+    return result;
+  }
+
+  if (args.size() > program.num_locals) {
+    result.error = VmError::kWrongNumberOfArgs;
+    return result;
+  }
+
+  static const OpcodeMap kDefaultOpcodeMap;
+  const OpcodeMap& map = opcode_map ? *opcode_map : kDefaultOpcodeMap;
+  const auto& code = program.code;
+
+  // Pass 1: Map byte offsets to token indexes
+  std::unordered_map<std::size_t, std::size_t> pc_to_token_idx;
+  std::size_t scan_pc = 0;
+  std::size_t token_count = 0;
+  while (scan_pc < code.size()) {
+    pc_to_token_idx[scan_pc] = token_count++;
+    auto decoded_op = map.Decode(code[scan_pc]);
+    Opcode op = *decoded_op;
+    scan_pc += 1 + static_cast<std::size_t>(OperandBytes(op));
+  }
+
+  // Pass 2: Build token stream
+  std::vector<TokenInstruction> tokens;
+  tokens.reserve(token_count);
+  scan_pc = 0;
+  while (scan_pc < code.size()) {
+    auto decoded_op = map.Decode(code[scan_pc]);
+    Opcode op = *decoded_op;
+    const std::uint8_t* operand = (scan_pc + 1 < code.size()) ? &code[scan_pc + 1] : nullptr;
+    int operand_len = OperandBytes(op);
+
+    TokenInstruction tok{};
+    switch (op) {
+      case Opcode::kPushConst:
+        tok.handler = TH_PushConst;
+        tok.imm = static_cast<std::uint64_t>(program.constants[ReadU16(operand)]);
+        break;
+      case Opcode::kPushLocal:
+        tok.handler = TH_PushLocal;
+        tok.imm = operand[0];
+        break;
+      case Opcode::kStoreLocal:
+        tok.handler = TH_StoreLocal;
+        tok.imm = operand[0];
+        break;
+      case Opcode::kDup: tok.handler = TH_Dup; break;
+      case Opcode::kPop: tok.handler = TH_Pop; break;
+      case Opcode::kAdd: tok.handler = TH_Add; break;
+      case Opcode::kSub: tok.handler = TH_Sub; break;
+      case Opcode::kMul: tok.handler = TH_Mul; break;
+      case Opcode::kDiv: tok.handler = TH_Div; break;
+      case Opcode::kMod: tok.handler = TH_Mod; break;
+      case Opcode::kAnd: tok.handler = TH_And; break;
+      case Opcode::kOr: tok.handler = TH_Or; break;
+      case Opcode::kXor: tok.handler = TH_Xor; break;
+      case Opcode::kNot: tok.handler = TH_Not; break;
+      case Opcode::kCmpEq: tok.handler = TH_CmpEq; break;
+      case Opcode::kCmpLt: tok.handler = TH_CmpLt; break;
+      case Opcode::kCmpGt: tok.handler = TH_CmpGt; break;
+      case Opcode::kJmp:
+        tok.handler = TH_Jmp;
+        tok.imm = pc_to_token_idx[ReadU16(operand)];
+        break;
+      case Opcode::kJz:
+        tok.handler = TH_Jz;
+        tok.imm = pc_to_token_idx[ReadU16(operand)];
+        break;
+      case Opcode::kJnz:
+        tok.handler = TH_Jnz;
+        tok.imm = pc_to_token_idx[ReadU16(operand)];
+        break;
+      case Opcode::kRet: tok.handler = TH_Ret; break;
+      case Opcode::kLoadMem8: tok.handler = TH_LoadMem8; break;
+      case Opcode::kStoreMem8: tok.handler = TH_StoreMem8; break;
+      case Opcode::kLoadMem64: tok.handler = TH_LoadMem64; break;
+      case Opcode::kStoreMem64: tok.handler = TH_StoreMem64; break;
+      case Opcode::kCall:
+        tok.handler = TH_Call;
+        tok.imm = pc_to_token_idx[ReadU16(operand)];
+        break;
+      case Opcode::kRetSub: tok.handler = TH_RetSub; break;
+      case Opcode::kCallProgram:
+        tok.handler = TH_CallProgram;
+        tok.imm = ReadU16(operand);
+        break;
+      case Opcode::kCallNative:
+        tok.handler = TH_CallNative;
+        tok.imm = ReadU16(operand);
+        break;
+      case Opcode::kFAdd: tok.handler = TH_FAdd; break;
+      case Opcode::kFSub: tok.handler = TH_FSub; break;
+      case Opcode::kFMul: tok.handler = TH_FMul; break;
+      case Opcode::kFDiv: tok.handler = TH_FDiv; break;
+      case Opcode::kFCmpEq: tok.handler = TH_FCmpEq; break;
+      case Opcode::kFCmpLt: tok.handler = TH_FCmpLt; break;
+      case Opcode::kFCmpGt: tok.handler = TH_FCmpGt; break;
+      case Opcode::kIntToFloat: tok.handler = TH_IntToFloat; break;
+      case Opcode::kFloatToInt: tok.handler = TH_FloatToInt; break;
+      case Opcode::kInertNop1:
+      case Opcode::kInertNop2:
+      case Opcode::kInertNop3:
+        tok.handler = TH_InertNop;
+        break;
+    }
+    tokens.push_back(tok);
+    scan_pc += 1 + static_cast<std::size_t>(operand_len);
+  }
+
+  TokenContext ctx{
+      {},
+      0,
+      std::vector<std::int64_t>(program.num_locals, 0),
+      {},
+      mem_ctx,
+      native_table,
+      recursion_depth,
+      opcode_map,
+      0,
+      false,
+      0,
+      0};
+
+  for (std::size_t k = 0; k < args.size(); ++k) ctx.locals[k] = args[k];
+
+  // Execution: direct token execution loop
+  while (!ctx.halted) {
+    if (ctx.executed >= kMaxExecutedInstructions) {
+      result.error = VmError::kInstructionBudgetExceeded;
+      result.instructions_executed = ctx.executed;
+      return result;
+    }
+    ++ctx.executed;
+
+    if (ctx.tip >= tokens.size()) {
+      result.error = VmError::kVerificationFailed;
+      result.instructions_executed = ctx.executed;
+      return result;
+    }
+
+    const auto& tok = tokens[ctx.tip++];
+    VmError err = tok.handler(ctx, tok.imm);
+    if (err != VmError::kNone) {
+      result.error = err;
+      result.instructions_executed = ctx.executed;
+      return result;
+    }
   }
 
   result.error = VmError::kNone;

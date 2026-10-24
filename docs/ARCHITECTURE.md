@@ -531,20 +531,84 @@ the full explanation.
 
 ### 1. Production v1 Baseline Scope
 The production baseline of RTProtect is architected around **compiler-assisted source instrumentation** and **hardware-anchored licensing authority**:
-- **Source-Level Clang AST Transformation:** Functions marked with `RTPROTECT_VIRTUALIZE` are transformed at build time into encrypted bytecode programs, executed inside an isolated multi-engine interpreter (Stack, Register-Threaded, or Direct-Threaded).
-- **Compile-Time Obfuscation & Sharding:** String literal encryption, control-flow flattening, and anti-tamper poisoned key derivation (`DeriveTamperBoundKey`).
+- **Source-Level Clang AST Transformation & Auto-Virtualization:** Functions tagged with `RTPROTECT_VIRTUALIZE` or automatically selected via `--auto-virtualize` under an execution budget (`--virtualization-budget`) are transformed at build time into encrypted bytecode programs, executed inside an isolated multi-engine interpreter (Stack, Register-Threaded, Direct-Threaded, or Token-Threaded).
+- **Compile-Time Obfuscation & Sharding:** String literal encryption, control-flow flattening, Mixed Boolean-Arithmetic (MBA) substitutions, invariant opaque predicates, and anti-tamper poisoned key derivation (`DeriveTamperBoundKey`).
 - **Cryptographic Licensing & Online Authority:** Ed25519 asymmetric signature verification, Windows DPAPI secret vault storage, token-bucket rate-limiting, and real-time abuse analytics (`/analytics`).
-- **Runtime Anti-Debugging & Hook Watchdogs:** Direct PEB inspection, hardware breakpoint monitoring, and early startup initialization gates.
+- **Runtime Anti-Debugging & Hook Watchdogs:** Direct PEB inspection, hardware breakpoint monitoring, dynamic API import hiding, and early startup initialization gates.
+- **Continuous Countermeasure Channel:** Cryptographically signed countermeasure configurations delivered over activation and renewal channels to update process/window blacklists and risk policy thresholds dynamically without recompilation.
 
 ### 2. Experimental Binary-Level PE Protector (`experimental-protect-binary`)
 The post-build PE binary protection module (`tooling/pe_protector.h`, `antitamper/section_protector.h`):
-- **Current Technical Implementation:** Encrypts designated executable sections (e.g. `.text`) with AES-256-CTR, obfuscates Import Address Table (IAT) names, and embeds a `PeProtectedSectionHeader` descriptor into the DOS stub area. The parser has been hardened with integer-underflow guards, 64-bit RVA overflow protection, a dedicated libFuzzer target (`fuzz/fuzz_pe_protector.cpp`), and a 1,000-iteration deterministic PRNG regression test.
+- **Current Technical Implementation:** Encrypts designated executable sections (e.g. `.text`) with AES-256-GCM and authenticates them before modifying memory, obfuscates Import Address Table (IAT) names, and embeds a version-2 `PeProtectedSectionHeader` descriptor into the DOS stub area. The key remains embedded, so this is an obfuscation and tamper-detection layer rather than a confidentiality boundary. The parser has integer-underflow guards, 64-bit RVA overflow protection, a dedicated libFuzzer target (`fuzz/fuzz_pe_protector.cpp`), and a deterministic malformed-input regression test.
 - **Why Gated as Experimental:** A production-grade binary packer requires a self-contained runtime bootstrap loader stub injected into the PE file to decrypt sections and restore IAT structures before the Windows loader hands execution to the original entry point. Because section encryption alters the binary on disk without a complete bootstrap loader, applying it directly to standard compiled executables interferes with normal Windows loader import binding and Authenticode signatures.
 - **Explicit Graduation Criteria (Pre-requisites for Production Promotion):**
   1. *Runtime Bootstrap Loader Stub:* Implement a zero-dependency assembly bootstrap loader stub injected into a dedicated PE section (`.rtpboot`) that runs before the original entry point (`OEP`), resolves APIs dynamically via PEB, restores decrypted code pages in-memory using `VirtualProtect`, and rebuilds IAT descriptors.
   2. *Quantitative Fuzzing Threshold:* Achieve a minimum of **100 CPU-hours** of continuous fuzzing on `fuzz_pe_protector` across varied PE corpora (console, GUI, DLLs, TLS callbacks) with **0 crashes, 0 memory leaks, and 0 sanitizer findings** under AddressSanitizer and UndefinedBehaviorSanitizer.
   3. *Real-World Application Validation Matrix:* Successfully transform, load, and execute at least 10 non-trivial native Windows x64 binaries (including multithreaded MSVC runtimes, C++ structured exception handling, and signed DLL dependencies) with 100% functional fidelity and zero loader regressions.
   Until all three criteria are met and independently verified, the binary patching engine remains gated strictly under `experimental-protect-binary` and is omitted from standard production workflows.
+
+## Commercial Denuvo-Class Structural Hardening Architecture
+
+To bridge the structural divergence between traditional opt-in source protection and commercial-grade binary protection (such as Denuvo or VMProtect), RTProtect implements a six-pillar structural hardening system:
+
+### Pillar 1: Automated Coverage Breadth & Expanded C Subset
+- **Expanded C Compiler Subsystem (`bytecode_vm/compiler.cpp`):** Recursive-descent compiler supports complex algorithmic constructs:
+  - `for` loops with arbitrary init, test, and post-step expressions.
+  - `break` and `continue` statement handling across nested loop contexts.
+  - Array indexing expressions (`arr[i]`) mapped to bounds-checked pointer/offset arithmetic.
+  - Struct and pointer member access (`s.field`, `s->field`) with computed field byte offsets.
+  - Native FFI invocation boundary (`call_native(id, arg)`) via `Opcode::kCallNative` (0x73) and `NativeFunctionTable`.
+- **AST Candidate Selection (`tooling/clang_ast_scanner.h`, `tooling/clang_ast_scanner.cpp`):**
+  - Project-wide AST traversal via Clang libTooling to identify virtualization candidates without manual source annotation.
+  - Multi-factor suitability scoring (`FunctionSuitabilityScore`): Call-graph centrality (in-degree), cyclomatic complexity, and statement volume.
+  - Hot-path loop penalty: Applies an 80% score reduction to frame render routines, tick callbacks, and tight loops to preserve real-time performance.
+  - CLI automation: `--auto-virtualize` and `--virtualization-budget <pct>` automatically tag the highest-scoring functions up to the specified percentage budget.
+
+### Pillar 2: Value Entanglement & Load-Bearing Protection
+- **Mathematical Risk Folding (`antitamper/risk_policy.h`):**
+  - Replaces central bypassable boolean checks (`if (is_tampered) abort();`) with mathematical value entanglement (`FoldTamperStateDelta`, `FoldTamperStateMask`).
+  - Business logic and gameplay calculations fold anti-tamper risk perturbations into their intermediate and return states. Clean environments yield invariant transformations (delta = 0, mask = ~0ULL), while detected tamper states silently corrupt application state.
+  - Unified clean environment invariant: Legitimate hypervisors and low-risk virtualization environments (WSL2 / Hyper-V) are preserved without false-positive state corruption.
+- **AST Weak-Entanglement Linter (`ClangAstScanner::CheckFunctionEntanglement`):**
+  - Analyzes AST return expressions of security-sensitive and virtualized functions.
+  - Flags trivial boolean gates returning raw status codes without arithmetic entanglement, warning during integration before deployment.
+- **Cross-Function State Chaining (`FunctionCrossLink`):**
+  - Emits and verifies non-linear state tokens (`DepositToken`, `VerifyToken`) across virtualized function call chains, ensuring functions cannot be called out-of-order or decoupled from the protection pipeline.
+
+### Pillar 3: Evolving Multi-Engine VM Architectures
+- **Four Structurally Distinct Interpreters (`bytecode_vm/vm.h`, `bytecode_vm/vm.cpp`):**
+  - **Stack-Based (`kStackBased`):** Traditional stack evaluation engine.
+  - **Register-Threaded (`kRegisterThreaded`):** 16 virtual registers with explicit register-to-register operations.
+  - **Direct-Threaded (`kDirectThreadedTable`):** Direct-threaded jump table dispatch.
+  - **Indirect Token-Threaded (`kIndirectTokenThreaded`):** Token-threaded function-pointer array dispatch (`s_token_handlers`), eliminating runtime opcode decoding, central switch tables, and branch prediction patterns.
+- **Per-Function Randomized Selection:** Wrapper generation randomizes engine flavor per function using `(fn_hash ^ opcode_seed) % 4`. Reverse engineers cannot build a single decompiler targeting a uniform interpreter dispatch loop.
+- **Polymorphic Inert NOP Opcodes:** Build-specific inert instructions (`Opcode::kInertNop1..3` = 0x90..0x92) injected with randomized operand lengths to introduce disassembly desynchronization, instruction stream noise, and timing jitter.
+
+### Pillar 4: Virtualized Anti-Tamper Probes & Safe FFI Boundary
+- **Tight Native FFI Allowlist (`NativeFunctionTable`):**
+  - `Opcode::kCallNative` restricts native execution strictly to registered function pointers in an immutable allowlist table, blocking arbitrary pointer execution or shellcode injection from VM bytecode.
+- **Virtualized Environment Risk Assessment (`AssessEnvironmentRiskVirtualized`):**
+  - Compiles anti-tamper signal collection (PEB inspection, debug port queries, memory hook scans) into VM bytecode.
+  - Probing sequence and instruction interleaving are randomized per build seed, removing predictable static signatures.
+
+### Pillar 5: PE Protector Scoped Execution & Native-Code Obfuscation
+- **Anti-Dump Scoped Execution (`antitamper/section_protector.h`, `ScopedSectionExecution`):**
+  - Thread-safe RAII in-memory decrypt-execute-re-encrypt protection for sensitive PE code sections.
+  - Utilizes atomic execution refcounting (`s_active_executions`) to maintain plaintext code pages strictly during execution and re-encrypt the section under AES-256-GCM when execution counts reach zero, defeating static memory dumpers.
+- **Dynamic API Import Hiding (`antitamper/dynamic_import.h`):**
+  - `RTPROTECT_RESOLVE_API` and `RTPROTECT_CALL_API` macros resolve Win32 imports via compile-time FNV-1a hashes directly from PEB module export lists, preventing import table hooking and static IAT inspection.
+- **Native Obfuscation Templates (`obfuscation/control_flow.h`):**
+  - Mixed Boolean-Arithmetic (MBA) identities (`MbaAdd`, `MbaSub`, `MbaXor`, `MbaEqual`).
+  - Invariant algebraic opaque predicates (`OpaquePredicateTrue`, `OpaquePredicateFalse`, `OpaquePredicateEqual`).
+  - Control-flow flattening state machines (`RTPROTECT_FLATTEN_BEGIN/CASE/TRANSITION/EXIT/END`).
+
+### Pillar 6: Continuous Response & Cryptographic Countermeasure Channel
+- **Signed Countermeasure Payloads (`licensing/countermeasure_config.h`):**
+  - Ed25519-signed countermeasure configuration packets delivered over online token activation and renewal channels (`/activate`, `/renew`).
+  - Supports dynamic updates to process blacklists, window title blacklists, and anti-tamper risk threshold configurations.
+  - Persisted securely in local OS credential storage (`RTSS` container).
+- **Runtime Application without Rebuilding:**
+  - Client activations dynamically apply countermeasure updates at runtime via decoupled observer hooks (`SetCountermeasureUpdateHook`, `NotifyCountermeasureUpdate`), allowing vendors to neutralize newly discovered reverse-engineering tools and cheat engines instantly without redistributing the protected binary.
 
 ## What this project does not cover, project-wide
 

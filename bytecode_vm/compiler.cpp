@@ -24,6 +24,11 @@ enum class TokenType {
   kIf,
   kElse,
   kWhile,
+  kFor,
+  kBreak,
+  kContinue,
+  kStruct,
+  kCallNative,
   kLoad8,
   kStore8,
   kLoad64,
@@ -49,8 +54,12 @@ enum class TokenType {
   kAssign,
   kSemicolon,
   kComma,
+  kDot,
+  kArrow,
   kLParen,
   kRParen,
+  kLBracket,
+  kRBracket,
   kLBrace,
   kRBrace
 };
@@ -81,11 +90,34 @@ class Lexer {
         ++pos_;
       }
       std::string id = src_.substr(start, pos_ - start);
+      // Clang reports fixed-width types using their fully qualified spelling.
+      // Accept the common standard-library alias so functions selected by
+      // the integration scanner compile identically to their unqualified form.
+      if (id == "std" && src_.compare(pos_, 2, "::") == 0) {
+        std::size_t type_start = pos_ + 2;
+        while (type_start < src_.size() &&
+               std::isspace(static_cast<unsigned char>(src_[type_start]))) {
+          ++type_start;
+        }
+        constexpr char kInt64Name[] = "int64_t";
+        if (src_.compare(type_start, sizeof(kInt64Name) - 1, kInt64Name) == 0 &&
+            (type_start + sizeof(kInt64Name) - 1 == src_.size() ||
+             !(std::isalnum(static_cast<unsigned char>(src_[type_start + sizeof(kInt64Name) - 1])) ||
+               src_[type_start + sizeof(kInt64Name) - 1] == '_'))) {
+          pos_ = type_start + sizeof(kInt64Name) - 1;
+          return {TokenType::kTypeInt64, "std::int64_t", 0, line_};
+        }
+      }
       if (id == "int64_t" || id == "int" || id == "long") return {TokenType::kTypeInt64, id, 0, line_};
       if (id == "return") return {TokenType::kReturn, id, 0, line_};
       if (id == "if") return {TokenType::kIf, id, 0, line_};
       if (id == "else") return {TokenType::kElse, id, 0, line_};
       if (id == "while") return {TokenType::kWhile, id, 0, line_};
+      if (id == "for") return {TokenType::kFor, id, 0, line_};
+      if (id == "break") return {TokenType::kBreak, id, 0, line_};
+      if (id == "continue") return {TokenType::kContinue, id, 0, line_};
+      if (id == "struct") return {TokenType::kStruct, id, 0, line_};
+      if (id == "call_native") return {TokenType::kCallNative, id, 0, line_};
       if (id == "load8") return {TokenType::kLoad8, id, 0, line_};
       if (id == "store8") return {TokenType::kStore8, id, 0, line_};
       if (id == "load64") return {TokenType::kLoad64, id, 0, line_};
@@ -114,14 +146,19 @@ class Lexer {
     ++pos_;
     switch (c) {
       case '+': return {TokenType::kPlus, "+", 0, line_};
-      case '-': return {TokenType::kMinus, "-", 0, line_};
+      case '-':
+        if (pos_ < src_.size() && src_[pos_] == '>') { ++pos_; return {TokenType::kArrow, "->", 0, line_}; }
+        return {TokenType::kMinus, "-", 0, line_};
       case '*': return {TokenType::kStar, "*", 0, line_};
       case '/': return {TokenType::kSlash, "/", 0, line_};
       case '%': return {TokenType::kPercent, "%", 0, line_};
       case '~': return {TokenType::kTilde, "~", 0, line_};
       case '^': return {TokenType::kCaret, "^", 0, line_};
+      case '.': return {TokenType::kDot, ".", 0, line_};
       case '(': return {TokenType::kLParen, "(", 0, line_};
       case ')': return {TokenType::kRParen, ")", 0, line_};
+      case '[': return {TokenType::kLBracket, "[", 0, line_};
+      case ']': return {TokenType::kRBracket, "]", 0, line_};
       case '{': return {TokenType::kLBrace, "{", 0, line_};
       case '}': return {TokenType::kRBrace, "}", 0, line_};
       case ';': return {TokenType::kSemicolon, ";", 0, line_};
@@ -344,6 +381,9 @@ class Parser {
       auto loop_start = builder_->NewLabel();
       auto loop_end = builder_->NewLabel();
 
+      loop_break_stack_.push_back(loop_end);
+      loop_continue_stack_.push_back(loop_start);
+
       builder_->Mark(loop_start);
       Consume(TokenType::kLParen);
       ParseExpression();
@@ -353,6 +393,119 @@ class Parser {
       ParseStatement();
       builder_->Jmp(loop_start);
       builder_->Mark(loop_end);
+
+      loop_break_stack_.pop_back();
+      loop_continue_stack_.pop_back();
+      return;
+    }
+
+    if (curr_.type == TokenType::kFor) {
+      Consume(TokenType::kFor);
+      Consume(TokenType::kLParen);
+      // 1. Init
+      if (curr_.type == TokenType::kTypeInt64) {
+        Consume(TokenType::kTypeInt64);
+        Token var_tok = Consume(TokenType::kIdent);
+        std::uint8_t l_idx = AllocateLocal(var_tok.text);
+        if (curr_.type == TokenType::kAssign) {
+          Consume(TokenType::kAssign);
+          ParseExpression();
+          builder_->StoreLocal(l_idx);
+        }
+        Consume(TokenType::kSemicolon);
+      } else if (curr_.type == TokenType::kIdent) {
+        Token var_tok = Consume(TokenType::kIdent);
+        Consume(TokenType::kAssign);
+        ParseExpression();
+        builder_->StoreLocal(GetLocal(var_tok.text));
+        Consume(TokenType::kSemicolon);
+      } else {
+        Consume(TokenType::kSemicolon);
+      }
+
+      auto cond_lbl = builder_->NewLabel();
+      auto step_lbl = builder_->NewLabel();
+      auto body_lbl = builder_->NewLabel();
+      auto loop_end = builder_->NewLabel();
+
+      builder_->Mark(cond_lbl);
+      if (curr_.type != TokenType::kSemicolon) {
+        ParseExpression();
+        builder_->Jz(loop_end);
+      }
+      Consume(TokenType::kSemicolon);
+
+      std::string step_var;
+      bool has_step = false;
+      if (curr_.type == TokenType::kIdent) {
+        has_step = true;
+        step_var = Consume(TokenType::kIdent).text;
+        Consume(TokenType::kAssign);
+      }
+
+      builder_->Jmp(body_lbl);
+
+      builder_->Mark(step_lbl);
+      if (has_step) {
+        ParseExpression();
+        builder_->StoreLocal(GetLocal(step_var));
+      }
+      builder_->Jmp(cond_lbl);
+
+      Consume(TokenType::kRParen);
+
+      builder_->Mark(body_lbl);
+      loop_break_stack_.push_back(loop_end);
+      loop_continue_stack_.push_back(step_lbl);
+
+      ParseStatement();
+
+      loop_break_stack_.pop_back();
+      loop_continue_stack_.pop_back();
+
+      builder_->Jmp(step_lbl);
+      builder_->Mark(loop_end);
+      return;
+    }
+
+    if (curr_.type == TokenType::kBreak) {
+      Consume(TokenType::kBreak);
+      Consume(TokenType::kSemicolon);
+      if (loop_break_stack_.empty()) {
+        throw std::runtime_error("break statement outside loop on line " + std::to_string(curr_.line));
+      }
+      builder_->Jmp(loop_break_stack_.back());
+      return;
+    }
+
+    if (curr_.type == TokenType::kContinue) {
+      Consume(TokenType::kContinue);
+      Consume(TokenType::kSemicolon);
+      if (loop_continue_stack_.empty()) {
+        throw std::runtime_error("continue statement outside loop on line " + std::to_string(curr_.line));
+      }
+      builder_->Jmp(loop_continue_stack_.back());
+      return;
+    }
+
+    if (curr_.type == TokenType::kStruct) {
+      Consume(TokenType::kStruct);
+      Token s_name = Consume(TokenType::kIdent);
+      Consume(TokenType::kLBrace);
+      StructDef s_def;
+      s_def.name = s_name.text;
+      std::size_t offset = 0;
+      while (curr_.type != TokenType::kRBrace && curr_.type != TokenType::kEof) {
+        Consume(TokenType::kTypeInt64);
+        Token field_tok = Consume(TokenType::kIdent);
+        Consume(TokenType::kSemicolon);
+        s_def.field_offsets[field_tok.text] = offset;
+        offset += 8;
+      }
+      s_def.total_size = offset;
+      Consume(TokenType::kRBrace);
+      Consume(TokenType::kSemicolon);
+      structs_[s_def.name] = s_def;
       return;
     }
 
@@ -385,6 +538,40 @@ class Parser {
 
     if (curr_.type == TokenType::kIdent) {
       Token var_token = Consume(TokenType::kIdent);
+      if (curr_.type == TokenType::kLBracket) {
+        Consume(TokenType::kLBracket);
+        builder_->PushLocal(GetLocal(var_token.text));
+        ParseExpression(); // index
+        builder_->PushConst(8);
+        builder_->Mul();
+        builder_->Add(); // address
+        Consume(TokenType::kRBracket);
+        Consume(TokenType::kAssign);
+        ParseExpression(); // value
+        Consume(TokenType::kSemicolon);
+        builder_->StoreMem64();
+        return;
+      }
+      if (curr_.type == TokenType::kDot || curr_.type == TokenType::kArrow) {
+        Consume(curr_.type);
+        Token field_tok = Consume(TokenType::kIdent);
+        std::size_t offset = 0;
+        for (const auto& [sn, sd] : structs_) {
+          auto it = sd.field_offsets.find(field_tok.text);
+          if (it != sd.field_offsets.end()) {
+            offset = it->second;
+            break;
+          }
+        }
+        builder_->PushLocal(GetLocal(var_token.text));
+        builder_->PushConst(static_cast<std::int64_t>(offset));
+        builder_->Add(); // address
+        Consume(TokenType::kAssign);
+        ParseExpression(); // value
+        Consume(TokenType::kSemicolon);
+        builder_->StoreMem64();
+        return;
+      }
       std::uint8_t local_idx = GetLocal(var_token.text);
       Consume(TokenType::kAssign);
       ParseExpression();
@@ -558,8 +745,48 @@ class Parser {
       return;
     }
 
+    if (curr_.type == TokenType::kCallNative) {
+      Consume(TokenType::kCallNative);
+      Consume(TokenType::kLParen);
+      Token id_tok = Consume(TokenType::kNumber);
+      std::uint16_t native_id = static_cast<std::uint16_t>(id_tok.number);
+      Consume(TokenType::kComma);
+      ParseExpression(); // arg
+      Consume(TokenType::kRParen);
+      builder_->CallNative(native_id);
+      return;
+    }
+
     if (curr_.type == TokenType::kIdent) {
       Token t = Consume(TokenType::kIdent);
+      if (curr_.type == TokenType::kLBracket) {
+        Consume(TokenType::kLBracket);
+        builder_->PushLocal(GetLocal(t.text));
+        ParseExpression(); // index
+        builder_->PushConst(8);
+        builder_->Mul();
+        builder_->Add(); // address
+        Consume(TokenType::kRBracket);
+        builder_->LoadMem64();
+        return;
+      }
+      if (curr_.type == TokenType::kDot || curr_.type == TokenType::kArrow) {
+        Consume(curr_.type);
+        Token field_tok = Consume(TokenType::kIdent);
+        std::size_t offset = 0;
+        for (const auto& [sn, sd] : structs_) {
+          auto it = sd.field_offsets.find(field_tok.text);
+          if (it != sd.field_offsets.end()) {
+            offset = it->second;
+            break;
+          }
+        }
+        builder_->PushLocal(GetLocal(t.text));
+        builder_->PushConst(static_cast<std::int64_t>(offset));
+        builder_->Add(); // address
+        builder_->LoadMem64();
+        return;
+      }
       std::uint8_t local_idx = GetLocal(t.text);
       builder_->PushLocal(local_idx);
       return;
@@ -582,6 +809,15 @@ class Parser {
   std::unordered_map<std::string, std::uint8_t> locals_;
   bool has_returned_ = false;
   bool has_enclosing_brace_ = false;
+
+  struct StructDef {
+    std::string name;
+    std::unordered_map<std::string, std::size_t> field_offsets;
+    std::size_t total_size = 0;
+  };
+  std::unordered_map<std::string, StructDef> structs_;
+  std::vector<int> loop_break_stack_;
+  std::vector<int> loop_continue_stack_;
 };
 
 }  // namespace

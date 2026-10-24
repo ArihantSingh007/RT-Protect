@@ -253,7 +253,7 @@ MT_TEST(PeProtector_EncryptsCodeSectionAndEmbedsHeader) {
   const auto* hdr = FindProtectedSectionHeader(pe.data());
   MT_CHECK(hdr != nullptr);
   MT_CHECK(hdr->magic == kPeProtectorMagic);
-  MT_CHECK(hdr->version == 1);
+  MT_CHECK(hdr->version == 2);
   MT_CHECK(hdr->section_rva == sec->VirtualAddress);
   MT_CHECK(hdr->section_size == sec->SizeOfRawData);
 }
@@ -293,6 +293,29 @@ MT_TEST(PeProtector_DecryptionRestoresOriginalCode) {
   const std::uint8_t* decrypted_code = static_cast<const std::uint8_t*>(loaded_image) + sec->VirtualAddress;
   MT_CHECK(std::memcmp(decrypted_code, original_code.data(), original_code.size()) == 0);
 
+  VirtualFree(loaded_image, 0, MEM_RELEASE);
+}
+
+MT_TEST(PeProtector_GcmRejectsSectionTampering) {
+  auto pe = CreateSyntheticPe64();
+  auto* sec = IMAGE_FIRST_SECTION(reinterpret_cast<IMAGE_NT_HEADERS64*>(pe.data() + 0x100));
+  PeProtectionOptions opts;
+  opts.obfuscate_imports = false;
+  PeProtectionResult res;
+  MT_CHECK(PeProtector::ProtectMemory(pe, opts, &res));
+
+  void* loaded_image = VirtualAlloc(nullptr, 0x3000, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+  MT_CHECK(loaded_image != nullptr);
+  std::memcpy(loaded_image, pe.data(), 0x400);
+  auto* loaded_bytes = static_cast<std::uint8_t*>(loaded_image);
+  std::memcpy(loaded_bytes + sec->VirtualAddress, pe.data() + sec->PointerToRawData, sec->SizeOfRawData);
+  loaded_bytes[sec->VirtualAddress] ^= 0x01;
+  const std::uint8_t tampered_byte = loaded_bytes[sec->VirtualAddress];
+
+  const auto* hdr = FindProtectedSectionHeader(loaded_image);
+  MT_CHECK(hdr != nullptr);
+  MT_CHECK(!DecryptProtectedSectionInMemory(*hdr, loaded_image));
+  MT_CHECK(loaded_bytes[sec->VirtualAddress] == tampered_byte);
   VirtualFree(loaded_image, 0, MEM_RELEASE);
 }
 

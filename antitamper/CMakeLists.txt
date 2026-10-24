@@ -7,4 +7,4 @@ add_library(rtprotect_antitamper STATIC
     section_protector.cpp
 )
 target_include_directories(rtprotect_antitamper PUBLIC ${CMAKE_SOURCE_DIR})
-target_link_libraries(rtprotect_antitamper PUBLIC rtprotect_crypto rtprotect_integrity)
+target_link_libraries(rtprotect_antitamper PUBLIC rtprotect_crypto rtprotect_integrity rtprotect_vm)

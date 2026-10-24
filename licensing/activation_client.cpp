@@ -22,6 +22,7 @@
 
 #include "crypto/aead.h"
 #include "crypto/kdf.h"
+#include "licensing/countermeasure_config.h"
 #include "licensing/hardware_id.h"
 #include "licensing/trusted_time.h"
 #include "tooling/simple_json.h"
@@ -661,6 +662,24 @@ std::optional<ActivationToken> RequestOnlineActivation(
   // Anchor verified server timestamp for monotonic trusted time enforcement
   TrustedTime::AnchorServerTime(product_id, token.issued_at);
 
+  // Dynamic Countermeasure Updates (Continuous Response Channel)
+  if (obj.contains("countermeasure_config")) {
+    std::string cm_hex = obj["countermeasure_config"].as_string();
+    if (!cm_hex.empty() && cm_hex.size() % 2 == 0) {
+      std::vector<std::uint8_t> cm_raw(cm_hex.size() / 2);
+      if (HexToBytes(cm_hex, cm_raw.data(), cm_raw.size())) {
+        auto cm_cfg = DeserializeCountermeasureConfig(cm_raw.data(), cm_raw.size());
+        if (cm_cfg.has_value() && VerifyCountermeasureConfigSignature(*cm_cfg, vendor_pubkey)) {
+          auto cur_cfg = LoadCountermeasureConfig(product_id);
+          if (!cur_cfg.has_value() || cm_cfg->sequence_number >= cur_cfg->sequence_number) {
+            SaveCountermeasureConfig(product_id, *cm_cfg);
+            NotifyCountermeasureUpdate(*cm_cfg);
+          }
+        }
+      }
+    }
+  }
+
   return token;
 }
 
@@ -756,6 +775,24 @@ std::optional<ActivationToken> RequestOnlineRenewal(
 
   // Anchor renewed server timestamp for monotonic trusted time enforcement
   TrustedTime::AnchorServerTime(renewed.license_id, renewed.issued_at);
+
+  // Dynamic Countermeasure Updates (Continuous Response Channel)
+  if (obj.contains("countermeasure_config")) {
+    std::string cm_hex = obj["countermeasure_config"].as_string();
+    if (!cm_hex.empty() && cm_hex.size() % 2 == 0) {
+      std::vector<std::uint8_t> cm_raw(cm_hex.size() / 2);
+      if (HexToBytes(cm_hex, cm_raw.data(), cm_raw.size())) {
+        auto cm_cfg = DeserializeCountermeasureConfig(cm_raw.data(), cm_raw.size());
+        if (cm_cfg.has_value() && VerifyCountermeasureConfigSignature(*cm_cfg, vendor_pubkey)) {
+          auto cur_cfg = LoadCountermeasureConfig(renewed.license_id);
+          if (!cur_cfg.has_value() || cm_cfg->sequence_number >= cur_cfg->sequence_number) {
+            SaveCountermeasureConfig(renewed.license_id, *cm_cfg);
+            NotifyCountermeasureUpdate(*cm_cfg);
+          }
+        }
+      }
+    }
+  }
 
   return renewed;
 }

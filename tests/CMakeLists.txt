@@ -119,7 +119,7 @@ target_include_directories(test_update_manifest PRIVATE ${CMAKE_SOURCE_DIR})
 add_test(NAME test_update_manifest COMMAND test_update_manifest)
 
 add_executable(test_antitamper test_antitamper.cpp)
-target_link_libraries(test_antitamper PRIVATE rtprotect_antitamper)
+target_link_libraries(test_antitamper PRIVATE rtprotect_antitamper rtprotect_licensing)
 target_include_directories(test_antitamper PRIVATE ${CMAKE_SOURCE_DIR})
 add_test(NAME test_antitamper COMMAND test_antitamper)
 
@@ -142,6 +142,21 @@ add_executable(test_pe_protector test_pe_protector.cpp)
 target_link_libraries(test_pe_protector PRIVATE rtprotect_tooling rtprotect_antitamper)
 target_include_directories(test_pe_protector PRIVATE ${CMAKE_SOURCE_DIR})
 add_test(NAME test_pe_protector COMMAND test_pe_protector)
+
+# Exercise the shipped consumer sample through the actual integration CLI,
+# generated VM wrapper, runtime authorization path, and tamper rejection.
+find_program(RTPROTECT_POWERSHELL_EXECUTABLE NAMES pwsh powershell)
+if(RTPROTECT_POWERSHELL_EXECUTABLE)
+  add_test(NAME test_sample_e2e
+    COMMAND "${RTPROTECT_POWERSHELL_EXECUTABLE}"
+            -NoProfile -ExecutionPolicy Bypass
+            -File "${CMAKE_CURRENT_SOURCE_DIR}/test_sample_e2e.ps1"
+            -Tool "$<TARGET_FILE:rtprotect-tool>"
+            -SampleSource "${CMAKE_SOURCE_DIR}/examples/sample_client_app"
+            -RtprotectRoot "${CMAKE_SOURCE_DIR}"
+            -BuildRoot "${CMAKE_BINARY_DIR}")
+  set_tests_properties(test_sample_e2e PROPERTIES TIMEOUT 180)
+endif()
 
 # Phase 6 tests only exist when the experimental module itself is built --
 # see top-level CMakeLists.txt's RTPROTECT_ENABLE_EXPERIMENTAL_RUNTIME_RECONSTRUCTION.

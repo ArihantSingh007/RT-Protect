@@ -3,6 +3,7 @@
 #include "licensing/activation.h"
 #include "licensing/activation_client.h"
 #include "licensing/activation_server.h"
+#include "licensing/countermeasure_config.h"
 #include "licensing/secure_storage.h"
 #include "licensing/hardware_id.h"
 #include "integrity/keys.h"
@@ -558,6 +559,59 @@ MT_TEST(ActivationClient_ParseUrl_FailClosed) {
   MT_CHECK(!ParseUrl("https://example.com:999999/api").has_value());
   MT_CHECK(!ParseUrl("https://example.com:-1/api").has_value());
   MT_CHECK(!ParseUrl("https://example.com:abc/api").has_value());
+}
+
+MT_TEST(CountermeasureConfig_SignVerifyAndRoundtrip) {
+  auto kp = MakeKeyPair();
+
+  CountermeasureConfig cfg;
+  cfg.sequence_number = 42;
+  cfg.issued_at = 1750000000;
+  cfg.expires_at = 1750100000;
+  cfg.blacklisted_process_names = { "x64dbg.exe", "ida64.exe", "cheatengine.exe" };
+  cfg.blacklisted_process_hashes = { 0x11223344, 0x55667788 };
+  cfg.blacklisted_window_titles = { "Cheat Engine 7.5", "x64dbg" };
+  cfg.blacklisted_driver_hashes = { 0xAABBCCDD };
+  cfg.risk_threshold_restrict = 35;
+  cfg.risk_threshold_terminate = 70;
+  cfg.enforce_hardware_breakpoints = true;
+  cfg.enforce_timing_checks = true;
+  cfg.enforce_memory_hooks = true;
+  cfg.enforce_anti_dump = true;
+
+  // Sign configuration
+  MT_CHECK(SignCountermeasureConfig(cfg, kp.private_key));
+
+  // Verify valid signature
+  MT_CHECK(VerifyCountermeasureConfigSignature(cfg, kp.public_key));
+
+  // Signature verification fails if payload is tampered
+  CountermeasureConfig tampered = cfg;
+  tampered.risk_threshold_restrict = 99;
+  MT_CHECK(!VerifyCountermeasureConfigSignature(tampered, kp.public_key));
+
+  // Serialization and deserialization roundtrip
+  auto wire = SerializeCountermeasureConfig(cfg);
+  auto parsed = DeserializeCountermeasureConfig(wire.data(), wire.size());
+  MT_CHECK(parsed.has_value());
+  MT_CHECK(parsed->sequence_number == 42);
+  MT_CHECK(parsed->issued_at == 1750000000);
+  MT_CHECK(parsed->expires_at == 1750100000);
+  MT_CHECK(parsed->blacklisted_process_names.size() == 3);
+  MT_CHECK(parsed->blacklisted_process_names[0] == "x64dbg.exe");
+  MT_CHECK(parsed->blacklisted_process_hashes.size() == 2);
+  MT_CHECK(parsed->blacklisted_window_titles.size() == 2);
+  MT_CHECK(parsed->blacklisted_driver_hashes.size() == 1);
+  MT_CHECK(parsed->risk_threshold_restrict == 35);
+  MT_CHECK(parsed->risk_threshold_terminate == 70);
+  MT_CHECK(VerifyCountermeasureConfigSignature(*parsed, kp.public_key));
+
+  // Persistence in SecureStorage
+  MT_CHECK(SaveCountermeasureConfig("com.test.countermeasure", cfg));
+  auto loaded = LoadCountermeasureConfig("com.test.countermeasure");
+  MT_CHECK(loaded.has_value());
+  MT_CHECK(loaded->sequence_number == 42);
+  MT_CHECK(VerifyCountermeasureConfigSignature(*loaded, kp.public_key));
 }
 
 MT_MAIN()

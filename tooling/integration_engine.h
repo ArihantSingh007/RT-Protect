@@ -72,6 +72,8 @@ struct IntegrationOptions {
   std::string content_key_path;      // Dedicated content encryption master key (separated from signing key)
   std::string vm_root_file;          // Optional explicit binary file for release VM root
   std::string vm_root_hex;           // Optional explicit 64-char hex string for release VM root
+  bool auto_virtualize = false;       // Whole-program automated candidate selection without manual annotations
+  double virtualization_budget = 25.0;// Virtualization overhead budget: percentage of eligible functions to protect
 };
 
 struct ChangePlan {

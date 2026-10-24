@@ -93,6 +93,7 @@ StackEffect GetStackEffect(Opcode op) {
       return {1, -1};
     case Opcode::kLoadMem8:
     case Opcode::kLoadMem64:
+    case Opcode::kCallNative:
       return {1, 0};
     case Opcode::kStoreMem8:
     case Opcode::kStoreMem64:
@@ -100,6 +101,9 @@ StackEffect GetStackEffect(Opcode op) {
     case Opcode::kCall:
     case Opcode::kRetSub:
     case Opcode::kCallProgram:
+    case Opcode::kInertNop1:
+    case Opcode::kInertNop2:
+    case Opcode::kInertNop3:
       return {0, 0};
   }
   return {0, 0};  // unreachable: every Opcode value is handled above, and

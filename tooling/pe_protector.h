@@ -7,8 +7,8 @@
 //
 // DESIGN & SECURITY NOTICE:
 // 1. This module is EXPERIMENTAL and NOT ready for production deployments.
-// 2. Client-side embedded AES keys provide static string obfuscation only; they do not provide
-//    confidentiality against an adversary with memory access or debugging tools on the host.
+// 2. The key is embedded in the image; section encryption is an obfuscation step, not a
+//    confidentiality boundary against an adversary with access to the binary or process memory.
 // 3. Modifying PE files on disk without a complete runtime bootstrap loader will interfere with
 //    normal Windows loader import binding and Authenticode code signatures.
 
@@ -33,7 +33,7 @@ struct PeProtectedSectionHeader {
   std::uint8_t key[32];              // AES-256 key for CTR decryption
   std::uint8_t iv[16];               // AES-256 CTR IV/nonce
   std::uint32_t original_protect;    // Original memory protection (PAGE_* constant, e.g. PAGE_EXECUTE_READ)
-  std::uint32_t checksum;            // FNV-1a checksum of encrypted section data
+  std::uint8_t tag[16];              // AES-256-GCM authentication tag
   std::uint32_t obfuscated_imports;  // Number of IAT import entries obfuscated
 };
 #pragma pack(pop)
@@ -57,7 +57,7 @@ inline DWORD SectionCharacteristicsToPageProtection(DWORD characteristics) {
 
 struct PeProtectionOptions {
   std::string target_section = ".text"; // Section name to encrypt (typically .text)
-  bool encrypt_section = true;          // Enable AES-256-CTR section encryption
+  bool encrypt_section = true;          // Enable AES-256-GCM section encryption
   bool obfuscate_imports = true;        // Enable IAT import name obfuscation
   std::string custom_key_hex;           // Optional 64-hex-character AES key (auto-generated if empty)
 };
@@ -70,7 +70,7 @@ struct PeProtectionResult {
   std::size_t imports_obfuscated = 0;
   std::array<std::uint8_t, 32> encryption_key{};
   std::array<std::uint8_t, 16> iv{};
-  std::uint32_t checksum = 0;
+  std::uint32_t checksum = 0; // Deprecated; authentication is provided by the GCM tag.
 };
 
 class PeProtector {

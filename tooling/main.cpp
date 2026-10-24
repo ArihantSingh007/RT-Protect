@@ -156,6 +156,8 @@ void PrintUsage() {
       "      --content-key <file>              Dedicated 32-byte content encryption master key\n"
       "      --vm-root <hex>                   Canonical 64-character hex VM root seed\n"
       "      --vm-root-file <file>             File containing 32-byte VM root seed\n"
+      "      --auto-virtualize                 Automated AST candidate selection without manual annotations\n"
+      "      --virtualization-budget <pct>     Virtualization budget percentage (default: 25.0)\n"
       "      --rtprotect-root <dir>            Root path to RTProtect distribution / SDK\n"
       "      --no-build                        Skip automatic build and verification\n"
       "      --non-interactive                 Do not prompt for confirmation\n"
@@ -535,6 +537,10 @@ int CmdIntegrate(int argc, char** argv) {
       options.vm_root_hex = argv[++i];
     } else if (arg == "--vm-root-file" && i + 1 < argc) {
       options.vm_root_file = argv[++i];
+    } else if (arg == "--auto-virtualize") {
+      options.auto_virtualize = true;
+    } else if (arg == "--virtualization-budget" && i + 1 < argc) {
+      options.virtualization_budget = std::stod(argv[++i]);
     } else {
       std::fprintf(stderr, "Unknown option: %s\n", arg.c_str());
       return 2;
@@ -570,7 +576,11 @@ int CmdIntegrate(int argc, char** argv) {
 
   switch (report.state) {
     case IntegrationState::kValidated:
-      std::printf("Integration and validation succeeded! [STATE: VALIDATED (READY FOR RELEASE)]\n");
+      if (options.use_dev_keys) {
+        std::printf("Integration and validation succeeded! [STATE: VALIDATED (DEVELOPMENT KEYS - NOT FOR RELEASE)]\n");
+      } else {
+        std::printf("Integration and validation succeeded! [STATE: VALIDATED (READY FOR RELEASE)]\n");
+      }
       break;
     case IntegrationState::kAwaitingSignature:
       std::printf("Project staged successfully! [STATE: AWAITING SIGNATURE (STAGED, UNSIGNED)]\n");

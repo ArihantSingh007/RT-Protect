@@ -16,6 +16,7 @@
 #include "integrity/keys.h"
 #include "licensing/activation.h"
 #include "licensing/activation_database.h"
+#include "licensing/countermeasure_config.h"
 #include "licensing/rate_limiter.h"
 
 namespace rtprotect::licensing {
@@ -44,6 +45,7 @@ struct ActivateResponse {
   std::string error_message;
   std::array<std::uint8_t, 32> server_nonce{};
   std::string encrypted_token_hex;
+  std::string countermeasure_config_hex; // Optional serialized/signed countermeasure update
   std::optional<ActivationToken> token; // Decrypted token for direct in-process callers
 };
 
@@ -59,6 +61,7 @@ struct RenewResponse {
   std::string error_message;
   std::array<std::uint8_t, 32> server_nonce{};
   std::string encrypted_token_hex;
+  std::string countermeasure_config_hex; // Optional serialized/signed countermeasure update
   std::optional<ActivationToken> token;
 };
 
@@ -99,6 +102,10 @@ class ActivationService {
   double ComputeSeatChurnRisk(const std::string& license_id, std::uint64_t current_time = 0) const;
   std::vector<ActivationEvent> GetRecentEvents(const std::string& license_id = "", std::size_t limit = 100) const;
 
+  // Continuous Response Countermeasure updates
+  void SetCountermeasureConfig(const CountermeasureConfig& config) { countermeasure_config_ = config; }
+  std::optional<CountermeasureConfig> GetCountermeasureConfig() const { return countermeasure_config_; }
+
   // Configures whether licenses must have an activation credential verifier (default: false for test/dev, enabled for production)
   void SetRequireActivationCredentials(bool req) { require_activation_credentials_ = req; }
   bool require_activation_credentials() const { return require_activation_credentials_; }
@@ -118,6 +125,7 @@ class ActivationService {
   RateLimiter license_rate_limiter_{1.0, 10.0}; // 1 req/sec, burst 10 requests per license
   RateLimiter ip_rate_limiter_{5.0, 20.0};      // 5 req/sec, burst 20 requests per IP
   bool require_activation_credentials_{false};
+  std::optional<CountermeasureConfig> countermeasure_config_;
 };
 
 }  // namespace rtprotect::licensing

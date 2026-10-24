@@ -67,6 +67,7 @@ enum class Opcode : std::uint8_t {
   kCall = 0x70,         // operand: u16 absolute byte offset. Push return_pc to call_stack; jump to target.
   kRetSub = 0x71,       // no operand. Pop return_pc from call_stack; jump to return_pc.
   kCallProgram = 0x72,  // operand: u16 program ID in ProgramRegistry. Invoke registered Program.
+  kCallNative = 0x73,   // operand: u16 native function ID in NativeFunctionTable. Safe FFI boundary.
 
   // --- floating point (IEEE-754 64-bit double precision) ---
   kFAdd = 0x80,        // pop b, pop a, push (double)a + (double)b
@@ -78,6 +79,11 @@ enum class Opcode : std::uint8_t {
   kFCmpGt = 0x86,      // pop b, pop a, push (double)a > (double)b ? 1 : 0
   kIntToFloat = 0x87,  // pop int64_t a, push (double)a bitcast
   kFloatToInt = 0x88,  // pop (double)a bitcast, push (int64_t)a
+
+  // --- polymorphic inert opcodes (per-build inert operations) ---
+  kInertNop1 = 0x90,   // no operand. Inert NOP specific to current opcode permutation.
+  kInertNop2 = 0x91,   // no operand. Inert NOP.
+  kInertNop3 = 0x92,   // no operand. Inert NOP.
 };
 
 // Returns the number of operand bytes following the opcode byte (0, 1, or 2).
@@ -91,6 +97,7 @@ inline int OperandBytes(Opcode op) {
     case Opcode::kJnz:
     case Opcode::kCall:
     case Opcode::kCallProgram:
+    case Opcode::kCallNative:
       return 2;
     case Opcode::kPushLocal:
     case Opcode::kStoreLocal:
@@ -124,6 +131,9 @@ inline int OperandBytes(Opcode op) {
     case Opcode::kFCmpGt:
     case Opcode::kIntToFloat:
     case Opcode::kFloatToInt:
+    case Opcode::kInertNop1:
+    case Opcode::kInertNop2:
+    case Opcode::kInertNop3:
       return 0;
   }
   return -1;
@@ -140,10 +150,11 @@ inline bool IsValidOpcode(std::uint8_t byte) {
     case Opcode::kRet:
     case Opcode::kLoadMem8: case Opcode::kStoreMem8:
     case Opcode::kLoadMem64: case Opcode::kStoreMem64:
-    case Opcode::kCall: case Opcode::kRetSub: case Opcode::kCallProgram:
+    case Opcode::kCall: case Opcode::kRetSub: case Opcode::kCallProgram: case Opcode::kCallNative:
     case Opcode::kFAdd: case Opcode::kFSub: case Opcode::kFMul: case Opcode::kFDiv:
     case Opcode::kFCmpEq: case Opcode::kFCmpLt: case Opcode::kFCmpGt:
     case Opcode::kIntToFloat: case Opcode::kFloatToInt:
+    case Opcode::kInertNop1: case Opcode::kInertNop2: case Opcode::kInertNop3:
       return true;
   }
   return false;

@@ -294,6 +294,10 @@ ActivateResponse ActivationService::ProcessActivate(const ActivateRequest& req, 
   auto wire_bytes = encrypted->Serialize();
   resp.encrypted_token_hex = BytesToHex(wire_bytes.data(), wire_bytes.size());
   resp.token = token;
+  if (countermeasure_config_.has_value()) {
+    auto cm_bytes = SerializeCountermeasureConfig(*countermeasure_config_);
+    resp.countermeasure_config_hex = BytesToHex(cm_bytes.data(), cm_bytes.size());
+  }
   resp.status = ActivationStatus::kValid;
   db_.RecordEvent({current_time, ActivationEventType::kActivationSuccess, safe_license_id, req.device_fingerprint, req.client_ip, "Activated seat seq=" + std::to_string(seat_res.sequence_number)});
   return resp;
@@ -473,6 +477,10 @@ RenewResponse ActivationService::ProcessRenew(const RenewRequest& req, std::uint
   auto wire_bytes = encrypted->Serialize();
   resp.encrypted_token_hex = BytesToHex(wire_bytes.data(), wire_bytes.size());
   resp.token = renewed;
+  if (countermeasure_config_.has_value()) {
+    auto cm_bytes = SerializeCountermeasureConfig(*countermeasure_config_);
+    resp.countermeasure_config_hex = BytesToHex(cm_bytes.data(), cm_bytes.size());
+  }
   resp.status = ActivationStatus::kValid;
   db_.RecordEvent({current_time, ActivationEventType::kRenewalSuccess, token.license_id, req.device_fingerprint, req.client_ip, "Renewed seat seq=" + std::to_string(renewed.sequence_number)});
   return resp;
@@ -596,8 +604,11 @@ std::string ActivationService::HandleActivateJson(const std::string& json_body, 
     ss << "  \"error\": \"" << EscapeJsonString(resp.error_message) << "\",\n";
   }
   ss << "  \"server_nonce\": \"" << BytesToHex(resp.server_nonce.data(), resp.server_nonce.size()) << "\",\n";
-  ss << "  \"encrypted_token\": \"" << resp.encrypted_token_hex << "\"\n";
-  ss << "}\n";
+  ss << "  \"encrypted_token\": \"" << resp.encrypted_token_hex << "\"";
+  if (!resp.countermeasure_config_hex.empty()) {
+    ss << ",\n  \"countermeasure_config\": \"" << resp.countermeasure_config_hex << "\"";
+  }
+  ss << "\n}\n";
   return ss.str();
 }
 
@@ -662,8 +673,11 @@ std::string ActivationService::HandleRenewJson(const std::string& json_body, std
     ss << "  \"error\": \"" << EscapeJsonString(resp.error_message) << "\",\n";
   }
   ss << "  \"server_nonce\": \"" << BytesToHex(resp.server_nonce.data(), resp.server_nonce.size()) << "\",\n";
-  ss << "  \"encrypted_token\": \"" << resp.encrypted_token_hex << "\"\n";
-  ss << "}\n";
+  ss << "  \"encrypted_token\": \"" << resp.encrypted_token_hex << "\"";
+  if (!resp.countermeasure_config_hex.empty()) {
+    ss << ",\n  \"countermeasure_config\": \"" << resp.countermeasure_config_hex << "\"";
+  }
+  ss << "\n}\n";
   return ss.str();
 }
 

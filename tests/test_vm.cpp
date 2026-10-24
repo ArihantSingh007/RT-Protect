@@ -6,6 +6,7 @@
 
 #include <cmath>
 #include <limits>
+#include <string>
 #include <thread>
 #include <vector>
 
@@ -34,6 +35,18 @@ MT_TEST(Vm_TrivialReturnValue) {
   auto r = Run(p, {});
   MT_CHECK(r.error == VmError::kNone);
   MT_CHECK(r.value == 42);
+}
+
+MT_TEST(Vm_CompilerAcceptsQualifiedInt64Types) {
+  std::string err;
+  auto program = CompileCSubset(
+      "std::int64_t Compute(std::int64_t base, std::int64_t multiplier) { "
+      "return base * 10 + multiplier; }",
+      &err);
+  MT_CHECK(program.has_value());
+  auto result = Run(*program, {5, 7});
+  MT_CHECK(result.error == VmError::kNone);
+  MT_CHECK(result.value == 57);
 }
 
 MT_TEST(Vm_Arithmetic_AddSubMulDivMod) {
@@ -1186,6 +1199,112 @@ MT_TEST(Vm_DirectThreadedTable_ConcurrentFirstUse) {
     MT_CHECK(successes[i]);
     MT_CHECK(results[i] == (i * 5 + 10));
   }
+}
+
+MT_TEST(Vm_IndirectTokenThreadedEngine_Parity) {
+  ProgramBuilder b(2);
+  b.PushLocal(0);
+  b.PushLocal(1);
+  b.Mul();
+  b.PushConst(100);
+  b.Add();
+  b.InertNop1();
+  b.InertNop2();
+  b.Ret();
+  auto p = b.Build();
+
+  auto r_stack = Run(p, {7, 8}, nullptr, nullptr, VmEngineFlavor::kStackBased);
+  auto r_token = Run(p, {7, 8}, nullptr, nullptr, VmEngineFlavor::kIndirectTokenThreaded);
+
+  MT_CHECK(r_stack.error == VmError::kNone);
+  MT_CHECK(r_token.error == VmError::kNone);
+  MT_CHECK(r_stack.value == 156);
+  MT_CHECK(r_token.value == 156);
+}
+
+MT_TEST(Vm_Compiler_ForLoop_And_Break_Continue) {
+  std::string src = R"(
+    int64_t sum_custom(int64_t max_val) {
+      int64_t sum = 0;
+      for (int64_t i = 0; i < max_val; i = i + 1) {
+        if (i == 5) {
+          continue;
+        }
+        if (i >= 8) {
+          break;
+        }
+        sum = sum + i;
+      }
+      return sum;
+    }
+  )";
+  std::string err;
+  auto prog = CompileCSubset(src, &err);
+  MT_CHECK(prog.has_value());
+  MT_CHECK(err.empty());
+
+  auto res1 = Run(*prog, {10}, nullptr, nullptr, VmEngineFlavor::kStackBased);
+  auto res2 = Run(*prog, {10}, nullptr, nullptr, VmEngineFlavor::kIndirectTokenThreaded);
+  MT_CHECK(res1.error == VmError::kNone);
+  MT_CHECK(res2.error == VmError::kNone);
+  MT_CHECK(res1.value == 23);
+  MT_CHECK(res2.value == 23);
+}
+
+MT_TEST(Vm_Compiler_Arrays_And_Structs) {
+  std::string src = R"(
+    int64_t compute_records(int64_t base_addr) {
+      struct Record {
+        int64_t id;
+        int64_t value;
+      };
+      base_addr.id = 101;
+      base_addr.value = 500;
+
+      int64_t arr_base = base_addr + 16;
+      arr_base[0] = 10;
+      arr_base[1] = 20;
+      arr_base[2] = 30;
+
+      return base_addr.value + arr_base[1];
+    }
+  )";
+  std::string err;
+  auto prog = CompileCSubset(src, &err);
+  MT_CHECK(prog.has_value());
+  MT_CHECK(err.empty());
+
+  MemoryContext mem(1024);
+  auto res = Run(*prog, {64}, nullptr, &mem, VmEngineFlavor::kIndirectTokenThreaded);
+  MT_CHECK(res.error == VmError::kNone);
+  MT_CHECK(res.value == 520);
+}
+
+MT_TEST(Vm_NativeFFI_CallNative) {
+  NativeFunctionTable table;
+  table.Register(0x100, [](std::int64_t arg, void*) -> std::int64_t {
+    return arg * 2 + 7;
+  });
+
+  ProgramBuilder b(1);
+  b.PushLocal(0);
+  b.CallNative(0x100);
+  b.Ret();
+  auto p = b.Build();
+
+  for (int flavor = 0; flavor <= 3; ++flavor) {
+    auto res = Run(p, {21}, nullptr, nullptr, static_cast<VmEngineFlavor>(flavor), 0, &table);
+    MT_CHECK(res.error == VmError::kNone);
+    MT_CHECK(res.value == 49);
+  }
+
+  ProgramBuilder b_bad(1);
+  b_bad.PushLocal(0);
+  b_bad.CallNative(0x999);
+  b_bad.Ret();
+  auto p_bad = b_bad.Build();
+  auto res_bad = Run(p_bad, {10}, nullptr, nullptr, VmEngineFlavor::kStackBased, 0, &table);
+  MT_CHECK(res_bad.error == VmError::kInvalidNativeCall);
 }
 
 MT_MAIN()

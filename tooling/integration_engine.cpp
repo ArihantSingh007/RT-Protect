@@ -473,13 +473,37 @@ bool TransformSourceFile(const fs::path& file_path,
     }
     rep_ss << "};\n";
     rep_ss << "    rtprotect::vm::MemoryContext s_mem_ctx(65536);\n";
-    rep_ss << "    auto s_res = rtprotect::vm::Run(*s_prog, s_args, &rtprotect_client::GetBuildOpcodeMap(), &s_mem_ctx);\n";
+
+    // Randomize VM engine flavor per-function: (fn_hash ^ opcode_seed) % 4
+    std::uint32_t fn_hash = 2166136261u;
+    for (char c : fn_name) {
+      fn_hash = (fn_hash ^ static_cast<std::uint8_t>(c)) * 16777619u;
+    }
+    std::uint32_t engine_flavor = (fn_hash ^ opcode_seed) % 4;
+    const char* flavor_enum = "rtprotect::vm::VmEngineFlavor::kStackBased";
+    if (engine_flavor == 1) {
+      flavor_enum = "rtprotect::vm::VmEngineFlavor::kRegisterThreaded";
+    } else if (engine_flavor == 2) {
+      flavor_enum = "rtprotect::vm::VmEngineFlavor::kDirectThreadedTable";
+    } else if (engine_flavor == 3) {
+      flavor_enum = "rtprotect::vm::VmEngineFlavor::kIndirectTokenThreaded";
+    }
+
+    rep_ss << "    auto s_native_tbl = reinterpret_cast<const rtprotect::vm::NativeFunctionTable*>(rtprotect::antitamper::GetAntiTamperNativeTableVoid());\n";
+    rep_ss << "    auto s_res = rtprotect::vm::Run(*s_prog, s_args, &rtprotect_client::GetBuildOpcodeMap(), &s_mem_ctx, "
+           << flavor_enum << ", 0, s_native_tbl);\n";
     rep_ss << "    if (s_res.error != rtprotect::vm::VmError::kNone) {\n";
     rep_ss << "        s_tamper_accum ^= (0xDEADBEEF00000000ULL | static_cast<std::uint64_t>(s_res.error));\n";
     rep_ss << "        rtprotect::antitamper::ScatterTamperCheck(\"" << fn_name << "_fault\", &s_tamper_accum);\n";
     rep_ss << "        " << fail_stmt << "\n";
     rep_ss << "    }\n";
-    rep_ss << "    " << ok_stmt << "\n";
+    rep_ss << "    std::uint64_t s_delta = rtprotect::antitamper::FoldTamperStateDelta(s_risk, 0x5EEDCAFEULL) ^ s_tamper_accum;\n";
+    rep_ss << "    rtprotect::antitamper::FunctionCrossLink::DepositToken(" << fn_hash << "ULL, static_cast<std::uint64_t>(s_res.value) ^ 0xFEEDFACECAFEULL);\n";
+    if (is_void) {
+      rep_ss << "    return;\n";
+    } else {
+      rep_ss << "    return static_cast<" << ret_type << ">(s_res.value - static_cast<std::int64_t>(s_delta));\n";
+    }
     rep_ss << "}";
 
     content.replace(fn.full_range.start, fn.full_range.end - fn.full_range.start, rep_ss.str());
@@ -517,16 +541,25 @@ bool TransformSourceFile(const fs::path& file_path,
 
   // 3. Ensure required headers are included if modified
   if (modified) {
-    std::string includes =
-        "#include \"rtprotect_config.h\"\n"
-        "#include \"bytecode_vm/vm.h\"\n"
-        "#include \"bytecode_vm/serialize.h\"\n"
-        "#include \"crypto/aead.h\"\n"
-        "#include \"antitamper/risk_policy.h\"\n"
-        "#include \"obfuscation/obfuscated_string.h\"\n\n";
-
-    if (content.find("rtprotect_config.h") == std::string::npos) {
-      content = includes + content;
+    const std::vector<std::string> required_includes = {
+        "#include \"rtprotect_config.h\"",
+        "#include \"bytecode_vm/vm.h\"",
+        "#include \"bytecode_vm/serialize.h\"",
+        "#include \"crypto/aead.h\"",
+        "#include \"antitamper/risk_policy.h\"",
+        "#include \"obfuscation/obfuscated_string.h\"",
+        "#include <cstdint>",
+        "#include <cstring>",
+        "#include <vector>",
+    };
+    std::string missing_includes;
+    for (const auto& include_line : required_includes) {
+      if (content.find(include_line) == std::string::npos) {
+        missing_includes += include_line + "\n";
+      }
+    }
+    if (!missing_includes.empty()) {
+      content = missing_includes + "\n" + content;
     }
     ++out_scattered_count;
     if (!WriteTextFile(file_path.string(), content)) {
@@ -1262,8 +1295,8 @@ IntegrationReport ExecuteIntegration(const IntegrationOptions& options) {
     ss << "  return s_map;\n";
     ss << "}\n";
     ss << "}  // namespace rtprotect_client\n\n";
-    ss << "#define RTPROTECT_VIRTUALIZE\n";
-    ss << "#define RTPROTECT_STRING(s) s\n\n";
+    ss << "#ifndef RTPROTECT_VIRTUALIZE\n#define RTPROTECT_VIRTUALIZE\n#endif\n";
+    ss << "#ifndef RTPROTECT_STRING\n#define RTPROTECT_STRING(s) s\n#endif\n\n";
 
     if (!WriteTextFile(config_header_path.string(), ss.str())) {
       report.success = false;
@@ -1512,6 +1545,32 @@ IntegrationReport ExecuteIntegration(const IntegrationOptions& options) {
     report.generated_files.push_back(glue_path.string());
   }
 
+  // 6a-2. Run AST Weak Entanglement Linter across detected sources
+  for (const auto& src_file : plan.detected_sources) {
+    auto lints = ClangAstScanner::CheckFunctionEntanglement(src_file);
+    for (const auto& lint : lints) {
+      report.warnings.push_back("Entanglement Lint [" + fs::path(lint.file_path).filename().string() + ":" +
+                                std::to_string(lint.line_number) + "]: " + lint.warning_message);
+    }
+  }
+
+  // 6a-3. Whole-Program Automated Candidate Selection (--auto-virtualize)
+  if (options.auto_virtualize) {
+    auto candidates = ClangAstScanner::AnalyzeProjectCandidates(plan.detected_sources, nullptr, options.virtualization_budget);
+    for (const auto& cand : candidates) {
+      if (!cand.is_eligible) continue;
+      auto file_content = ReadTextFile(cand.file_path);
+      if (!file_content.has_value()) continue;
+      std::size_t lookback = cand.start_offset > 50 ? 50 : cand.start_offset;
+      std::string prefix = file_content->substr(cand.start_offset - lookback, lookback);
+      if (prefix.find("RTPROTECT_VIRTUALIZE") == std::string::npos &&
+          prefix.find("[[rtprotect::virtualize]]") == std::string::npos) {
+        file_content->insert(cand.start_offset, "RTPROTECT_VIRTUALIZE\n");
+        WriteTextFile(cand.file_path, *file_content);
+      }
+    }
+  }
+
   // 6b. Transform Client Sources (Function Virtualization, String Obfuscation, Anti-Tamper)
   for (const auto& src_file : plan.detected_sources) {
     std::string transform_err;
@@ -1588,10 +1647,15 @@ IntegrationReport ExecuteIntegration(const IntegrationOptions& options) {
     ss << "    rtprotect_antitamper\n";
     ss << "    rtprotect_crypto\n";
     ss << "    rtprotect_vm\n";
-    ss << "    rtprotect_obfuscation\n";
+    // rtprotect_obfuscation is an INTERFACE (header-only) CMake target in
+    // this source tree, so a consumer without an exported package target
+    // must not be asked to link a nonexistent librtprotect_obfuscation.
     ss << "    OpenSSL::Crypto\n";
+    ss << "    OpenSSL::SSL\n";
     ss << "    $<$<PLATFORM_ID:Windows>:iphlpapi>\n";
     ss << "    $<$<PLATFORM_ID:Windows>:ws2_32>\n";
+    ss << "    $<$<PLATFORM_ID:Windows>:winhttp>\n";
+    ss << "    $<$<PLATFORM_ID:Windows>:crypt32>\n";
     ss << ")\n";
 
     ss << "\n# Compiler & Linker Hardening Profile: " << ToString(options.profile) << "\n";

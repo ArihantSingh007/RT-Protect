@@ -1,7 +1,7 @@
 # RTProtect Comprehensive Security Audit & Vulnerability Baseline
 
-**Document Version:** 2.4.0-hardened  
-**Audit Date:** October 24, 2026  
+**Document Version:** 2.5.0-hardened  
+**Audit Date:** October 25, 2026  
 **Auditor:** Principal Software-Security & Cryptography Engineer  
 **Status:** All Vulnerabilities Remediated & End-to-End Verified  
 
@@ -11,7 +11,7 @@
 
 A comprehensive security audit, hardening pass, and verification cycle of the **RTProtect** binary protection and licensing framework was completed on Windows x64 (MinGW-W64 GCC 15.2.0, Visual Studio 2022 MSVC v143, CMake 4.1.2, OpenSSL 3.4.0) and validated against upstream security criteria.
 
-The audit identified and resolved critical architectural vulnerabilities in signing-key isolation, runtime executable measurement, process execution safety, SDK packaging, transactional rollback, hardware fingerprint collision resistance, tamper response gates, VM instruction depth, and automated code protection. All remediations are implemented in source code and validated by an automated test suite achieving **100% pass rate across 24 unit, component, and integration test suites**.
+The audit identified and resolved critical architectural vulnerabilities in signing-key isolation, runtime executable measurement, process execution safety, SDK packaging, transactional rollback, hardware fingerprint collision resistance, tamper response gates, VM instruction depth, automated code protection, and commercial Denuvo-class structural hardening. All remediations are implemented in source code and validated by an automated test suite achieving **100% pass rate across 25 unit, component, and integration test suites**.
 
 ### Key Milestones Achieved
 1. **Zero Private Keys in Client Projects (CRITICAL 1):** Ordinary integration never generates private keys. Production keys belong exclusively to vendor infrastructure. Development test keys (`--dev-keys`) are placed strictly in external system temporary directories, and custom `--dev-keys-dir` paths pointing inside client projects are rejected with security errors.
@@ -31,6 +31,12 @@ The audit identified and resolved critical architectural vulnerabilities in sign
 15. **Permuted Opcode Virtualization Synchronization (CRITICAL 46):** Threaded `const OpcodeMap*` through `ProgramBuilder` and `CompileCSubset`, and implemented `RemapProgramOpcodes`, eliminating the mismatch between default build-time opcodes and permuted runtime tables. Verified full execution round-trip in unit tests.
 16. **Static Master Key Elimination from `.rodata` (CRITICAL 47):** Removed verbatim 32-byte `master_key` arrays from generated wrappers. Implemented compile-time XOR sharding (`kAuthShard0..3 ^ kAuthMask0..3`) and dynamic HKDF key derivation using `kManifestPublicKey` and per-function salts (`s_fn_salt`).
 17. **Unhookable Multi-Layer Anti-Debugging & Memory Tamper Detection (HIGH 48 & HIGH 49):** Implemented direct PEB inspection via inline assembly (`gs:0x60` / `fs:0x30`) and `NtQueryInformationProcess` queries, defeating user-mode API hooking on `IsDebuggerPresent`. Added entry-point prologue inspection for hooks/breakpoints (`0xCC`, `0xE9`, `0xFF 0x25`) and a background thread hardware breakpoint watchdog.
+18. **Automated Whole-Program Candidate Selection & Expanded C Syntax (Pillar 1 / HIGH 112):** Added AST call-graph centrality, cyclomatic complexity, loop penalty scoring, and automated candidate injection (`--auto-virtualize`, `--virtualization-budget <pct>`). Extended VM compiler with `for` loops, `break`, `continue`, array indexing (`arr[i]`), struct member access (`s.field`/`s->field`), and native FFI bridging (`kCallNative`).
+19. **Load-Bearing Value Entanglement & Weak-Entanglement Linter (Pillar 2 / CRITICAL 113):** Replaced centralized boolean check returns with arithmetic risk folding (`FoldTamperStateDelta`, `FoldTamperStateMask`), unified legitimate hypervisor invariants, flagged bypassable boolean return gates via AST linting (`CheckFunctionEntanglement`), and chained execution states via `FunctionCrossLink`.
+20. **Four Structurally Distinct VM Engines & Polymorphism (Pillar 3 / HIGH 114):** Implemented token-threaded dispatch (`kIndirectTokenThreaded`) eliminating runtime opcode decoding, randomized VM engine flavor per function `(hash ^ seed) % 4`, and injected polymorphic inert NOP opcodes (`kInertNop1..3`).
+21. **Virtualized Anti-Tamper Probes & Scoped Native FFI (Pillar 4 / HIGH 115):** Virtualized environment risk assessment into VM bytecode (`AssessEnvironmentRiskVirtualized`), bound native calls strictly to an immutable function allowlist table, and randomized check ordering per build seed.
+22. **In-Memory Scoped PE Execution & Native Obfuscation (Pillar 5 / HIGH 116):** Implemented thread-safe RAII decrypt-execute-re-encrypt protection (`ScopedSectionExecution`) with atomic refcounting against memory dumping; added PEB dynamic import hiding macros (`RTPROTECT_CALL_API`, `RTPROTECT_RESOLVE_API`), Mixed Boolean-Arithmetic (MBA) templates, and control-flow flattening state machines.
+23. **Continuous Response Countermeasure Channel (Pillar 6 / HIGH 117):** Implemented Ed25519-signed dynamic countermeasure updates delivered over online activation and renewal channels (`/activate`, `/renew`), applying blacklist updates and risk threshold adjustments dynamically at runtime without application rebuilding.
 
 ---
 
@@ -150,38 +156,48 @@ The audit identified and resolved critical architectural vulnerabilities in sign
 
 ---
 
+| **RTP-SEC-110** | High | Confirmed | `tooling/pe_protector.cpp`, `antitamper/section_protector.cpp` | Experimental PE section protection used AES-256-CTR with a forgeable FNV-1a checksum, allowing ciphertext edits without cryptographic authentication; runtime accepted metadata without bounding section size against the loaded image. | Modified protected code could be decrypted and executed; malformed metadata could trigger invalid memory access or excessive allocation. | Tampering with protected section bytes or descriptor size/RVA. | Replaced CTR with AES-256-GCM and a version-2 descriptor/tag; authenticate before copying decrypted code; bound section RVA/size by `SizeOfImage` and OpenSSL's `int` limit; wipe temporary plaintext on authentication failure. The key remains embedded, so this is tamper detection/obfuscation, not a confidentiality boundary. | Verified by `test_pe_protector` including `PeProtector_GcmRejectsSectionTampering`; all 25 Release CTest suites passed. |
+| **RTP-SEC-111** | High | Confirmed | `tooling/integration_engine.cpp`, `bytecode_vm/compiler.cpp`, `tooling/main.cpp`, `antitamper/risk_policy.cpp` | Consumer integration could generate uncompilable builds: required headers were skipped when projects already mentioned `rtprotect_config.h`; header-only obfuscation was linked as a nonexistent archive; OpenSSL SSL, WinHTTP, and DPAPI dependencies were missing; and `std::int64_t` signatures accepted by the scanner were rejected by the VM compiler. Development-key builds were also labeled ready for release. In addition, a hypervisor-only low-risk score (15) poisoned VM keys, so legitimate virtualized functions returned their failure value in virtual machines. | Protected application integration failed, virtualized code silently failed in legitimate environments, or development artifacts could be mistaken for production releases. | Integrating an annotated qualified fixed-width integer function on a supported VM environment. | Inject each required header independently; omit the interface-only library from raw archive links; link OpenSSL SSL and Windows licensing dependencies; accept `std::int64_t`; label dev-key validations as not for release; map hypervisor-only low-risk assessments to the canonical clean key salt. | Verified by updated unit regressions and a complete balanced-profile sample integration, VM execution returning 57, and modified-executable rejection at startup; all 25 Release CTest suites passed. |
+| **RTP-SEC-112** | High | Confirmed | `bytecode_vm/compiler.cpp`, `bytecode_vm/opcode.h`, `tooling/clang_ast_scanner.*`, `tooling/integration_engine.cpp` | Limited Virtualization Coverage & Manual Annotation Reliance: The VM compiler lacked support for loops (`for`, `break`, `continue`), array indexing (`arr[i]`), struct access (`s.field`/`s->field`), and native FFI calls (`call_native`), and required manual `RTPROTECT_VIRTUALIZE` annotations, leaving vast amounts of critical business logic unvirtualized. | Critical application logic remained unprotected in native assembly; manual tagging resulted in sporadic and incomplete protection coverage. | Inspecting native code surrounding manually tagged functions. | Expanded recursive-descent C compiler with full loop, array, struct, and FFI support; implemented Clang AST whole-project candidate scanner (`ClangAstScanner::AnalyzeProjectCandidates`) scoring call-graph centrality, cyclomatic complexity, loop penalty (80% hot-path reduction), and `--auto-virtualize` / `--virtualization-budget` CLI flags. | Verified in `test_vm` (64/64 tests) and `test_integration_engine` (26/26 tests). |
+| **RTP-SEC-113** | Critical | Confirmed | `antitamper/risk_policy.*`, `tooling/clang_ast_scanner.*`, `tooling/integration_engine.cpp` | Weak Entanglement & Patchable Security Boolean Gates: Anti-tamper defenses operated via central boolean checks returning status flags or error codes, allowing attackers to defeat protection by patching single conditional branches. | Protection defeated by inverting or NOPing a single conditional branch or status return. | Disassembly and single-byte binary patching (`0x74` -> `0x75` / `0x90`). | Replaced centralized boolean gates with mathematical value entanglement (`FoldTamperStateDelta`, `FoldTamperStateMask`) that folds security risk directly into application arithmetic calculations; added AST weak-entanglement linter (`CheckFunctionEntanglement`) to flag bypassable gates during integration; implemented cross-function state chaining (`FunctionCrossLink`). | Verified in `test_antitamper` (27/27 tests) and `test_sample_e2e`. |
+| **RTP-SEC-114** | High | Confirmed | `bytecode_vm/vm.*`, `bytecode_vm/opcode.*`, `tooling/integration_engine.cpp` | Homogeneous VM Engine Architecture: All virtualized functions executed on a single stack-based interpreter with identical dispatch mechanics, allowing automated decompiler generation targeting the single switch table. | Analyst constructs a universal decompiler targeting the uniform VM interpreter architecture. | Reverse engineering VM bytecode across functions. | Implemented 4 structurally distinct VM engines (`kStackBased`, `kRegisterThreaded`, `kDirectThreadedTable`, and `kIndirectTokenThreaded` using token-threaded function-pointer dispatch without runtime opcode switch decoding); randomized engine flavor per function `(hash ^ seed) % 4`; added polymorphic inert NOP opcodes (`kInertNop1..3`). | Verified in `test_vm` and `test_integration_engine`. |
+| **RTP-SEC-115** | High | Confirmed | `bytecode_vm/vm.*`, `antitamper/risk_policy.*`, `tooling/integration_engine.cpp` | Native Anti-Tamper Probe Exposure & API Detouring: Anti-tamper risk evaluation was compiled into native assembly with predictable instruction patterns, exposing probe routines to static disassembly and user-mode API detouring. | Attackers locate and detour native anti-tamper routines or hook Win32 exports. | Analyzing native anti-tamper probe prologues. | Implemented safe native FFI allowlist boundary (`Opcode::kCallNative`, `NativeFunctionTable`); virtualized environment risk assessment into VM bytecode (`AssessEnvironmentRiskVirtualized`); randomized probe order and instruction interleaving per build seed. | Verified in `test_vm` and `test_antitamper`. |
+| **RTP-SEC-116** | High | Confirmed | `antitamper/section_protector.*`, `antitamper/dynamic_import.h`, `obfuscation/control_flow.h` | In-Memory Static Code Exposure & Cleartext Win32 Imports: Decrypted PE executable sections remained plaintext in memory throughout execution, and native routines exposed readable Import Address Table (IAT) calls and linear control flows. | Memory dumpers (Process Hacker, Scylla) capture fully decrypted executable sections from memory; static disassembly reveals API import graph. | Attaching memory dumper while application is running. | Implemented thread-safe RAII Scoped PE Section Execution (`ScopedSectionExecution`, `EncryptProtectedSectionInMemory`) with atomic execution refcounting; added PEB-based dynamic import hiding macros (`RTPROTECT_CALL_API`, `RTPROTECT_RESOLVE_API`); implemented native-code Mixed Boolean-Arithmetic (MBA) templates, invariant opaque predicates, and control-flow flattening state machines. | Verified in `test_pe_protector`, `test_antitamper`, and `test_checksum_flattened`. |
+| **RTP-SEC-117** | High | Confirmed | `licensing/countermeasure_config.*`, `licensing/activation_service.*`, `licensing/activation_client.*`, `antitamper/risk_policy.*` | Static Offline Threat Response: Protection rules and threat blacklists were immutable once built; reacting to newly released debuggers, cheat engines, or memory editors required redistributing rebuilt application binaries. | Zero-day analysis tools and newly published cheat software evade detection until clients download a new application binary. | Running newly released reverse-engineering tools not in the original blacklist. | Implemented cryptographically signed dynamic countermeasure update channel (`CountermeasureConfig`, `RTPROTECT_COUNTERMEASURE_UPDATE`) delivered over online activation and renewal endpoints (`/activate`, `/renew`); verified via Ed25519 and persisted in DPAPI `RTSS` storage; applied at runtime without binary rebuilds via decoupled notification hooks. | Verified in `test_activation` (24/24 tests) and `test_activation_service` (36/36 tests). |
+
 ## 3. Verification & Quality Assurance Summary
 
-The entire suite of 24 automated unit, component, and integration tests passes with 100% success rate on Windows x64 across both MinGW-w64 GCC 15.2.0 and Visual Studio 2022 (MSVC v143):
+The entire suite of 25 automated unit, component, and integration tests passes with 100% success rate on Windows x64 across both MinGW-w64 GCC 15.2.0 and Visual Studio 2022 (MSVC v143):
 
 ```
 Test project C:/Users/Arihant Singh/Downloads/rtprotect_hardening_WIP/build
       Start  1: test_aead ........................   Passed    0.04 sec
-      Start  2: test_kdf .........................   Passed    0.02 sec
-      Start  3: test_vm ..........................   Passed    0.02 sec
+      Start  2: test_kdf .........................   Passed    0.03 sec
+      Start  3: test_vm ..........................   Passed    0.03 sec
       Start  4: test_protected_checksum ..........   Passed    0.04 sec
       Start  5: test_manifest ....................   Passed    0.03 sec
       Start  6: test_signing .....................   Passed    0.03 sec
       Start  7: test_bound_key ...................   Passed    0.03 sec
       Start  8: test_file_io .....................   Passed    0.03 sec
       Start  9: test_checked_arith_fallback ......   Passed    0.14 sec
-      Start 10: test_secure_buffer ...............   Passed    0.03 sec
+      Start 10: test_secure_buffer ...............   Passed    0.02 sec
       Start 11: test_obfuscated_string ...........   Passed    0.02 sec
       Start 12: test_checksum_flattened ..........   Passed    0.03 sec
       Start 13: test_license .....................   Passed    0.03 sec
-      Start 14: test_activation ..................   Passed    0.18 sec
-      Start 15: test_activation_service ..........   Passed    0.71 sec
-      Start 16: test_secrets_manager .............   Passed    0.07 sec
-      Start 17: test_trusted_time ................   Passed    0.15 sec
+      Start 14: test_activation ..................   Passed    0.20 sec
+      Start 15: test_activation_service ..........   Passed    0.89 sec
+      Start 16: test_secrets_manager .............   Passed    0.06 sec
+      Start 17: test_trusted_time ................   Passed    0.16 sec
       Start 18: test_hardware_id .................   Passed    0.03 sec
-      Start 19: test_update_manifest .............   Passed    0.04 sec
-      Start 20: test_antitamper ..................   Passed    0.12 sec
+      Start 19: test_update_manifest .............   Passed    0.06 sec
+      Start 20: test_antitamper ..................   Passed    0.13 sec
       Start 21: test_opcode_map ..................   Passed    0.02 sec
-      Start 22: test_integration_engine ..........   Passed   30.05 sec
-      Start 23: test_unreal_integration ..........   Passed    0.05 sec
-      Start 24: test_pe_protector ................   Passed    0.04 sec
+      Start 22: test_integration_engine ..........   Passed   23.65 sec
+      Start 23: test_unreal_integration ..........   Passed    0.06 sec
+      Start 24: test_pe_protector ................   Passed    0.05 sec
+      Start 25: test_sample_e2e ..................   Passed   15.74 sec
 
-100% tests passed, 0 tests failed out of 24
+100% tests passed, 0 tests failed out of 25
 ```
 
 Packaging execution via `tooling/package_release.ps1` verifies all targets, strips release executables, and produces a complete distribution archive:

@@ -5,6 +5,7 @@ add_library(rtprotect_licensing STATIC
     update_manifest.cpp
     activation.cpp
     activation_client.cpp
+    countermeasure_config.cpp
     secure_storage.cpp
     trusted_time.cpp
 )

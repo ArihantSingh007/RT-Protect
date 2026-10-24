@@ -12,6 +12,7 @@
 
 #include <cstdint>
 #include <optional>
+#include <unordered_map>
 #include <vector>
 
 #include "bytecode_vm/program.h"
@@ -42,6 +43,7 @@ enum class VmError {
   kMemoryAccessOutOfBounds,    // Memory load/store offset out of bounds
   kCallStackOverflow,          // Call stack exceeded maximum recursion depth
   kCallStackUnderflow,         // RetSub executed without an active call frame
+  kInvalidNativeCall,          // Invoked un-allowlisted or unregistered native function
 };
 
 const char* ToString(VmError error);
@@ -78,28 +80,56 @@ struct RunResult {
 enum class VmEngineFlavor {
   kStackBased = 0,
   kRegisterThreaded = 1,
-  kDirectThreadedTable = 2
+  kDirectThreadedTable = 2,
+  kIndirectTokenThreaded = 3
 };
 
 class OpcodeMap;
+
+using NativeFunction = std::int64_t (*)(std::int64_t arg, void* user_data);
+
+struct NativeFunctionTable {
+  std::unordered_map<std::uint16_t, NativeFunction> functions;
+  void* user_data = nullptr;
+
+  void Register(std::uint16_t id, NativeFunction fn) {
+    functions[id] = fn;
+  }
+
+  std::optional<std::int64_t> Invoke(std::uint16_t id, std::int64_t arg) const {
+    auto it = functions.find(id);
+    if (it == functions.end() || !it->second) return std::nullopt;
+    return it->second(arg, user_data);
+  }
+};
 
 RunResult Run(const Program& program,
               const std::vector<std::int64_t>& args,
               const OpcodeMap* opcode_map = nullptr,
               MemoryContext* mem_ctx = nullptr,
               VmEngineFlavor flavor = VmEngineFlavor::kStackBased,
-              std::size_t recursion_depth = 0);
+              std::size_t recursion_depth = 0,
+              const NativeFunctionTable* native_table = nullptr);
 
 RunResult RunRegisterThreaded(const Program& program,
                               const std::vector<std::int64_t>& args,
                               const OpcodeMap* opcode_map = nullptr,
                               MemoryContext* mem_ctx = nullptr,
-                              std::size_t recursion_depth = 0);
+                              std::size_t recursion_depth = 0,
+                              const NativeFunctionTable* native_table = nullptr);
 
 RunResult RunDirectThreadedTable(const Program& program,
                                  const std::vector<std::int64_t>& args,
                                  const OpcodeMap* opcode_map = nullptr,
                                  MemoryContext* mem_ctx = nullptr,
-                                 std::size_t recursion_depth = 0);
+                                 std::size_t recursion_depth = 0,
+                                 const NativeFunctionTable* native_table = nullptr);
+
+RunResult RunIndirectTokenThreaded(const Program& program,
+                                   const std::vector<std::int64_t>& args,
+                                   const OpcodeMap* opcode_map = nullptr,
+                                   MemoryContext* mem_ctx = nullptr,
+                                   std::size_t recursion_depth = 0,
+                                   const NativeFunctionTable* native_table = nullptr);
 
 }  // namespace rtprotect::vm

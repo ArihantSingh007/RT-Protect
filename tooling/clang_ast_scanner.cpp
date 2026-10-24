@@ -536,4 +536,299 @@ std::vector<ClangFunctionDecl> ClangAstScanner::AnalyzeTranslationUnit(
   return results;
 }
 
+namespace {
+
+bool IsHotPathFunctionName(const std::string& name) {
+  std::string lower = name;
+  std::transform(lower.begin(), lower.end(), lower.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+  static const char* const kHotKeywords[] = {
+      "tick", "update", "render", "draw", "frame", "per_frame", "fast_", "inner_", "flush", "poll", "audio", "physics"
+  };
+  for (const char* kw : kHotKeywords) {
+    if (lower.find(kw) != std::string::npos) return true;
+  }
+  return false;
+}
+
+std::size_t CalculateLineNumber(const std::string& text, std::size_t offset) {
+  std::size_t line = 1;
+  for (std::size_t i = 0; i < offset && i < text.size(); ++i) {
+    if (text[i] == '\n') ++line;
+  }
+  return line;
+}
+
+// Fallback lexical function parser to ensure candidate analysis works under any build environment
+struct LexicalFunction {
+  std::string name;
+  std::string return_type;
+  std::vector<std::string> param_types;
+  std::vector<std::string> param_names;
+  std::string body;
+  std::size_t start_offset = 0;
+  std::size_t end_offset = 0;
+};
+
+std::vector<LexicalFunction> ExtractLexicalFunctions(const std::string& src) {
+  std::vector<LexicalFunction> fns;
+  std::size_t pos = 0;
+  while (pos < src.size()) {
+    // Find next potential function start: '(' followed eventually by '{'
+    auto open_paren = src.find('(', pos);
+    if (open_paren == std::string::npos) break;
+
+    // Look backwards from open_paren for function name and return type
+    std::size_t name_end = open_paren;
+    while (name_end > 0 && std::isspace(static_cast<unsigned char>(src[name_end - 1]))) --name_end;
+    std::size_t name_start = name_end;
+    while (name_start > 0 && (std::isalnum(static_cast<unsigned char>(src[name_start - 1])) || src[name_start - 1] == '_')) {
+      --name_start;
+    }
+
+    if (name_start < name_end) {
+      std::string fn_name = src.substr(name_start, name_end - name_start);
+      // Skip control-flow keywords like if, for, while, switch, catch
+      if (fn_name != "if" && fn_name != "for" && fn_name != "while" && fn_name != "switch" && fn_name != "catch" && fn_name != "sizeof") {
+        auto close_paren = src.find(')', open_paren);
+        if (close_paren != std::string::npos) {
+          // Find opening brace '{'
+          std::size_t brace_search = close_paren + 1;
+          while (brace_search < src.size() && (std::isspace(static_cast<unsigned char>(src[brace_search])) || src[brace_search] == '\r' || src[brace_search] == '\n' || src[brace_search] == ':')) {
+            ++brace_search;
+          }
+          if (brace_search < src.size() && src[brace_search] == '{') {
+            std::size_t body_start = brace_search;
+            int depth = 1;
+            std::size_t cur = body_start + 1;
+            while (cur < src.size() && depth > 0) {
+              if (src[cur] == '{') ++depth;
+              else if (src[cur] == '}') --depth;
+              ++cur;
+            }
+            if (depth == 0) {
+              // Extract return type preceding name
+              std::size_t ret_end = name_start;
+              while (ret_end > 0 && std::isspace(static_cast<unsigned char>(src[ret_end - 1]))) --ret_end;
+              std::size_t ret_start = ret_end;
+              while (ret_start > 0 && src[ret_start - 1] != ';' && src[ret_start - 1] != '}' && src[ret_start - 1] != '\n') {
+                --ret_start;
+              }
+              std::string ret_type = src.substr(ret_start, ret_end - ret_start);
+              while (!ret_type.empty() && std::isspace(static_cast<unsigned char>(ret_type.front()))) ret_type.erase(0, 1);
+              while (!ret_type.empty() && std::isspace(static_cast<unsigned char>(ret_type.back()))) ret_type.pop_back();
+              if (ret_type.empty()) ret_type = "int";
+
+              LexicalFunction lf;
+              lf.name = fn_name;
+              lf.return_type = ret_type;
+              lf.body = src.substr(body_start, cur - body_start);
+              lf.start_offset = name_start;
+              lf.end_offset = cur;
+              fns.push_back(lf);
+
+              pos = cur;
+              continue;
+            }
+          }
+        }
+      }
+    }
+    pos = open_paren + 1;
+  }
+  return fns;
+}
+
+int CountSubstrings(const std::string& str, const std::string& sub) {
+  if (sub.empty()) return 0;
+  int count = 0;
+  std::size_t pos = 0;
+  while ((pos = str.find(sub, pos)) != std::string::npos) {
+    ++count;
+    pos += sub.size();
+  }
+  return count;
+}
+
+}  // namespace
+
+std::vector<FunctionSuitabilityScore> ClangAstScanner::AnalyzeProjectCandidates(
+    const std::vector<std::string>& source_files,
+    const CompilationDatabase* comp_db,
+    double budget_pct) {
+  (void)comp_db;
+  std::vector<FunctionSuitabilityScore> candidates;
+  std::unordered_map<std::string, std::string> file_contents;
+
+  // Load all source file contents
+  for (const auto& file : source_files) {
+    auto content = ReadTextFile(file);
+    if (content.has_value()) {
+      file_contents[file] = *content;
+    }
+  }
+
+  // Phase 1: Discover all function definitions across all translation units
+  for (const auto& [file, content] : file_contents) {
+    auto lexical_fns = ExtractLexicalFunctions(content);
+    for (const auto& lfn : lexical_fns) {
+      FunctionSuitabilityScore score;
+      score.name = lfn.name;
+      score.file_path = file;
+      score.return_type = lfn.return_type;
+      score.start_offset = lfn.start_offset;
+      score.end_offset = lfn.end_offset;
+      score.start_line = CalculateLineNumber(content, lfn.start_offset);
+      score.end_line = CalculateLineNumber(content, lfn.end_offset);
+
+      // Measure cyclomatic complexity: count control-flow keywords and branching
+      int cc = 1;
+      cc += CountSubstrings(lfn.body, "if ");
+      cc += CountSubstrings(lfn.body, "if(");
+      cc += CountSubstrings(lfn.body, "for ");
+      cc += CountSubstrings(lfn.body, "for(");
+      cc += CountSubstrings(lfn.body, "while ");
+      cc += CountSubstrings(lfn.body, "while(");
+      cc += CountSubstrings(lfn.body, "case ");
+      cc += CountSubstrings(lfn.body, "&&");
+      cc += CountSubstrings(lfn.body, "||");
+      cc += CountSubstrings(lfn.body, "?");
+      score.cyclomatic_complexity = cc;
+
+      // Measure statement count
+      score.statement_count = CountSubstrings(lfn.body, ";");
+
+      // Check hot-path characteristics
+      score.is_hot_path = IsHotPathFunctionName(lfn.name);
+      if (score.is_hot_path) {
+        score.hot_path_penalty = 0.2; // 80% penalty for hot rendering/tick paths
+      } else {
+        score.hot_path_penalty = 1.0;
+      }
+
+      // Check eligibility for bytecode virtualization
+      ClangFunctionDecl mock_decl;
+      mock_decl.name = lfn.name;
+      mock_decl.return_type = lfn.return_type;
+      std::string inelig_reason;
+      score.is_eligible = ValidateVirtualizationEligibility(mock_decl, &inelig_reason);
+      if (!score.is_eligible) {
+        score.ineligibility_reason = inelig_reason;
+      }
+
+      candidates.push_back(score);
+    }
+  }
+
+  // Phase 2: Whole-Program Call-Graph Centrality Analysis
+  // For each candidate, count how many call sites invoke it across all files in the project
+  for (auto& cand : candidates) {
+    int calls = 0;
+    std::string call_pattern1 = cand.name + "(";
+    std::string call_pattern2 = cand.name + " (";
+    for (const auto& [file, content] : file_contents) {
+      calls += CountSubstrings(content, call_pattern1);
+      calls += CountSubstrings(content, call_pattern2);
+    }
+    // Subtract self-definition
+    if (calls > 0) calls -= 1;
+    cand.call_graph_centrality = calls;
+
+    // Calculate Denuvo-class suitability score:
+    // Prioritize high-centrality hub functions with non-trivial complexity that are not in hot frame loops
+    double base = (cand.call_graph_centrality * 4.0) + (cand.cyclomatic_complexity * 2.5) + (cand.statement_count * 0.5);
+    cand.total_score = base * cand.hot_path_penalty;
+  }
+
+  // Phase 3: Rank candidates by suitability score
+  std::sort(candidates.begin(), candidates.end(), [](const FunctionSuitabilityScore& a, const FunctionSuitabilityScore& b) {
+    if (a.is_eligible != b.is_eligible) return a.is_eligible > b.is_eligible;
+    return a.total_score > b.total_score;
+  });
+
+  if (budget_pct > 0.0 && budget_pct < 100.0 && !candidates.empty()) {
+    std::size_t eligible_count = 0;
+    for (const auto& c : candidates) {
+      if (c.is_eligible) ++eligible_count;
+    }
+    std::size_t keep_count = static_cast<std::size_t>(std::ceil(eligible_count * (budget_pct / 100.0)));
+    if (keep_count == 0 && eligible_count > 0) keep_count = 1;
+    if (keep_count < candidates.size()) {
+      candidates.resize(keep_count);
+    }
+  }
+
+  return candidates;
+}
+
+std::vector<EntanglementLintResult> ClangAstScanner::CheckFunctionEntanglement(
+    const std::string& source_path,
+    const std::vector<std::string>& compiler_flags) {
+  (void)compiler_flags;
+  std::vector<EntanglementLintResult> lints;
+  auto content = ReadTextFile(source_path);
+  if (!content.has_value()) return lints;
+
+  auto lexical_fns = ExtractLexicalFunctions(*content);
+  for (const auto& lfn : lexical_fns) {
+    // Only check functions returning boolean
+    if (lfn.return_type != "bool" && lfn.return_type != "_Bool") continue;
+
+    // Check if function invokes security or anti-tamper primitives
+    static const char* const kSecurityPrimitives[] = {
+        "AssessEnvironmentRisk",
+        "AssessFastEnvironmentRisk",
+        "CheckDebuggerPresent",
+        "CheckRemoteDebugger",
+        "CheckHardwareBreakpoints",
+        "CheckExecutionTimingAnomaly",
+        "DetectMemoryDumper",
+        "DetectMemoryProbing",
+        "VerifyLicense",
+        "VerifyClientIntegrityAndLicense",
+        "EnforceRiskPolicy"
+    };
+
+    bool invokes_security = false;
+    for (const char* prim : kSecurityPrimitives) {
+      if (lfn.body.find(prim) != std::string::npos) {
+        invokes_security = true;
+        break;
+      }
+    }
+
+    if (!invokes_security) continue;
+
+    // Check if function uses Value Entanglement or State Chaining to fold risk into state
+    static const char* const kEntanglementMechanisms[] = {
+        "FoldTamperStateDelta",
+        "FoldTamperStateMask",
+        "DeriveTamperPerturbation",
+        "DeriveTamperBoundKey",
+        "FunctionCrossLink",
+        "ScatterTamperCheck"
+    };
+
+    bool uses_entanglement = false;
+    for (const char* ent : kEntanglementMechanisms) {
+      if (lfn.body.find(ent) != std::string::npos) {
+        uses_entanglement = true;
+        break;
+      }
+    }
+
+    // Weak Entanglement detected: Trivial boolean gate directly returning security state
+    if (!uses_entanglement) {
+      EntanglementLintResult lint;
+      lint.has_weak_entanglement = true;
+      lint.function_name = lfn.name;
+      lint.file_path = source_path;
+      lint.line_number = CalculateLineNumber(*content, lfn.start_offset);
+      lint.warning_message = "Function '" + lfn.name + "' returns a security status boolean directly without value entanglement. An attacker can defeat this with a 1-byte patch ('mov al, 1; ret'). Use FoldTamperStateDelta or FunctionCrossLink to fold risk into business logic instead.";
+      lints.push_back(lint);
+    }
+  }
+
+  return lints;
+}
+
 }  // namespace rtprotect::tooling

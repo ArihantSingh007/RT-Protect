@@ -10,6 +10,7 @@
 
 #include <iostream>
 #include <cstdlib>
+#include <cstdint>
 
 #if __has_include("rtprotect_config.h")
 #include "rtprotect_config.h"
@@ -17,6 +18,13 @@
 #else
 #define RTPROTECT_ENABLED 0
 #endif
+
+// This small business rule is intentionally kept in the end-to-end sample so
+// `rtprotect-tool integrate` can prove the full source-to-VM transformation.
+// @rtprotect_virtualize
+std::int64_t ComputeProtectedEntitlement(std::int64_t base, std::int64_t multiplier) {
+  return base * multiplier + 7;
+}
 
 int main() {
   std::cout << "====================================================\n";
@@ -45,6 +53,12 @@ int main() {
 #endif
 
   std::cout << "[App] Processing secure business workload...\n";
+  const auto entitlement = ComputeProtectedEntitlement(5, 10);
+  if (entitlement != 57) {
+    std::cerr << "[FATAL] Protected workload returned an unexpected result: " << entitlement << "\n";
+    return 2;
+  }
+  std::cout << "[App] Virtualized entitlement calculation returned " << entitlement << ".\n";
   std::cout << "[App] Workload completed successfully.\n";
   return 0;
 }

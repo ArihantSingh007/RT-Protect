@@ -97,6 +97,12 @@ class ProgramBuilder {
   void CallProgram(std::uint16_t program_id) {
     EmitU16(Opcode::kCallProgram, program_id);
   }
+  void CallNative(std::uint16_t native_id) {
+    EmitU16(Opcode::kCallNative, native_id);
+  }
+  void InertNop1() { EmitNoOperand(Opcode::kInertNop1); }
+  void InertNop2() { EmitNoOperand(Opcode::kInertNop2); }
+  void InertNop3() { EmitNoOperand(Opcode::kInertNop3); }
 
   Program Build() {
     // Patch every jump placeholder now that all labels are bound.

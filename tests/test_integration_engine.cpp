@@ -714,9 +714,10 @@ void TestFunctionVirtualization() {
   WriteTextFile((test_dir / "CMakeLists.txt").string(), cmake_text);
 
   std::string main_cpp =
+      "#include \"rtprotect_config.h\"\n"
       "#include <cstdint>\n"
-      "RTPROTECT_VIRTUALIZE\n"
-      "int64_t compute_auth(int64_t a, int64_t b) {\n"
+      "// @rtprotect_virtualize\n"
+      "std::int64_t compute_auth(std::int64_t a, std::int64_t b) {\n"
       "    int64_t sum = a + b;\n"
       "    return sum * 2;\n"
       "}\n"
@@ -748,12 +749,25 @@ void TestFunctionVirtualization() {
   assert(transformed_main->find("rtprotect::vm::MemoryContext") != std::string::npos);
   assert(transformed_main->find("rtprotect::vm::Run") != std::string::npos);
   assert(transformed_main->find("s_res.error != rtprotect::vm::VmError::kNone") != std::string::npos);
+  assert(transformed_main->find("#include \"bytecode_vm/vm.h\"") != std::string::npos);
+  assert(transformed_main->find("#include \"crypto/aead.h\"") != std::string::npos);
+  assert(transformed_main->find("#include \"antitamper/risk_policy.h\"") != std::string::npos);
+  assert(transformed_main->find("#include <cstring>") != std::string::npos);
+  assert(transformed_main->find("#include <vector>") != std::string::npos);
+
+  auto generated_cmake = ReadTextFile((test_dir / "CMakeLists.txt").string());
+  assert(generated_cmake.has_value());
+  assert(generated_cmake->find("    rtprotect_obfuscation\n") == std::string::npos);
+  assert(generated_cmake->find("    OpenSSL::SSL\n") != std::string::npos);
+  assert(generated_cmake->find("    $<$<PLATFORM_ID:Windows>:winhttp>\n") != std::string::npos);
+  assert(generated_cmake->find("    $<$<PLATFORM_ID:Windows>:crypt32>\n") != std::string::npos);
 
   // Assert that rtprotect_config.h contains NO plaintext shards or masks
   auto cfg = ReadTextFile((test_dir / "rtprotect_config.h").string());
   assert(cfg.has_value());
   assert(cfg->find("kAuthShard") == std::string::npos);
   assert(cfg->find("kAuthMask") == std::string::npos);
+  assert(cfg->find("#ifndef RTPROTECT_STRING") != std::string::npos);
 
   // Assert that release.manifest does NOT commit rtprotect_vm_root (master secrets are not shipped in manifests)
   auto man_bytes = ReadFile((test_dir / "release.manifest").string());
@@ -1506,6 +1520,91 @@ void TestProductionBuildRejectsPrivateSigningKeys() {
   std::printf("  PASSED: Production build strictly rejects vendor private signing keys.\n");
 }
 
+void TestCandidateSelectionAndSuitabilityScoring() {
+  fs::path test_dir = fs::current_path() / "build" / "test_candidate_selection";
+  CleanDir(test_dir);
+  fs::create_directories(test_dir);
+
+  std::string file1 = (test_dir / "math_ops.cpp").string();
+  std::string file2 = (test_dir / "game_loop.cpp").string();
+
+  // file1 defines high-centrality, complex function
+  std::string code1 =
+      "int core_hub_calculation(int a, int b) {\n"
+      "  int res = 0;\n"
+      "  if (a > 10) { res += a * 2; }\n"
+      "  for (int i = 0; i < b; ++i) { res += i; }\n"
+      "  while (res > 100) { res -= 10; }\n"
+      "  return res;\n"
+      "}\n\n"
+      "int trivial_getter() {\n"
+      "  return 42;\n"
+      "}\n";
+
+  // file2 calls core_hub_calculation multiple times and has a hot render loop
+  std::string code2 =
+      "int core_hub_calculation(int a, int b);\n"
+      "void render_frame_tick() {\n"
+      "  int val1 = core_hub_calculation(1, 2);\n"
+      "  int val2 = core_hub_calculation(3, 4);\n"
+      "  int val3 = core_hub_calculation(5, 6);\n"
+      "  int val4 = core_hub_calculation(7, 8);\n"
+      "}\n";
+
+  WriteTextFile(file1, code1);
+  WriteTextFile(file2, code2);
+
+  std::vector<std::string> sources = { file1, file2 };
+  auto candidates = ClangAstScanner::AnalyzeProjectCandidates(sources, nullptr, 100.0);
+
+  assert(!candidates.empty());
+  // core_hub_calculation should rank highest due to high centrality (4 calls) and cyclomatic complexity (4)
+  const auto& top = candidates[0];
+  assert(top.name == "core_hub_calculation");
+  assert(top.call_graph_centrality >= 4);
+  assert(top.cyclomatic_complexity >= 4);
+  assert(top.is_eligible);
+
+  // Check budget filtering: budget 50% should keep top candidate
+  auto budget_candidates = ClangAstScanner::AnalyzeProjectCandidates(sources, nullptr, 50.0);
+  assert(budget_candidates.size() <= candidates.size());
+  assert(budget_candidates[0].name == "core_hub_calculation");
+
+  CleanDir(test_dir);
+  std::printf("  PASSED: Whole-program AST candidate selection and Denuvo-class suitability scoring.\n");
+}
+
+void TestEntanglementLinter() {
+  fs::path test_dir = fs::current_path() / "build" / "test_entanglement_lint";
+  CleanDir(test_dir);
+  fs::create_directories(test_dir);
+
+  std::string file_path = (test_dir / "security_checks.cpp").string();
+  std::string code =
+      "bool CheckClientSecurity() {\n"
+      "  auto risk = AssessEnvironmentRisk();\n"
+      "  if (risk.risk_score >= 50) return false;\n"
+      "  return true;\n"
+      "}\n\n"
+      "int64_t ComputePlayerScore(int base) {\n"
+      "  auto risk = AssessEnvironmentRisk();\n"
+      "  uint64_t delta = FoldTamperStateDelta(risk);\n"
+      "  return base - delta;\n"
+      "}\n";
+
+  WriteTextFile(file_path, code);
+
+  auto lints = ClangAstScanner::CheckFunctionEntanglement(file_path);
+  // CheckClientSecurity should be flagged as weak boolean gate
+  assert(lints.size() == 1);
+  assert(lints[0].has_weak_entanglement);
+  assert(lints[0].function_name == "CheckClientSecurity");
+  assert(lints[0].warning_message.find("1-byte patch") != std::string::npos);
+
+  CleanDir(test_dir);
+  std::printf("  PASSED: AST Weak Entanglement Linter flags bypassable boolean gates.\n");
+}
+
 }  // namespace
 
 int main() {
@@ -1534,6 +1633,8 @@ int main() {
   TestIntegration_OnlineActivationPipeline_EndToEndRoundTrip();
   TestClangAstScannerAndCompilationDatabase();
   TestTargetScopedSourceDiscoveryAndFailClosedVirtualization();
+  TestCandidateSelectionAndSuitabilityScoring();
+  TestEntanglementLinter();
   std::printf("ALL INTEGRATION ENGINE TESTS PASSED.\n");
   return 0;
 }

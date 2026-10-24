@@ -21,15 +21,6 @@ namespace rtprotect::tooling {
 
 namespace {
 
-std::uint32_t ComputeFnv1a(const std::uint8_t* data, std::size_t len) {
-  std::uint32_t hash = 2166136261u;
-  for (std::size_t i = 0; i < len; ++i) {
-    hash ^= data[i];
-    hash *= 16777619u;
-  }
-  return hash;
-}
-
 bool HexToBytes(const std::string& hex, std::uint8_t* out, std::size_t len) {
   if (hex.size() != len * 2) return false;
   for (std::size_t i = 0; i < len; ++i) {
@@ -63,22 +54,26 @@ std::size_t RvaToFileOffset(const IMAGE_NT_HEADERS64* nt,
   return 0;
 }
 
-bool Aes256CtrTransform(const std::uint8_t* key,
+bool Aes256GcmEncrypt(const std::uint8_t* key,
                         const std::uint8_t* iv,
                         const std::uint8_t* input,
                         std::size_t len,
-                        std::uint8_t* output) {
+                        std::uint8_t* output,
+                        std::uint8_t* tag) {
   if (len > static_cast<std::size_t>(std::numeric_limits<int>::max())) return false;
   EVP_CIPHER_CTX* ctx = EVP_CIPHER_CTX_new();
   if (!ctx) return false;
 
   bool ok = false;
   do {
-    if (EVP_CipherInit_ex(ctx, EVP_aes_256_ctr(), nullptr, key, iv, 1) != 1) break;
+    if (EVP_EncryptInit_ex(ctx, EVP_aes_256_gcm(), nullptr, nullptr, nullptr) != 1 ||
+        EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_SET_IVLEN, 16, nullptr) != 1 ||
+        EVP_EncryptInit_ex(ctx, nullptr, nullptr, key, iv) != 1) break;
     int out_len = 0;
-    if (EVP_CipherUpdate(ctx, output, &out_len, input, static_cast<int>(len)) != 1) break;
+    if (EVP_EncryptUpdate(ctx, output, &out_len, input, static_cast<int>(len)) != 1) break;
     int final_len = 0;
-    if (EVP_CipherFinal_ex(ctx, output + out_len, &final_len) != 1) break;
+    if (EVP_EncryptFinal_ex(ctx, output + out_len, &final_len) != 1 ||
+        EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_GET_TAG, 16, tag) != 1) break;
     ok = true;
   } while (false);
 
@@ -160,7 +155,7 @@ bool PeProtector::ProtectMemory(std::vector<std::uint8_t>& pe_image,
 
   PeProtectedSectionHeader header{};
   header.magic = kPeProtectorMagic;
-  header.version = 1;
+  header.version = 2;
 
   if (options.encrypt_section && target_sec) {
     // Checked arithmetic for section bounds
@@ -201,13 +196,11 @@ bool PeProtector::ProtectMemory(std::vector<std::uint8_t>& pe_image,
     // Encrypt section in-place
     std::uint8_t* sec_data = pe_image.data() + target_sec->PointerToRawData;
     std::vector<std::uint8_t> encrypted(target_sec->SizeOfRawData);
-    if (!Aes256CtrTransform(header.key, header.iv, sec_data, target_sec->SizeOfRawData, encrypted.data())) {
-      if (result_out) result_out->error = "AES-256-CTR section encryption failed";
+    if (!Aes256GcmEncrypt(header.key, header.iv, sec_data, target_sec->SizeOfRawData, encrypted.data(), header.tag)) {
+      if (result_out) result_out->error = "AES-256-GCM section encryption failed";
       return false;
     }
     std::memcpy(sec_data, encrypted.data(), target_sec->SizeOfRawData);
-
-    header.checksum = ComputeFnv1a(sec_data, target_sec->SizeOfRawData);
 
     // Ensure section has read, write, execute in header characteristics
     target_sec->Characteristics |= IMAGE_SCN_MEM_WRITE | IMAGE_SCN_MEM_READ | IMAGE_SCN_MEM_EXECUTE;
@@ -216,7 +209,7 @@ bool PeProtector::ProtectMemory(std::vector<std::uint8_t>& pe_image,
       result_out->section_bytes_encrypted = target_sec->SizeOfRawData;
       std::memcpy(result_out->encryption_key.data(), header.key, 32);
       std::memcpy(result_out->iv.data(), header.iv, 16);
-      result_out->checksum = header.checksum;
+      result_out->checksum = 0;  // Retained API field; GCM replaces the forgeable checksum.
     }
   }
 

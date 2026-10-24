@@ -39,6 +39,7 @@ const std::vector<Opcode>& AllOpcodes() {
     Opcode::kCall,
     Opcode::kRetSub,
     Opcode::kCallProgram,
+    Opcode::kCallNative,
     Opcode::kFAdd,
     Opcode::kFSub,
     Opcode::kFMul,
@@ -47,7 +48,10 @@ const std::vector<Opcode>& AllOpcodes() {
     Opcode::kFCmpLt,
     Opcode::kFCmpGt,
     Opcode::kIntToFloat,
-    Opcode::kFloatToInt
+    Opcode::kFloatToInt,
+    Opcode::kInertNop1,
+    Opcode::kInertNop2,
+    Opcode::kInertNop3
   };
   return opcodes;
 }

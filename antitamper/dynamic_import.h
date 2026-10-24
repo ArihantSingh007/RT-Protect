@@ -100,3 +100,15 @@ inline FuncPtr ResolveApi(std::uint32_t module_hash, std::uint32_t func_hash) {
 }
 
 }  // namespace rtprotect::antitamper
+
+// Application-level Dynamic Import Macros:
+// Completely eliminates function names and module names from PE IAT and string tables
+#define RTPROTECT_RESOLVE_API(module_str, func_name, FuncType) \
+  ::rtprotect::antitamper::ResolveApi<FuncType>( \
+      ::rtprotect::antitamper::HashApiCaseInsensitive(module_str), \
+      ::rtprotect::antitamper::HashApi(#func_name))
+
+#define RTPROTECT_CALL_API(module_str, func_name, FuncType, ...) \
+  (::rtprotect::antitamper::ResolveApi<FuncType>( \
+      ::rtprotect::antitamper::HashApiCaseInsensitive(module_str), \
+      ::rtprotect::antitamper::HashApi(#func_name))(__VA_ARGS__))
