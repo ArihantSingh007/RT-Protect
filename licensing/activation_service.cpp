@@ -455,23 +455,18 @@ RenewResponse ActivationService::ProcessRenew(const RenewRequest& req, std::uint
     return resp;
   }
 
-  // 10. Transactional commit: consume nonces and commit activation record only now that encryption has succeeded
-  if (!db_.ConsumeNonceIfUnused(client_nonce_hex, current_time + 86400, current_time) ||
-      !db_.ConsumeNonceIfUnused(old_nonce_hex, current_time + 86400 * 30, current_time)) {
-    resp.status = ActivationStatus::kNonceMismatch;
-    resp.error_message = "Nonce consumption collision during renewal commit";
-    return resp;
-  }
-
+  // 10. Atomic transactional commit: consume nonces and commit activation record under single lock
   ActivationRecord act;
   act.license_id = token.license_id;
   act.device_fingerprint = req.device_fingerprint;
   act.first_seen = token.issued_at;
   act.last_seen = current_time;
   act.sequence_number = renewed.sequence_number;
-  if (!db_.RecordActivation(act)) {
+  if (!db_.CommitRenewalAtomic(client_nonce_hex, current_time + 86400,
+                               old_nonce_hex, current_time + 86400 * 30,
+                               act, current_act->sequence_number, current_time)) {
     resp.status = ActivationStatus::kMalformed;
-    resp.error_message = "Database write-through persistence failed during renewal";
+    resp.error_message = "Atomic renewal commit failed (nonce replay or concurrent modification)";
     return resp;
   }
 
@@ -525,15 +520,11 @@ DeactivateResponse ActivationService::ProcessDeactivate(const DeactivateRequest&
     return resp;
   }
 
-  // Remove activation record to free up the seat with checked persistence
-  if (!db_.RemoveActivation(token_opt->license_id, req.device_fingerprint)) {
-    resp.error_message = "Database write-through persistence failed during deactivation";
-    return resp;
-  }
-
   std::string nonce_hex = BytesToHex(token_opt->server_nonce.data(), token_opt->server_nonce.size());
-  if (!db_.RecordNonce(nonce_hex, current_time + 86400 * 30)) {
-    resp.error_message = "Failed to record deactivation nonce";
+  if (!db_.CommitDeactivationAtomic(token_opt->license_id, req.device_fingerprint,
+                                   current_act->sequence_number, nonce_hex,
+                                   current_time + 86400 * 30, current_time)) {
+    resp.error_message = "Atomic deactivation commit failed";
     return resp;
   }
 

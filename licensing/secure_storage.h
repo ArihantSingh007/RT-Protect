@@ -37,8 +37,15 @@ class SecureStorage {
   // Returns the active secure storage backend on this platform/environment.
   static SecureStorageBackend GetActiveBackend();
 
+  // Configures whether DPAPI is mandatory (fails closed if unavailable, e.g. in production)
+  static void SetRequireDpapi(bool require);
+  static bool IsRequireDpapi();
+
   // Resolves the file storage path on disk for file-backed storage mechanisms
   static std::string GetStorageFilePath(const std::string& key_name);
+
+  // Resolves the legacy unhashed file storage path on disk for backward compatibility
+  static std::string GetLegacyStorageFilePath(const std::string& key_name);
 
   // Fallback hardware-bound AES-256-GCM encryption helpers (accessible for headless fallback and tests)
   static std::optional<std::vector<std::uint8_t>> EncryptFallback(

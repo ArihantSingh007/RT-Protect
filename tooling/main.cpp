@@ -142,6 +142,8 @@ void PrintUsage() {
       "      --dev-keys                        Use development test keys (outside client project)\n"
       "      --manifest-pubkey <file>          External Ed25519 public key for manifest verification\n"
       "      --license-pubkey <file>           External Ed25519 public key for license verification\n"
+      "      --activation-pubkey <file>        External Ed25519 public key for activation token verification\n"
+      "      --release-sequence <num>          Monotonically increasing minimum release sequence (default: 1)\n"
       "      --sign-manifest-key <file>        Vendor private key for manifest signing\n"
       "      --sign-license-key <file>         Vendor private key for license signing\n"
       "      --license-file <file>             Deploy authorized vendor client.license\n"
@@ -496,10 +498,21 @@ int CmdIntegrate(int argc, char** argv) {
       options.manifest_pubkey_path = argv[++i];
     } else if (arg == "--license-pubkey" && i + 1 < argc) {
       options.license_pubkey_path = argv[++i];
+    } else if (arg == "--activation-pubkey" && i + 1 < argc) {
+      options.activation_pubkey_path = argv[++i];
+    } else if (arg == "--release-sequence" && i + 1 < argc) {
+      char* end = nullptr;
+      options.minimum_release_sequence = std::strtoull(argv[++i], &end, 10);
     } else if (arg == "--sign-manifest-key" && i + 1 < argc) {
       options.sign_manifest_key_path = argv[++i];
+      if (!options.use_dev_keys) {
+        std::fprintf(stderr, "[SECURITY WARNING] Passing vendor private signing keys to 'integrate' exposes them to the build environment. Recommended: integrate using public keys and pre-issued license, then run 'rtprotect-tool sign-release' on an isolated signing server.\n");
+      }
     } else if (arg == "--sign-license-key" && i + 1 < argc) {
       options.sign_license_key_path = argv[++i];
+      if (!options.use_dev_keys) {
+        std::fprintf(stderr, "[SECURITY WARNING] Passing vendor private signing keys to 'integrate' exposes them to the build environment. Recommended: integrate using public keys and pre-issued license, then run 'rtprotect-tool sign-release' on an isolated signing server.\n");
+      }
     } else if (arg == "--license-file" && i + 1 < argc) {
       options.license_file_path = argv[++i];
     } else if (arg == "--dev-keys-dir" && i + 1 < argc) {

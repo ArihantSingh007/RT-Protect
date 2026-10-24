@@ -14,6 +14,9 @@
 #include <unordered_set>
 
 #include "tooling/file_io.h"
+#include "crypto/aead.h"
+#include "crypto/kdf.h"
+#include "licensing/hardware_id.h"
 
 namespace rtprotect::licensing {
 
@@ -137,7 +140,12 @@ std::optional<ActivationEventType> ParseActivationEventType(const std::string& s
   return std::nullopt;
 }
 
-ActivationDatabase::ActivationDatabase(const std::string& db_path) {
+ActivationDatabase::ActivationDatabase(const std::string& db_path, const crypto::Aes256Key* encryption_key) {
+  if (encryption_key) {
+    std::array<std::uint8_t, 32> raw{};
+    std::memcpy(raw.data(), encryption_key->bytes().data(), 32);
+    encryption_key_raw_ = raw;
+  }
   Open(db_path);
 }
 
@@ -195,8 +203,8 @@ bool ActivationDatabase::Open(const std::string& db_path) {
         if (!ParseU32Strict(seats_str, &rec.max_seats) || rec.max_seats == 0) {
           continue; // Malformed seat count
         }
-        if (!HexToBytes(root_hex, rec.vm_root.data(), rec.vm_root.size())) {
-          continue; // Corrupted or truncated vm_root hex
+        if (!DecryptVmRootLocked(root_hex, rec.vm_root)) {
+          continue; // Corrupted, malformed, or unauthenticated vm_root
         }
         if (!ParseU64Strict(created_str, &rec.created_at)) {
           continue; // Malformed created timestamp
@@ -259,9 +267,81 @@ bool ActivationDatabase::Open(const std::string& db_path) {
   return true;
 }
 
-bool ActivationDatabase::SaveLocked() const {
-  if (db_path_.empty()) return true;
+void ActivationDatabase::SetEncryptionKey(const crypto::Aes256Key& key) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  std::array<std::uint8_t, 32> raw{};
+  std::memcpy(raw.data(), key.bytes().data(), 32);
+  encryption_key_raw_ = raw;
+}
 
+void ActivationDatabase::EnableEnvelopeEncryption(bool enable) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  envelope_encryption_enabled_ = enable;
+}
+
+std::optional<crypto::Aes256Key> ActivationDatabase::GetEffectiveEncryptionKeyLocked() const {
+  if (encryption_key_raw_.has_value()) {
+    return crypto::Aes256Key::FromBytes(encryption_key_raw_->data(), encryption_key_raw_->size());
+  }
+  std::string hwid = GetLocalHardwareId();
+  crypto::SecureBuffer sec_hwid(reinterpret_cast<const std::uint8_t*>(hwid.data()), hwid.size());
+  std::vector<std::uint8_t> salt = {'R', 'T', 'P', 'r', 'o', 't', 'e', 'c', 't', 'A', 'c', 't', 'D', 'B', 'K', 'e', 'y'};
+  auto derived = crypto::Hkdf::DeriveKey(sec_hwid, salt, "rtprotect/activation-db/vm-root/v1", crypto::kAes256KeyLen);
+  if (derived.has_value()) {
+    return crypto::Aes256Key::FromBytes(derived->data(), derived->size());
+  }
+  std::array<std::uint8_t, 32> fallback_raw{};
+  for (std::size_t i = 0; i < 32; ++i) fallback_raw[i] = static_cast<std::uint8_t>(0xA5 ^ i);
+  return crypto::Aes256Key::FromBytes(fallback_raw.data(), fallback_raw.size());
+}
+
+std::string ActivationDatabase::EncryptVmRootLocked(const std::array<std::uint8_t, 32>& root) const {
+  if (!envelope_encryption_enabled_) {
+    return BytesToHex(root.data(), root.size());
+  }
+  auto key = GetEffectiveEncryptionKeyLocked();
+  if (!key.has_value()) {
+    return BytesToHex(root.data(), root.size());
+  }
+  auto enc = crypto::Encrypt(*key, root.data(), root.size());
+  if (!enc.has_value()) {
+    return BytesToHex(root.data(), root.size());
+  }
+  return "enc:" + BytesToHex(enc->nonce.bytes, crypto::kGcmNonceLen) + ":" +
+         BytesToHex(enc->tag, crypto::kGcmTagLen) + ":" +
+         BytesToHex(enc->ciphertext.data(), enc->ciphertext.size());
+}
+
+bool ActivationDatabase::DecryptVmRootLocked(const std::string& field, std::array<std::uint8_t, 32>& out_root) const {
+  if (field.rfind("enc:", 0) == 0) {
+    auto colon1 = field.find(':', 4);
+    if (colon1 == std::string::npos) return false;
+    auto colon2 = field.find(':', colon1 + 1);
+    if (colon2 == std::string::npos) return false;
+
+    std::string iv_hex = field.substr(4, colon1 - 4);
+    std::string tag_hex = field.substr(colon1 + 1, colon2 - colon1 - 1);
+    std::string ct_hex = field.substr(colon2 + 1);
+
+    crypto::EncryptedMessage msg;
+    if (!HexToBytes(iv_hex, msg.nonce.bytes, crypto::kGcmNonceLen)) return false;
+    if (!HexToBytes(tag_hex, msg.tag, crypto::kGcmTagLen)) return false;
+    msg.ciphertext.resize(ct_hex.size() / 2);
+    if (!HexToBytes(ct_hex, msg.ciphertext.data(), msg.ciphertext.size())) return false;
+
+    auto key = GetEffectiveEncryptionKeyLocked();
+    if (!key.has_value()) return false;
+    crypto::AeadError err = crypto::AeadError::kNone;
+    auto plain = crypto::Decrypt(*key, msg, nullptr, 0, &err);
+    if (!plain.has_value() || plain->size() != 32) return false;
+
+    std::memcpy(out_root.data(), plain->data(), 32);
+    return true;
+  }
+  return HexToBytes(field, out_root.data(), out_root.size());
+}
+
+std::string ActivationDatabase::SerializeLocked() const {
   std::ostringstream ss;
   ss << "# RTProtect Activation Authority Database\n\n";
 
@@ -272,7 +352,7 @@ bool ActivationDatabase::SaveLocked() const {
        << EscapeField(l.product_id) << "|"
        << ToString(l.status) << "|"
        << l.max_seats << "|"
-       << BytesToHex(l.vm_root.data(), l.vm_root.size()) << "|"
+       << EncryptVmRootLocked(l.vm_root) << "|"
        << l.created_at;
     if (!l.activation_credential_hash.empty()) {
       ss << "|" << EscapeField(l.activation_credential_hash);
@@ -306,65 +386,44 @@ bool ActivationDatabase::SaveLocked() const {
        << EscapeField(e.details) << "\n";
   }
 
-  std::string content = ss.str();
+  return ss.str();
+}
+
+bool ActivationDatabase::SaveLocked() const {
+  if (db_path_.empty()) return true;
+  std::string content = SerializeLocked();
   return tooling::WriteFile(db_path_, reinterpret_cast<const std::uint8_t*>(content.data()), content.size());
 }
 
 bool ActivationDatabase::Save(const std::string& db_path) {
   std::lock_guard<std::mutex> lock(mutex_);
-  if (db_path.empty() || db_path == db_path_) {
-    return SaveLocked();
-  }
-
-  std::ostringstream ss;
-  ss << "# RTProtect Activation Authority Database\n\n";
-
-  ss << "[licenses]\n";
-  for (const auto& pair : licenses_) {
-    const auto& l = pair.second;
-    ss << EscapeField(l.license_id) << "|"
-       << EscapeField(l.product_id) << "|"
-       << ToString(l.status) << "|"
-       << l.max_seats << "|"
-       << BytesToHex(l.vm_root.data(), l.vm_root.size()) << "|"
-       << l.created_at << "\n";
-  }
-
-  ss << "\n[activations]\n";
-  for (const auto& pair : activations_) {
-    for (const auto& a : pair.second) {
-      ss << EscapeField(a.license_id) << "|"
-         << EscapeField(a.device_fingerprint) << "|"
-         << a.first_seen << "|"
-         << a.last_seen << "|"
-         << a.sequence_number << "\n";
-    }
-  }
-
-  ss << "\n[used_nonces]\n";
-  for (const auto& pair : used_nonces_) {
-    ss << pair.first << "|" << pair.second << "\n";
-  }
-
-  ss << "\n[events]\n";
-  for (const auto& e : events_) {
-    ss << e.timestamp << "|"
-       << ToString(e.type) << "|"
-       << EscapeField(e.license_id) << "|"
-       << EscapeField(e.device_fingerprint) << "|"
-       << EscapeField(e.ip_address) << "|"
-       << EscapeField(e.details) << "\n";
-  }
-
-  std::string content = ss.str();
-  return tooling::WriteFile(db_path, reinterpret_cast<const std::uint8_t*>(content.data()), content.size());
+  const std::string& target = db_path.empty() ? db_path_ : db_path;
+  if (target.empty()) return true;
+  std::string content = SerializeLocked();
+  return tooling::WriteFile(target, reinterpret_cast<const std::uint8_t*>(content.data()), content.size());
 }
 
-bool ActivationDatabase::RegisterLicense(const LicenseRecord& record) {
+bool ActivationDatabase::RegisterLicense(const LicenseRecord& record, bool allow_overwrite) {
   std::lock_guard<std::mutex> lock(mutex_);
   if (record.license_id.empty() || record.product_id.empty()) return false;
+  auto it = licenses_.find(record.license_id);
+  if (it != licenses_.end() && !allow_overwrite) {
+    return false; // Reject duplicate license registration to prevent silent revocation resurrection
+  }
+  std::optional<LicenseRecord> prev;
+  if (it != licenses_.end()) {
+    prev = it->second;
+  }
   licenses_[record.license_id] = record;
-  return SaveLocked();
+  if (!SaveLocked()) {
+    if (prev.has_value()) {
+      licenses_[record.license_id] = *prev;
+    } else {
+      licenses_.erase(record.license_id);
+    }
+    return false;
+  }
+  return true;
 }
 
 std::optional<LicenseRecord> ActivationDatabase::GetLicense(const std::string& license_id) const {
@@ -378,8 +437,13 @@ bool ActivationDatabase::UpdateLicenseStatus(const std::string& license_id, Lice
   std::lock_guard<std::mutex> lock(mutex_);
   auto it = licenses_.find(license_id);
   if (it == licenses_.end()) return false;
+  auto prev_status = it->second.status;
   it->second.status = status;
-  return SaveLocked();
+  if (!SaveLocked()) {
+    it->second.status = prev_status;
+    return false;
+  }
+  return true;
 }
 
 std::size_t ActivationDatabase::GetActiveSeatCount(const std::string& license_id) const {
@@ -542,6 +606,9 @@ bool ActivationDatabase::RollbackSeatAtomic(
   if (reservation.is_new_seat) {
     for (auto s_it = acts.begin(); s_it != acts.end(); ++s_it) {
       if (s_it->device_fingerprint == device_fingerprint) {
+        if (s_it->sequence_number != reservation.sequence_number) {
+          return false; // Concurrent newer activation has already advanced this seat
+        }
         acts.erase(s_it);
         if (!SaveLocked()) {
           acts = std::move(original_acts);
@@ -553,6 +620,9 @@ bool ActivationDatabase::RollbackSeatAtomic(
   } else {
     for (auto& a : acts) {
       if (a.device_fingerprint == device_fingerprint) {
+        if (a.sequence_number != reservation.sequence_number) {
+          return false; // Concurrent newer renewal has already advanced this seat
+        }
         a.sequence_number = reservation.previous_sequence_number;
         a.last_seen = reservation.previous_last_seen;
         if (!SaveLocked()) {
@@ -566,6 +636,102 @@ bool ActivationDatabase::RollbackSeatAtomic(
   return false;
 }
 
+bool ActivationDatabase::CommitRenewalAtomic(
+    const std::string& client_nonce_hex,
+    std::uint64_t client_nonce_expiry,
+    const std::string& old_server_nonce_hex,
+    std::uint64_t old_server_nonce_expiry,
+    const ActivationRecord& updated_activation,
+    std::uint64_t expected_sequence_number,
+    std::uint64_t current_time) {
+  std::lock_guard<std::mutex> lock(mutex_);
+
+  auto c_it = used_nonces_.find(client_nonce_hex);
+  if (c_it != used_nonces_.end() && c_it->second > current_time) {
+    return false; // Replay detected
+  }
+  auto s_it = used_nonces_.find(old_server_nonce_hex);
+  if (s_it != used_nonces_.end() && s_it->second > current_time) {
+    return false; // Replay detected
+  }
+
+  auto act_it = activations_.find(updated_activation.license_id);
+  if (act_it == activations_.end()) return false;
+  auto& acts = act_it->second;
+
+  auto target = acts.end();
+  for (auto it = acts.begin(); it != acts.end(); ++it) {
+    if (it->device_fingerprint == updated_activation.device_fingerprint) {
+      target = it;
+      break;
+    }
+  }
+  if (target == acts.end() || target->sequence_number != expected_sequence_number) {
+    return false;
+  }
+
+  auto orig_nonces = used_nonces_;
+  auto orig_acts = acts;
+
+  used_nonces_[client_nonce_hex] = client_nonce_expiry;
+  used_nonces_[old_server_nonce_hex] = old_server_nonce_expiry;
+  target->last_seen = updated_activation.last_seen;
+  target->sequence_number = updated_activation.sequence_number;
+
+  if (!SaveLocked()) {
+    used_nonces_ = std::move(orig_nonces);
+    acts = std::move(orig_acts);
+    return false;
+  }
+  return true;
+}
+
+bool ActivationDatabase::CommitDeactivationAtomic(
+    const std::string& license_id,
+    const std::string& device_fingerprint,
+    std::uint64_t expected_sequence_number,
+    const std::string& server_nonce_hex,
+    std::uint64_t nonce_expiry,
+    std::uint64_t current_time) {
+  std::lock_guard<std::mutex> lock(mutex_);
+
+  auto n_it = used_nonces_.find(server_nonce_hex);
+  if (n_it != used_nonces_.end() && n_it->second > current_time) {
+    return false;
+  }
+
+  auto act_it = activations_.find(license_id);
+  if (act_it == activations_.end()) return false;
+  auto& acts = act_it->second;
+
+  auto target = acts.end();
+  for (auto it = acts.begin(); it != acts.end(); ++it) {
+    if (it->device_fingerprint == device_fingerprint) {
+      target = it;
+      break;
+    }
+  }
+  if (target == acts.end() || target->sequence_number != expected_sequence_number) {
+    return false;
+  }
+
+  auto orig_nonces = used_nonces_;
+  auto orig_acts = acts;
+
+  used_nonces_[server_nonce_hex] = nonce_expiry;
+  acts.erase(target);
+  if (acts.empty()) {
+    activations_.erase(act_it);
+  }
+
+  if (!SaveLocked()) {
+    used_nonces_ = std::move(orig_nonces);
+    activations_[license_id] = std::move(orig_acts);
+    return false;
+  }
+  return true;
+}
+
 bool ActivationDatabase::IsNonceUsed(const std::string& nonce_hex) const {
   std::lock_guard<std::mutex> lock(mutex_);
   return used_nonces_.find(nonce_hex) != used_nonces_.end();
@@ -573,8 +739,14 @@ bool ActivationDatabase::IsNonceUsed(const std::string& nonce_hex) const {
 
 bool ActivationDatabase::RecordNonce(const std::string& nonce_hex, std::uint64_t expires_at) {
   std::lock_guard<std::mutex> lock(mutex_);
+  if (nonce_hex.empty()) return false;
+  auto orig = used_nonces_;
   used_nonces_[nonce_hex] = expires_at;
-  return SaveLocked();
+  if (!SaveLocked()) {
+    used_nonces_ = std::move(orig);
+    return false;
+  }
+  return true;
 }
 
 bool ActivationDatabase::ConsumeNonceIfUnused(const std::string& nonce_hex, std::uint64_t expires_at, std::uint64_t current_time) {
@@ -594,9 +766,10 @@ bool ActivationDatabase::ConsumeNonceIfUnused(const std::string& nonce_hex, std:
       }
     }
   }
+  auto orig = used_nonces_;
   used_nonces_[nonce_hex] = expires_at;
   if (!SaveLocked()) {
-    used_nonces_.erase(nonce_hex);
+    used_nonces_ = std::move(orig);
     return false;
   }
   return true;
@@ -604,6 +777,7 @@ bool ActivationDatabase::ConsumeNonceIfUnused(const std::string& nonce_hex, std:
 
 void ActivationDatabase::PruneExpiredNonces(std::uint64_t current_time) {
   std::lock_guard<std::mutex> lock(mutex_);
+  auto orig = used_nonces_;
   bool modified = false;
   for (auto it = used_nonces_.begin(); it != used_nonces_.end();) {
     if (it->second <= current_time) {
@@ -614,7 +788,9 @@ void ActivationDatabase::PruneExpiredNonces(std::uint64_t current_time) {
     }
   }
   if (modified) {
-    SaveLocked();
+    if (!SaveLocked()) {
+      used_nonces_ = std::move(orig);
+    }
   }
 }
 

@@ -14,6 +14,17 @@
 
 namespace rtprotect::licensing {
 
+struct ParsedUrl {
+  bool is_https = false;
+  std::string host;
+  std::uint16_t port = 80;
+  std::string path = "/";
+};
+
+// Parses and validates an HTTP/HTTPS authority URL, failing closed on invalid syntax,
+// missing protocols, or embedded authentication credentials.
+std::optional<ParsedUrl> ParseUrl(const std::string& url_str);
+
 // Requests online device activation from the vendor authority server.
 // Returns an installation-bound ActivationToken containing the authorized vm_root.
 std::optional<ActivationToken> RequestOnlineActivation(

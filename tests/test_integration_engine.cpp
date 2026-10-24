@@ -552,8 +552,10 @@ void TestProductionLicenseSigningWorkflow() {
   fs::path man_pub_file = test_dir / "external_man.pub";
   fs::path lic_pub_file = test_dir / "external_lic.pub";
   fs::path lic_priv_file = test_dir / "external_lic.priv";
+  fs::path act_pub_file = test_dir / "external_act.pub";
   WriteFile(man_pub_file.string(), man_kp->public_key.data(), man_kp->public_key.size());
   WriteFile(lic_pub_file.string(), lic_kp->public_key.data(), lic_kp->public_key.size());
+  WriteFile(act_pub_file.string(), man_kp->public_key.data(), man_kp->public_key.size());
   WriteSecretFile(lic_priv_file.string(), lic_kp->private_key.data(), lic_kp->private_key.size());
 
   std::string orig_cmake = "cmake_minimum_required(VERSION 3.20)\nproject(ClientApp)\nadd_executable(client main.cpp)\n";
@@ -565,6 +567,7 @@ void TestProductionLicenseSigningWorkflow() {
   opts.product_id = "com.test.prodlic";
   opts.manifest_pubkey_path = man_pub_file.string();
   opts.license_pubkey_path = lic_pub_file.string();
+  opts.activation_pubkey_path = act_pub_file.string();
   opts.sign_license_key_path = lic_priv_file.string();
   opts.staging_only = true;
   opts.run_build = false;

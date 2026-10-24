@@ -50,14 +50,30 @@ bool HexToBytes(const std::string& hex, std::uint8_t* out, std::size_t expected_
   return true;
 }
 
-struct ParsedUrl {
-  bool is_https = false;
-  std::string host = "127.0.0.1";
-  std::uint16_t port = 80;
-  std::string path = "/";
-};
+std::string EscapeJsonString(const std::string& str) {
+  std::string out;
+  out.reserve(str.size() * 2);
+  for (char c : str) {
+    if (c == '\\') out += "\\\\";
+    else if (c == '"') out += "\\\"";
+    else if (c == '\n') out += "\\n";
+    else if (c == '\r') out += "\\r";
+    else if (c == '\t') out += "\\t";
+    else if (static_cast<unsigned char>(c) < 0x20) {
+      char buf[8];
+      std::snprintf(buf, sizeof(buf), "\\u%04x", static_cast<unsigned char>(c));
+      out += buf;
+    } else {
+      out += c;
+    }
+  }
+  return out;
+}
 
-ParsedUrl ParseUrl(const std::string& url_str) {
+}  // namespace
+
+std::optional<ParsedUrl> ParseUrl(const std::string& url_str) {
+  if (url_str.empty()) return std::nullopt;
   ParsedUrl res;
   std::string rem = url_str;
   if (rem.rfind("https://", 0) == 0) {
@@ -69,12 +85,12 @@ ParsedUrl ParseUrl(const std::string& url_str) {
     res.port = 80;
     rem = rem.substr(7);
   } else {
-    return res;
+    return std::nullopt; // Disallow unencrypted schemes or missing protocol
   }
 
   // Reject embedded credentials in authority URL
   if (rem.find('@') != std::string::npos) {
-    return res;
+    return std::nullopt;
   }
 
   auto slash_pos = rem.find('/');
@@ -87,19 +103,19 @@ ParsedUrl ParseUrl(const std::string& url_str) {
     res.path = "/";
   }
 
-  if (host_port.empty()) return res;
+  if (host_port.empty()) return std::nullopt;
 
   if (host_port.front() == '[') {
     // IPv6 bracketed literal: e.g. [::1]:8080 or [2001:db8::1]
     auto close_bracket = host_port.find(']');
-    if (close_bracket == std::string::npos) return res;
+    if (close_bracket == std::string::npos) return std::nullopt;
     res.host = host_port.substr(1, close_bracket - 1);
     if (close_bracket + 1 < host_port.size()) {
-      if (host_port[close_bracket + 1] != ':') return res;
+      if (host_port[close_bracket + 1] != ':') return std::nullopt;
       std::string pstr = host_port.substr(close_bracket + 2);
       char* end = nullptr;
       long p = std::strtol(pstr.c_str(), &end, 10);
-      if (end != pstr.c_str() + pstr.size() || p <= 0 || p > 65535) return res;
+      if (end != pstr.c_str() + pstr.size() || p <= 0 || p > 65535) return std::nullopt;
       res.port = static_cast<std::uint16_t>(p);
     }
   } else {
@@ -109,15 +125,18 @@ ParsedUrl ParseUrl(const std::string& url_str) {
       std::string pstr = host_port.substr(colon_pos + 1);
       char* end = nullptr;
       long p = std::strtol(pstr.c_str(), &end, 10);
-      if (end != pstr.c_str() + pstr.size() || p <= 0 || p > 65535) return res;
+      if (end != pstr.c_str() + pstr.size() || p <= 0 || p > 65535) return std::nullopt;
       res.port = static_cast<std::uint16_t>(p);
     } else {
       res.host = host_port;
     }
   }
 
+  if (res.host.empty()) return std::nullopt;
   return res;
 }
+
+namespace {
 
 std::optional<std::string> HttpPostWinHttp(const ParsedUrl& url, const std::string& path, const std::string& json_body, std::string* error_out) {
   HINTERNET hSession = WinHttpOpen(L"RTProtect-Activation-Client/2.0",
@@ -183,6 +202,25 @@ std::optional<std::string> HttpPostWinHttp(const ParsedUrl& url, const std::stri
     return std::nullopt;
   }
 
+  DWORD status_code = 0;
+  DWORD status_code_size = sizeof(status_code);
+  if (WinHttpQueryHeaders(hRequest, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
+                          WINHTTP_HEADER_NAME_BY_INDEX, &status_code, &status_code_size, WINHTTP_NO_HEADER_INDEX)) {
+    if (status_code != 200) {
+      WinHttpCloseHandle(hRequest);
+      WinHttpCloseHandle(hConnect);
+      WinHttpCloseHandle(hSession);
+      if (error_out) *error_out = "Activation server returned HTTP status " + std::to_string(status_code);
+      return std::nullopt;
+    }
+  } else {
+    WinHttpCloseHandle(hRequest);
+    WinHttpCloseHandle(hConnect);
+    WinHttpCloseHandle(hSession);
+    if (error_out) *error_out = "Failed to query HTTP status code from server response";
+    return std::nullopt;
+  }
+
   std::string response_body;
   DWORD bytes_available = 0;
   while (WinHttpQueryDataAvailable(hRequest, &bytes_available) && bytes_available > 0) {
@@ -245,9 +283,16 @@ std::optional<std::string> HttpPostSocket(const ParsedUrl& url, const std::strin
   int req_len = static_cast<int>(req_str.size());
   while (total_sent < req_len) {
     int n = send(s, req_str.data() + total_sent, req_len - total_sent, 0);
+    if (n == SOCKET_ERROR) {
+      int err = WSAGetLastError();
+      if (err == WSAEINTR) continue;
+      closesocket(s);
+      if (error_out) *error_out = "Socket send error: " + std::to_string(err);
+      return std::nullopt;
+    }
     if (n <= 0) {
       closesocket(s);
-      if (error_out) *error_out = "Failed to send request to " + url.host;
+      if (error_out) *error_out = "Socket connection closed during send to " + url.host;
       return std::nullopt;
     }
     total_sent += n;
@@ -288,8 +333,8 @@ std::optional<std::string> HttpPostSocket(const ParsedUrl& url, const std::strin
   }
 
   std::string body = resp.substr(body_pos + 4);
-  if (http_code != 200 && http_code != 0) {
-    if (error_out) *error_out = "Server returned HTTP status " + std::to_string(http_code) + ": " + body;
+  if (http_code != 200) {
+    if (error_out) *error_out = "Server returned HTTP status " + std::to_string(http_code) + (body.empty() ? "" : ": " + body);
     return std::nullopt;
   }
   return body;
@@ -344,8 +389,20 @@ std::optional<std::string> HttpPostTls(const ParsedUrl& url, const std::string& 
     return std::nullopt;
   }
 
-  SSL_set_tlsext_host_name(ssl, url.host.c_str());
-  SSL_set1_host(ssl, url.host.c_str());
+  if (SSL_set_tlsext_host_name(ssl, url.host.c_str()) != 1) {
+    SSL_free(ssl);
+    SSL_CTX_free(ctx);
+    closesocket(s);
+    if (error_out) *error_out = "Failed to configure TLS SNI host name: " + url.host;
+    return std::nullopt;
+  }
+  if (SSL_set1_host(ssl, url.host.c_str()) != 1) {
+    SSL_free(ssl);
+    SSL_CTX_free(ctx);
+    closesocket(s);
+    if (error_out) *error_out = "Failed to configure TLS hostname validation: " + url.host;
+    return std::nullopt;
+  }
   SSL_set_fd(ssl, static_cast<int>(s));
 
   if (SSL_connect(ssl) <= 0) {
@@ -449,15 +506,20 @@ std::optional<std::string> HttpPostTls(const ParsedUrl& url, const std::string& 
   }
 
   std::string body = resp.substr(body_pos + 4);
-  if (http_code != 200 && http_code != 0) {
-    if (error_out) *error_out = "Server returned HTTP status " + std::to_string(http_code) + ": " + body;
+  if (http_code != 200) {
+    if (error_out) *error_out = "Server returned HTTP status " + std::to_string(http_code) + (body.empty() ? "" : ": " + body);
     return std::nullopt;
   }
   return body;
 }
 
 std::optional<std::string> DispatchHttpPost(const std::string& base_url, const std::string& endpoint, const std::string& body, std::string* error_out) {
-  ParsedUrl url = ParseUrl(base_url);
+  auto url_opt = ParseUrl(base_url);
+  if (!url_opt.has_value()) {
+    if (error_out) *error_out = "Invalid activation server URL: " + base_url;
+    return std::nullopt;
+  }
+  const auto& url = *url_opt;
   if (url.is_https) {
     auto winhttp_res = HttpPostWinHttp(url, endpoint, body, error_out);
     if (winhttp_res.has_value()) {
@@ -469,8 +531,10 @@ std::optional<std::string> DispatchHttpPost(const std::string& base_url, const s
 
   // Plain HTTP used ONLY when caller explicitly provided http:// on local loopback
   bool is_loopback = (url.host == "127.0.0.1" || url.host == "localhost" || url.host == "::1");
-  if (!is_loopback) {
-    if (error_out) *error_out = "Refusing insecure plain HTTP connection to non-loopback server: " + base_url + " (HTTPS required)";
+  const char* req_https_env = std::getenv("RTPROTECT_REQUIRE_HTTPS");
+  bool require_https = req_https_env && (std::strcmp(req_https_env, "1") == 0 || std::strcmp(req_https_env, "true") == 0);
+  if (!is_loopback || require_https) {
+    if (error_out) *error_out = "Refusing insecure plain HTTP connection: " + base_url + " (HTTPS required)";
     return std::nullopt;
   }
   return HttpPostSocket(url, endpoint, body, error_out);
@@ -515,13 +579,13 @@ std::optional<ActivationToken> RequestOnlineActivation(
 
   std::ostringstream json_req;
   json_req << "{\n";
-  json_req << "  \"license_key\": \"" << license_key << "\",\n";
-  json_req << "  \"device_fingerprint\": \"" << hwid << "\",\n";
-  json_req << "  \"product_id\": \"" << product_id << "\",\n";
+  json_req << "  \"license_key\": \"" << EscapeJsonString(license_key) << "\",\n";
+  json_req << "  \"device_fingerprint\": \"" << EscapeJsonString(hwid) << "\",\n";
+  json_req << "  \"product_id\": \"" << EscapeJsonString(product_id) << "\",\n";
   json_req << "  \"client_version\": \"2.0.0\",\n";
   json_req << "  \"client_timestamp\": " << client_timestamp << ",\n";
   if (!activation_credential.empty()) {
-    json_req << "  \"activation_credential\": \"" << activation_credential << "\",\n";
+    json_req << "  \"activation_credential\": \"" << EscapeJsonString(activation_credential) << "\",\n";
   }
   json_req << "  \"client_nonce\": \"" << BytesToHex(client_nonce.data(), client_nonce.size()) << "\"\n";
   json_req << "}\n";
@@ -618,8 +682,8 @@ std::optional<ActivationToken> RequestOnlineRenewal(
 
   std::ostringstream json_req;
   json_req << "{\n";
-  json_req << "  \"token\": \"" << token_hex << "\",\n";
-  json_req << "  \"device_fingerprint\": \"" << hwid << "\",\n";
+  json_req << "  \"token\": \"" << EscapeJsonString(token_hex) << "\",\n";
+  json_req << "  \"device_fingerprint\": \"" << EscapeJsonString(hwid) << "\",\n";
   json_req << "  \"client_nonce\": \"" << BytesToHex(client_nonce.data(), client_nonce.size()) << "\"\n";
   json_req << "}\n";
 
@@ -706,8 +770,8 @@ bool RequestOnlineDeactivation(
 
   std::ostringstream json_req;
   json_req << "{\n";
-  json_req << "  \"token\": \"" << token_hex << "\",\n";
-  json_req << "  \"device_fingerprint\": \"" << hwid << "\"\n";
+  json_req << "  \"token\": \"" << EscapeJsonString(token_hex) << "\",\n";
+  json_req << "  \"device_fingerprint\": \"" << EscapeJsonString(hwid) << "\"\n";
   json_req << "}\n";
 
   auto resp_body = DispatchHttpPost(server_url, "/deactivate", json_req.str(), error_out);

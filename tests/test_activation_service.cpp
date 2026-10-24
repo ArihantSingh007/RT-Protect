@@ -1533,4 +1533,215 @@ MT_TEST(HttpServer_Analytics_AdminAuthRequired) {
   std::filesystem::remove(db_path, ec);
 }
 
+MT_TEST(Database_EnvelopeEncryption_VmRoot) {
+  std::string db_path = MakeTempDbPath();
+  std::error_code ec;
+  std::filesystem::remove(db_path, ec);
+
+  std::array<std::uint8_t, 32> expected_root{};
+  for (std::size_t i = 0; i < 32; ++i) expected_root[i] = static_cast<std::uint8_t>(0xC0 + i);
+
+  {
+    ActivationDatabase db(db_path);
+    LicenseRecord lic;
+    lic.license_id = "lic-envelope-enc";
+    lic.product_id = "com.vendor.envelope";
+    lic.max_seats = 1;
+    lic.created_at = 1700000000;
+    lic.vm_root = expected_root;
+    MT_CHECK(db.RegisterLicense(lic));
+    MT_CHECK(db.Save());
+  }
+
+  // 1. Verify file on disk contains "enc:" envelope encryption format and NOT plaintext root
+  auto file_bytes = rtprotect::tooling::ReadFile(db_path);
+  MT_CHECK(file_bytes.has_value());
+  std::string content(reinterpret_cast<const char*>(file_bytes->data()), file_bytes->size());
+  MT_CHECK(content.find("lic-envelope-enc|com.vendor.envelope|active|1|enc:") != std::string::npos);
+
+  // 2. Load from disk and verify vm_root matches original
+  {
+    ActivationDatabase db2(db_path);
+    auto lic2 = db2.GetLicense("lic-envelope-enc");
+    MT_CHECK(lic2.has_value());
+    MT_CHECK(lic2->vm_root == expected_root);
+  }
+
+  // 3. Test explicit custom encryption key
+  std::array<std::uint8_t, 32> custom_key_bytes{};
+  for (std::size_t i = 0; i < 32; ++i) custom_key_bytes[i] = static_cast<std::uint8_t>(0x7A ^ i);
+  auto custom_key = rtprotect::crypto::Aes256Key::FromBytes(custom_key_bytes.data(), custom_key_bytes.size());
+  MT_CHECK(custom_key.has_value());
+
+  std::string db_path2 = MakeTempDbPath();
+  std::filesystem::remove(db_path2, ec);
+  {
+    ActivationDatabase db_custom(db_path2, &(*custom_key));
+    LicenseRecord lic;
+    lic.license_id = "lic-custom-enc";
+    lic.product_id = "com.vendor.custom";
+    lic.max_seats = 1;
+    lic.created_at = 1700000000;
+    lic.vm_root = expected_root;
+    MT_CHECK(db_custom.RegisterLicense(lic));
+    MT_CHECK(db_custom.Save());
+  }
+  {
+    ActivationDatabase db_custom_load(db_path2, &(*custom_key));
+    auto lic_load = db_custom_load.GetLicense("lic-custom-enc");
+    MT_CHECK(lic_load.has_value());
+    MT_CHECK(lic_load->vm_root == expected_root);
+  }
+
+  std::filesystem::remove(db_path, ec);
+  std::filesystem::remove(db_path2, ec);
+}
+
+MT_TEST(Database_DuplicateLicenseRegistration_Rejected) {
+  std::string db_path = MakeTempDbPath();
+  std::error_code ec;
+  std::filesystem::remove(db_path, ec);
+
+  ActivationDatabase db(db_path);
+  LicenseRecord lic;
+  lic.license_id = "lic-dup-reject";
+  lic.product_id = "com.vendor.dup";
+  lic.max_seats = 1;
+  lic.created_at = 1700000000;
+  lic.vm_root.fill(0x11);
+  MT_CHECK(db.RegisterLicense(lic));
+
+  // Revoke the license
+  MT_CHECK(db.UpdateLicenseStatus("lic-dup-reject", LicenseRecordStatus::kRevoked));
+  auto lic_revoked = db.GetLicense("lic-dup-reject");
+  MT_CHECK(lic_revoked.has_value());
+  MT_CHECK(lic_revoked->status == LicenseRecordStatus::kRevoked);
+
+  // Attempt to re-register the same license ID (default allow_overwrite = false) -> MUST FAIL
+  LicenseRecord lic_new;
+  lic_new.license_id = "lic-dup-reject";
+  lic_new.product_id = "com.vendor.dup";
+  lic_new.status = LicenseRecordStatus::kActive;
+  lic_new.max_seats = 5;
+  lic_new.created_at = 1700000001;
+  lic_new.vm_root.fill(0x22);
+  MT_CHECK(!db.RegisterLicense(lic_new, false));
+
+  // Status must remain Revoked
+  auto lic_check = db.GetLicense("lic-dup-reject");
+  MT_CHECK(lic_check.has_value());
+  MT_CHECK(lic_check->status == LicenseRecordStatus::kRevoked);
+
+  // Explicit allow_overwrite permitted only with explicit opt-in
+  MT_CHECK(db.RegisterLicense(lic_new, true));
+  auto lic_overwritten = db.GetLicense("lic-dup-reject");
+  MT_CHECK(lic_overwritten.has_value());
+  MT_CHECK(lic_overwritten->status == LicenseRecordStatus::kActive);
+  MT_CHECK(lic_overwritten->max_seats == 5);
+
+  std::filesystem::remove(db_path, ec);
+}
+
+MT_TEST(Database_RollbackSeatAtomic_RaceConditionSafety) {
+  std::string db_path = MakeTempDbPath();
+  std::error_code ec;
+  std::filesystem::remove(db_path, ec);
+
+  ActivationDatabase db(db_path);
+  LicenseRecord lic;
+  lic.license_id = "lic-race-test";
+  lic.product_id = "com.vendor.race";
+  lic.max_seats = 2;
+  lic.created_at = 1700000000;
+  lic.vm_root.fill(0x99);
+  MT_CHECK(db.RegisterLicense(lic));
+
+  // 1. Initial reservation: sequence 1
+  auto res1 = db.ReserveSeatAtomic("lic-race-test", "DEV-RACE-1", 2, 1700000000);
+  MT_CHECK(res1.success);
+  MT_CHECK(res1.is_new_seat);
+  MT_CHECK(res1.sequence_number == 1);
+
+  // 2. Concurrent renewal arrives and advances sequence 1 -> 2
+  auto res2 = db.ReserveSeatAtomic("lic-race-test", "DEV-RACE-1", 2, 1700000050);
+  MT_CHECK(res2.success);
+  MT_CHECK(!res2.is_new_seat);
+  MT_CHECK(res2.sequence_number == 2);
+  MT_CHECK(res2.previous_sequence_number == 1);
+
+  // 3. Stale rollback for request 1 (which had sequence 1) is attempted -> MUST BE REJECTED
+  bool rolled_back = db.RollbackSeatAtomic("lic-race-test", "DEV-RACE-1", res1);
+  MT_CHECK(!rolled_back); // Refuses to corrupt or erase sequence 2!
+
+  // Verify seat still exists and remains at sequence 2
+  auto act = db.GetActivation("lic-race-test", "DEV-RACE-1");
+  MT_CHECK(act.has_value());
+  MT_CHECK(act->sequence_number == 2);
+
+  // 4. Valid rollback for current reservation (sequence 2) -> Rolls back to sequence 1
+  MT_CHECK(db.RollbackSeatAtomic("lic-race-test", "DEV-RACE-1", res2));
+  act = db.GetActivation("lic-race-test", "DEV-RACE-1");
+  MT_CHECK(act.has_value());
+  MT_CHECK(act->sequence_number == 1);
+
+  std::filesystem::remove(db_path, ec);
+}
+
+MT_TEST(Database_CommitRenewalAndDeactivationAtomic) {
+  std::string db_path = MakeTempDbPath();
+  std::error_code ec;
+  std::filesystem::remove(db_path, ec);
+
+  ActivationDatabase db(db_path);
+  LicenseRecord lic;
+  lic.license_id = "lic-atomic-test";
+  lic.product_id = "com.vendor.atomic";
+  lic.max_seats = 1;
+  lic.created_at = 1700000000;
+  lic.vm_root.fill(0x33);
+  MT_CHECK(db.RegisterLicense(lic));
+
+  auto res = db.ReserveSeatAtomic("lic-atomic-test", "DEV-ATOMIC", 1, 1700000000);
+  MT_CHECK(res.success);
+
+  // 1. Commit renewal atomically
+  ActivationRecord renewed_act;
+  renewed_act.license_id = "lic-atomic-test";
+  renewed_act.device_fingerprint = "DEV-ATOMIC";
+  renewed_act.last_seen = 1700000100;
+  renewed_act.sequence_number = 2;
+
+  MT_CHECK(db.CommitRenewalAtomic("client_nonce_111", 1700086400,
+                                  "server_nonce_111", 1702592000,
+                                  renewed_act, 1, 1700000100));
+
+  // Nonces are recorded
+  MT_CHECK(db.IsNonceUsed("client_nonce_111"));
+  MT_CHECK(db.IsNonceUsed("server_nonce_111"));
+
+  // Seat is bumped
+  auto act = db.GetActivation("lic-atomic-test", "DEV-ATOMIC");
+  MT_CHECK(act.has_value());
+  MT_CHECK(act->sequence_number == 2);
+
+  // Replay of same nonces fails
+  renewed_act.sequence_number = 3;
+  MT_CHECK(!db.CommitRenewalAtomic("client_nonce_111", 1700086400,
+                                   "server_nonce_222", 1702592000,
+                                   renewed_act, 2, 1700000100));
+
+  // Sequence mismatch fails
+  MT_CHECK(!db.CommitRenewalAtomic("client_nonce_333", 1700086400,
+                                   "server_nonce_333", 1702592000,
+                                   renewed_act, 5, 1700000100));
+
+  // 2. Commit deactivation atomically
+  MT_CHECK(db.CommitDeactivationAtomic("lic-atomic-test", "DEV-ATOMIC", 2,
+                                      "deact_nonce_444", 1702592000, 1700000200));
+  MT_CHECK(db.IsNonceUsed("deact_nonce_444"));
+  MT_CHECK(!db.GetActivation("lic-atomic-test", "DEV-ATOMIC").has_value());
+
+  std::filesystem::remove(db_path, ec);
+}
+
 MT_MAIN()

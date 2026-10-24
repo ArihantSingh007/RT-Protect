@@ -13,6 +13,8 @@
 #include <unordered_map>
 #include <vector>
 
+#include "crypto/aead.h"
+
 namespace rtprotect::licensing {
 
 enum class LicenseRecordStatus {
@@ -78,7 +80,7 @@ struct SeatReservationResult {
 class ActivationDatabase {
  public:
   ActivationDatabase() = default;
-  explicit ActivationDatabase(const std::string& db_path);
+  explicit ActivationDatabase(const std::string& db_path, const crypto::Aes256Key* encryption_key = nullptr);
 
   // Opens and loads database from file; creates empty database if file doesn't exist
   bool Open(const std::string& db_path);
@@ -87,9 +89,13 @@ class ActivationDatabase {
   bool Save(const std::string& db_path = "");
 
   // License management
-  bool RegisterLicense(const LicenseRecord& record);
+  bool RegisterLicense(const LicenseRecord& record, bool allow_overwrite = false);
   std::optional<LicenseRecord> GetLicense(const std::string& license_id) const;
   bool UpdateLicenseStatus(const std::string& license_id, LicenseRecordStatus status);
+
+  // Envelope encryption for sensitive fields (vm_root)
+  void SetEncryptionKey(const crypto::Aes256Key& key);
+  void EnableEnvelopeEncryption(bool enable = true);
 
   // Activation & seat tracking
   std::size_t GetActiveSeatCount(const std::string& license_id) const;
@@ -98,6 +104,22 @@ class ActivationDatabase {
                                                 const std::string& device_fingerprint) const;
   bool RecordActivation(const ActivationRecord& record);
   bool RemoveActivation(const std::string& license_id, const std::string& device_fingerprint);
+
+  // Unified atomic transactions for renewals and deactivations
+  bool CommitRenewalAtomic(const std::string& client_nonce_hex,
+                           std::uint64_t client_nonce_expiry,
+                           const std::string& old_server_nonce_hex,
+                           std::uint64_t old_server_nonce_expiry,
+                           const ActivationRecord& updated_activation,
+                           std::uint64_t expected_sequence_number,
+                           std::uint64_t current_time);
+
+  bool CommitDeactivationAtomic(const std::string& license_id,
+                                const std::string& device_fingerprint,
+                                std::uint64_t expected_sequence_number,
+                                const std::string& server_nonce_hex,
+                                std::uint64_t nonce_expiry,
+                                std::uint64_t current_time);
 
   // Atomic seat reservation and lifecycle lease management
   SeatReservationResult ReserveSeatAtomic(const std::string& license_id,
@@ -133,6 +155,10 @@ class ActivationDatabase {
 
  private:
   bool SaveLocked() const;
+  std::string SerializeLocked() const;
+  std::optional<crypto::Aes256Key> GetEffectiveEncryptionKeyLocked() const;
+  std::string EncryptVmRootLocked(const std::array<std::uint8_t, 32>& root) const;
+  bool DecryptVmRootLocked(const std::string& field, std::array<std::uint8_t, 32>& out_root) const;
 
   mutable std::mutex mutex_;
   std::string db_path_;
@@ -140,6 +166,8 @@ class ActivationDatabase {
   std::unordered_map<std::string, std::vector<ActivationRecord>> activations_; // license_id -> activations
   std::unordered_map<std::string, std::uint64_t> used_nonces_;                 // nonce_hex -> expires_at
   std::vector<ActivationEvent> events_;                                        // audit event log
+  std::optional<std::array<std::uint8_t, 32>> encryption_key_raw_;
+  bool envelope_encryption_enabled_ = true;
 };
 
 }  // namespace rtprotect::licensing

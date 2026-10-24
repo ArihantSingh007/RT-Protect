@@ -133,6 +133,14 @@ The audit identified and resolved critical architectural vulnerabilities in sign
 | **RTP-SEC-093** | High | Confirmed | `.github/workflows/ci.yml`:132-178 | CI Fuzzing Exit-Code Swallowing & Reproducer Loss: In multi-command PowerShell steps, failure exit codes from earlier fuzzers were overwritten by subsequent clean runs, allowing genuine crashes to report green; crashing inputs were not uploaded. | Silent failure of continuous fuzzing; crashes or sanitizer findings undetected in scheduled CI runs. | libFuzzer discovering a crash in any fuzzer prior to the final command. | Implemented target iteration with explicit `$LASTEXITCODE` tracking terminating with exit code 1 on failure; configured `-artifact_prefix=fuzz_artifacts/`; added `actions/upload-artifact@v4` upload on failure. | Verified via PowerShell fuzzer runner loop and CI schema verification. |
 | **RTP-SEC-094** | Medium | Confirmed | `licensing/abuse_analytics.*`, `licensing/activation_database.*` | Abuse Analytics Anomaly Scoring Coverage Gaps & Status Overrides: `kRenewalFailed` was ignored; `kActivationFailed` was omitted from risk scoring; revoked/refunded/unregistered licenses could receive `ALLOW` recommendations; IPv6 `::` compression produced malformed `:::` subnets; churn scaling was unnormalized against seat counts. | Inaccurate risk assessments on credential-stuffing attacks; revoked or unregistered licenses left unmonitored; false subnet grouping. | Automated credential stuffing, token replay against revoked keys, querying unregistered license IDs, or IPv6 multi-client deployments. | Added `ACTIVATION_FAILURE_BURST`, `REVOKED_LICENSE_ACTIVITY`, and `UNREGISTERED_LICENSE_ACTIVITY` anomaly flags; enforced mandatory `SUSPEND_LICENSE` on non-active and active-unregistered licenses; normalized IPv4 /24 and IPv6 /48 prefixes; seat-normalized churn ratio scaling. | Verified in `test_activation_service.cpp` (`AbuseAnalytics_EdgeCasesAndHardenedScoring`, 28/28 tests passing). |
 | **RTP-SEC-095** | Low | Confirmed | `licensing/activation_database.cpp`:425-545 | ActivationDatabase Stale-Purge & Mutation Desynchronization on Partial Failure: In `ReserveSeatAtomic`, `RemoveActivation`, and `RollbackSeatAtomic`, in-memory mutations (such as stale-seat purges) preceded capacity validation or disk write-through without snapshot rollback, risking memory-disk state divergence on failure. | In-memory activations list drifting out-of-sync with on-disk state upon rejected seat capacity or failed disk write-through. | Capacity exhaustion or disk write failure during seat reservation with stale entries present. | Captured pre-mutation vector snapshots (`original_acts`); restored pre-mutation state on all capacity rejection and disk write failure branches across `ReserveSeatAtomic`, `RecordActivation`, `RemoveActivation`, and `RollbackSeatAtomic`. | Verified in `test_activation_service.cpp` (`Database_ReserveSeatAtomic_StalePurgeRollback`, 29/29 tests passing). |
+| **RTP-SEC-096** | Critical | Confirmed | `tooling/integration_engine.cpp` | Hardcoded Client Activation Credential Leakage: `PlanIntegration` embedded `kActivationCredential` directly into generated C++ source headers (`rtprotect_config.h`), leaking purchaser activation credentials across distributed customer binaries and subverting server-side credential verification. | Total bypass of server-side activation authentication; shared credential leakage across binary distribution. | Inspecting strings or decompiling protected binaries built with online activation enabled. | Removed `kActivationCredential` generation completely; implemented dynamic credential supply via `VerifyClientIntegrityAndLicense(const char* activation_credential = nullptr)`, `SetClientActivationCredential(const char*)`, or `RTPROTECT_ACTIVATION_CREDENTIAL` environment variable; deferred online activation to `main()` if no cached token exists. | Verified in `test_integration_engine.cpp` and runtime glue tests. |
+| **RTP-SEC-097** | High | Confirmed | `tooling/integration_engine.cpp`, `tooling/main.cpp` | Activation Public Key Provisioning Defect & Mismatched Throwaway Keys: Integration tooling silently generated ephemeral throwaway keypairs when `--activation-pubkey` was omitted in production mode (`!use_dev_keys`), producing binaries incompatible with production activation authority. | Production application builds fail online activation due to signature mismatch against the vendor activation authority. | Running `integrate` in production mode without explicit activation key parameters. | Added `--activation-pubkey <path>` and `--release-sequence <num>` CLI arguments; enforced mandatory pre-provisioned activation public key in production builds; prohibited silent ephemeral key generation when `!use_dev_keys`. | Verified in `test_integration_engine.cpp` and CLI validation tests. |
+| **RTP-SEC-098** | High | Confirmed | `tooling/main.cpp`, `tooling/integration_engine.cpp` | Build Pipeline Vendor Private Key Exposure: Build scripts frequently passed private signing keys (`--sign-manifest-key`, `--sign-license-key`) into customer build pipelines during initial code integration rather than during release staging. | Exposure of vendor root signing keys within client and CI developer build environments. | Passing private signing keys to developer build targets. | Added prominent security warnings in CLI and build planner when private keys are passed to `integrate` in production; documented standard two-phase workflow: integrate with public verification keys, then sign binaries and manifests during final release stage via `rtprotect-tool sign-release`. | Verified in CLI help, logs, and security audit documentation. |
+| **RTP-SEC-099** | High | Confirmed | `tooling/activation_server_main.cpp` | Insecure File Vault in Production Activation Authority: Server permitted file-backed secret storage (`kGuardedFile`) in default production mode, storing authority Ed25519 signing keys in filesystem files without hardware DPAPI protection. | Authority Ed25519 private key theft from production filesystem backups or unauthorized local file reads. | Starting production activation server with file-backed secrets provider. | Enforced an explicit allowlist in production mode requiring `kWindowsDpapiVault` (Windows Data Protection API); rejected file-backed storage unless `--allow-insecure-file-vault` is explicitly supplied; corrected honest log reporting. | Verified in `tooling/activation_server_main.cpp`. |
+| **RTP-SEC-100** | High | Confirmed | `licensing/activation_database.cpp` | Activation Seat Sequence Race Condition in Multi-Seat Systems: `RollbackSeatAtomic` identified target activations solely by `device_fingerprint`, allowing failed older concurrent requests to overwrite or delete newer valid activations occurring on the same device. | Concurrent activations corrupted, causing premature seat revocation or sequence desynchronization. | Concurrent or interleaved activation requests from the same hardware device. | Gated seat modification and deletion in `RollbackSeatAtomic` on matching the exact assigned `reservation.sequence_number`, ensuring failed older requests cannot mutate or delete newer valid activations. | Verified in `test_activation_service.cpp` (`Database_RollbackSeatAtomic_RaceConditionSafety`). |
+| **RTP-SEC-101** | High | Confirmed | `licensing/activation_database.*`, `licensing/activation_service.cpp` | Multi-Step Renewal & Deactivation Partial-Commit Failures: In `ProcessRenew` and `ProcessDeactivate`, consuming nonces, updating activation records, and saving to disk occurred as separate disjoint operations, risking partial state commits on crash or failure. | Desynchronized nonce replay states, orphaned seat allocations, or duplicate renewals. | Power loss or server crash during renewal or deactivation execution. | Implemented unified atomic methods `CommitRenewalAtomic` and `CommitDeactivationAtomic` in `ActivationDatabase`, executing nonce consumption, sequence bumps/seat deletion, and disk persistence under a single atomic lock with automatic rollback on error. | Verified in `test_activation_service.cpp` (`Database_CommitRenewalAndDeactivationAtomic`). |
+| **RTP-SEC-102** | High | Confirmed | `licensing/activation_database.*` | Plaintext VM Root Material Storage in Database: The authority database stored 32-byte `vm_root` symmetric keys in unauthenticated plaintext hexadecimal, exposing root virtualization secrets to anyone with file read access. | Extraction of VM encryption roots from database disk files or unauthorized backup inspection. | Reading `licenses.db` flat file on authority server. | Implemented AES-256-GCM envelope encryption (`enc:<iv>:<tag>:<ct>`) bound to machine HKDF keys or dedicated custom KMS keys (`SetEncryptionKey`); supported backward-compatible parsing of legacy hex format; enforced authenticated decryption. | Verified in `test_activation_service.cpp` (`Database_EnvelopeEncryption_VmRoot`). |
+| **RTP-SEC-103** | High | Confirmed | `licensing/secure_storage.*`, `licensing/activation_client.*`, `tooling/integration_engine.cpp` | Client Secure Storage & Network Protocol Hardening: Secure storage key names could collide or traverse paths; container parsing accepted trailing unauthenticated data; DPAPI failures silently fell back without enforcement; HTTP client accepted plain HTTP, ignored TLS hostname errors, and URL parser lacked fail-closed validation. | Token tampering via appended container bytes; cleartext network eavesdropping; credential theft; C++ code injection via unescaped string literals. | Trailing garbage bytes in token containers, insecure URLs, or unescaped product metadata. | SHA-256 hashed key filenames; strictly enforced container size (`bytes.size() == 12 + len`); added `SetRequireDpapi` fail-closed mode; hardened URL parser with strict scheme and credentials rejection; mandated HTTPS for non-loopback addresses; verified OpenSSL hostname validation; implemented `EscapeCxxStringLiteral()` and strict schema validation in code generators. | Verified in `test_activation.cpp` (`SecureStorage_UnpackContainer_StrictLength`, `SecureStorage_RequireDpapi_PolicyEnforcement`, `ActivationClient_ParseUrl_FailClosed`). |
 
 ---
 
@@ -143,53 +151,31 @@ The entire suite of 24 automated unit, component, and integration tests passes w
 ```
 Test project C:/Users/Arihant Singh/Downloads/rtprotect_hardening_WIP/build
       Start  1: test_aead ........................   Passed    0.04 sec
-      Start  2: test_kdf .........................   Passed    0.03 sec
+      Start  2: test_kdf .........................   Passed    0.02 sec
       Start  3: test_vm ..........................   Passed    0.02 sec
-      Start  4: test_protected_checksum ..........   Passed    0.11 sec
+      Start  4: test_protected_checksum ..........   Passed    0.04 sec
       Start  5: test_manifest ....................   Passed    0.03 sec
       Start  6: test_signing .....................   Passed    0.03 sec
       Start  7: test_bound_key ...................   Passed    0.03 sec
-      Start  8: test_file_io .....................   Passed    0.06 sec
+      Start  8: test_file_io .....................   Passed    0.03 sec
       Start  9: test_checked_arith_fallback ......   Passed    0.14 sec
       Start 10: test_secure_buffer ...............   Passed    0.03 sec
-      Start 11: test_obfuscated_string ...........   Passed    0.03 sec
-      Start 12: test_checksum_flattened ..........   Passed    0.04 sec
-      Start 13: test_license .....................   Passed    0.13 sec
-      Start 14: test_activation ..................   Passed    0.23 sec
-      Start 15: test_activation_service ..........   Passed    0.52 sec
-      Start 16: test_secrets_manager .............   Passed    0.08 sec
-      Start 17: test_trusted_time ................   Passed    0.15 sec
-      Start 18: test_hardware_id .................   Passed    0.04 sec
-      Start 19: test_update_manifest .............   Passed    0.13 sec
-      Start 20: test_antitamper ..................   Passed    0.18 sec
-      Start 21: test_opcode_map ..................   Passed    0.09 sec
-      Start 22: test_integration_engine ..........   Passed   32.42 sec
-      Start 23: test_unreal_integration ..........   Passed    0.24 sec
-      Start 24: test_pe_protector ................   Passed    0.10 sec
-
-100% tests passed, 0 tests failed out of 24
-```
-      Start  4: test_protected_checksum ..........   Passed    0.03 sec
-      Start  5: test_manifest ....................   Passed    0.02 sec
-      Start  6: test_signing .....................   Passed    0.03 sec
-      Start  7: test_bound_key ...................   Passed    0.03 sec
-      Start  8: test_file_io .....................   Passed    0.01 sec
-      Start  9: test_checked_arith_fallback ......   Passed    0.14 sec
-      Start 10: test_secure_buffer ...............   Passed    0.02 sec
       Start 11: test_obfuscated_string ...........   Passed    0.02 sec
       Start 12: test_checksum_flattened ..........   Passed    0.03 sec
       Start 13: test_license .....................   Passed    0.03 sec
-      Start 14: test_activation ..................   Passed    0.12 sec
-      Start 15: test_activation_service ..........   Passed    0.16 sec
-      Start 16: test_trusted_time ................   Passed    0.13 sec
-      Start 17: test_hardware_id .................   Passed    0.03 sec
-      Start 18: test_update_manifest .............   Passed    0.04 sec
-      Start 19: test_antitamper ..................   Passed    0.03 sec
-      Start 20: test_opcode_map ..................   Passed    0.02 sec
-      Start 21: test_integration_engine ..........   Passed    3.28 sec
-      Start 22: test_unreal_integration ..........   Passed    0.05 sec
+      Start 14: test_activation ..................   Passed    0.18 sec
+      Start 15: test_activation_service ..........   Passed    0.71 sec
+      Start 16: test_secrets_manager .............   Passed    0.07 sec
+      Start 17: test_trusted_time ................   Passed    0.15 sec
+      Start 18: test_hardware_id .................   Passed    0.03 sec
+      Start 19: test_update_manifest .............   Passed    0.04 sec
+      Start 20: test_antitamper ..................   Passed    0.12 sec
+      Start 21: test_opcode_map ..................   Passed    0.02 sec
+      Start 22: test_integration_engine ..........   Passed   30.05 sec
+      Start 23: test_unreal_integration ..........   Passed    0.05 sec
+      Start 24: test_pe_protector ................   Passed    0.04 sec
 
-100% tests passed, 0 tests failed out of 22
+100% tests passed, 0 tests failed out of 24
 ```
 
 Packaging execution via `tooling/package_release.ps1` verifies all targets, strips release executables, and produces a complete distribution archive:

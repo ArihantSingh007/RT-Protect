@@ -65,6 +65,26 @@ std::string EscapeJson(const std::string& str) {
   return out;
 }
 
+std::string EscapeCxxStringLiteral(const std::string& str) {
+  std::string out;
+  out.reserve(str.size() * 2);
+  for (unsigned char c : str) {
+    if (c == '\\') out += "\\\\";
+    else if (c == '"') out += "\\\"";
+    else if (c == '\n') out += "\\n";
+    else if (c == '\r') out += "\\r";
+    else if (c == '\t') out += "\\t";
+    else if (c < 32 || c >= 127) {
+      char buf[8];
+      std::snprintf(buf, sizeof(buf), "\\x%02x", c);
+      out += buf;
+    } else {
+      out += static_cast<char>(c);
+    }
+  }
+  return out;
+}
+
 bool IsPathWithin(const fs::path& child, const fs::path& base) {
   std::error_code ec;
   auto abs_child = fs::weakly_canonical(child, ec);
@@ -624,6 +644,23 @@ ChangePlan PlanIntegration(const IntegrationOptions& options) {
     return plan;
   }
 
+  if (!IsValidIdentifier(options.product_id)) {
+    plan.is_supported = false;
+    plan.explanation = "Invalid product identifier: '" + options.product_id + "'. Must match ^[A-Za-z0-9_.-]+$ and be <= 128 characters.";
+    return plan;
+  }
+  if (!IsValidIdentifier(options.release_version)) {
+    plan.is_supported = false;
+    plan.explanation = "Invalid release version: '" + options.release_version + "'. Must match ^[A-Za-z0-9_.-]+$ and be <= 128 characters.";
+    return plan;
+  }
+
+  if (!options.use_dev_keys && (!options.sign_manifest_key_path.empty() || !options.sign_license_key_path.empty())) {
+    plan.warnings.push_back(
+        "Vendor private signing keys were supplied to build integration. For production environments, "
+        "use public keys during build and invoke 'sign-release' on an isolated signing machine.");
+  }
+
   std::error_code ec;
   fs::path proj_path = fs::canonical(options.target_project_path, ec);
   if (ec || !fs::is_directory(proj_path)) {
@@ -925,10 +962,22 @@ IntegrationReport ExecuteIntegration(const IntegrationOptions& options) {
       }
       std::memcpy(activation_pubkey.data(), act_bytes->data(), integrity::kEd25519PublicKeyLen);
     } else {
+      if (!options.use_dev_keys) {
+        report.success = false;
+        report.state = IntegrationState::kFailed;
+        report.error_message = "Production mode requires --activation-pubkey pointing to the vendor activation server public key";
+        return report;
+      }
       auto act_kp = integrity::GenerateEd25519KeyPair();
       if (act_kp.has_value()) {
         activation_pubkey = act_kp->public_key;
       }
+    }
+
+    if (!options.use_dev_keys && (!options.sign_manifest_key_path.empty() || !options.sign_license_key_path.empty())) {
+      report.warnings.push_back(
+          "Vendor private signing keys were supplied to build integration. For production environments, "
+          "use public keys during build and invoke 'sign-release' on an isolated signing machine.");
     }
 
     // Optional signing keys for authorized build machine
@@ -1156,12 +1205,11 @@ IntegrationReport ExecuteIntegration(const IntegrationOptions& options) {
     ss << "#include \"crypto/kdf.h\"\n";
     ss << "#include \"crypto/secure_buffer.h\"\n\n";
     ss << "namespace rtprotect_client {\n\n";
-    ss << "inline constexpr const char* kProductId = \"" << options.product_id << "\";\n";
-    ss << "inline constexpr const char* kReleaseVersion = \"" << options.release_version << "\";\n";
-    ss << "inline constexpr const char* kProtectionProfile = \"" << ToString(options.profile) << "\";\n";
-    ss << "inline constexpr const char* kExpectedExecutableName = \"" << expected_exe_name << "\";\n";
-    ss << "inline constexpr const char* kActivationServerUrl = \"" << options.activation_server_url << "\";\n";
-    ss << "inline constexpr const char* kActivationCredential = \"" << options.activation_credential << "\";\n";
+    ss << "inline constexpr const char* kProductId = \"" << EscapeCxxStringLiteral(options.product_id) << "\";\n";
+    ss << "inline constexpr const char* kReleaseVersion = \"" << EscapeCxxStringLiteral(options.release_version) << "\";\n";
+    ss << "inline constexpr const char* kProtectionProfile = \"" << EscapeCxxStringLiteral(ToString(options.profile)) << "\";\n";
+    ss << "inline constexpr const char* kExpectedExecutableName = \"" << EscapeCxxStringLiteral(expected_exe_name) << "\";\n";
+    ss << "inline constexpr const char* kActivationServerUrl = \"" << EscapeCxxStringLiteral(options.activation_server_url) << "\";\n";
     ss << "inline constexpr bool kAllowDevTokenFallback = " << (options.use_dev_keys ? "true" : "false") << ";\n";
     ss << "inline constexpr std::uint64_t kRequiredCapabilities = 0x01; // kCapCoreExecution\n";
     ss << "inline constexpr std::uint64_t kMinimumReleaseSequence = " << options.minimum_release_sequence << "ULL;\n\n";
@@ -1189,7 +1237,8 @@ IntegrationReport ExecuteIntegration(const IntegrationOptions& options) {
     dump_key("kActivationPublicKey", activation_pubkey);
     dump_key("kPublicKey", manifest_pubkey);
 
-    ss << "bool VerifyClientIntegrityAndLicense();\n";
+    ss << "bool VerifyClientIntegrityAndLicense(const char* activation_credential = nullptr);\n";
+    ss << "void SetClientActivationCredential(const char* credential);\n";
     ss << "std::string GetLicenseEdition();\n";
     ss << "std::uint64_t GetLicenseCapabilities();\n";
     ss << "bool HasCapability(std::uint64_t cap);\n";
@@ -1250,7 +1299,16 @@ IntegrationReport ExecuteIntegration(const IntegrationOptions& options) {
     ss << "static bool s_license_validated = false;\n";
     ss << "static rtprotect::licensing::License s_validated_license{};\n";
     ss << "static std::array<std::uint8_t, 32> s_runtime_manifest_vm_root{};\n";
-    ss << "static bool s_runtime_root_initialized = false;\n\n";
+    ss << "static bool s_runtime_root_initialized = false;\n";
+    ss << "static std::string s_client_activation_credential;\n\n";
+
+    ss << "void SetClientActivationCredential(const char* credential) {\n";
+    ss << "  if (credential) {\n";
+    ss << "    s_client_activation_credential = credential;\n";
+    ss << "  } else {\n";
+    ss << "    s_client_activation_credential.clear();\n";
+    ss << "  }\n";
+    ss << "}\n\n";
 
     ss << "void SetRuntimeManifestRoot(const std::uint8_t* root_hash, std::size_t len) {\n";
     ss << "  if (root_hash && len == 32) {\n";
@@ -1299,7 +1357,7 @@ IntegrationReport ExecuteIntegration(const IntegrationOptions& options) {
     ss << "}\n\n";
     ss << "}  // namespace\n\n";
 
-    ss << "bool VerifyClientIntegrityAndLicense() {\n";
+    ss << "bool VerifyClientIntegrityAndLicense(const char* activation_credential) {\n";
     ss << "  // 1. Runtime environment risk assessment and launch watchdog\n";
     ss << "  rtprotect::antitamper::StartHardwareBreakpointWatchdog(500);\n";
     ss << "  auto risk = rtprotect::antitamper::AssessEnvironmentRisk();\n";
@@ -1353,9 +1411,20 @@ IntegrationReport ExecuteIntegration(const IntegrationOptions& options) {
     ss << "  }\n\n";
     ss << "  // 4b. Online Activation against server if uncached or expired\n";
     ss << "  if (!token_loaded && kActivationServerUrl[0] != '\\0') {\n";
+    ss << "    const char* effective_cred = activation_credential;\n";
+    ss << "    if (!effective_cred || effective_cred[0] == '\\0') {\n";
+    ss << "      if (!s_client_activation_credential.empty()) {\n";
+    ss << "        effective_cred = s_client_activation_credential.c_str();\n";
+    ss << "      } else {\n";
+    ss << "        const char* env_cred = std::getenv(\"RTPROTECT_ACTIVATION_CREDENTIAL\");\n";
+    ss << "        if (env_cred && env_cred[0] != '\\0') {\n";
+    ss << "          effective_cred = env_cred;\n";
+    ss << "        }\n";
+    ss << "      }\n";
+    ss << "    }\n";
     ss << "    std::string act_err;\n";
     ss << "    auto online_token = rtprotect::licensing::RequestOnlineActivation(\n";
-    ss << "        kActivationServerUrl, lic.license_id, kProductId, kActivationPublicKey, &act_err, kActivationCredential, ctx.current_time);\n";
+    ss << "        kActivationServerUrl, lic.license_id, kProductId, kActivationPublicKey, &act_err, effective_cred ? effective_cred : \"\", ctx.current_time);\n";
     ss << "    if (online_token.has_value()) {\n";
     ss << "      token = *online_token;\n";
     ss << "      rtprotect::licensing::SaveActivationToken(kProductId, token);\n";
@@ -1402,9 +1471,12 @@ IntegrationReport ExecuteIntegration(const IntegrationOptions& options) {
     // Automatic pre-main() startup constructor hook
     ss << "#if defined(_MSC_VER)\n";
     ss << "static int InitializeRtProtectStartupHook() {\n";
-    ss << "  if (!rtprotect_client::VerifyClientIntegrityAndLicense()) {\n";
-    ss << "    std::fprintf(stderr, \"[RTProtect] Fatal: Integrity or license verification failed. Terminating.\\n\");\n";
-    ss << "    std::exit(1);\n";
+    ss << "  const char* env_cred = std::getenv(\"RTPROTECT_ACTIVATION_CREDENTIAL\");\n";
+    ss << "  if (!rtprotect_client::VerifyClientIntegrityAndLicense(env_cred)) {\n";
+    ss << "    if (rtprotect_client::kActivationServerUrl[0] == '\\0' || rtprotect_client::kAllowDevTokenFallback) {\n";
+    ss << "      std::fprintf(stderr, \"[RTProtect] Fatal: Integrity or license verification failed. Terminating.\\n\");\n";
+    ss << "      std::exit(1);\n";
+    ss << "    }\n";
     ss << "  }\n";
     ss << "  return 0;\n";
     ss << "}\n";
@@ -1412,9 +1484,12 @@ IntegrationReport ExecuteIntegration(const IntegrationOptions& options) {
     ss << "__declspec(allocate(\".CRT$XCU\")) static int (*p_init_rtprotect)() = InitializeRtProtectStartupHook;\n";
     ss << "#else\n";
     ss << "__attribute__((constructor(101))) static void InitializeRtProtectStartupHook() {\n";
-    ss << "  if (!rtprotect_client::VerifyClientIntegrityAndLicense()) {\n";
-    ss << "    std::fprintf(stderr, \"[RTProtect] Fatal: Integrity or license verification failed. Terminating.\\n\");\n";
-    ss << "    std::exit(1);\n";
+    ss << "  const char* env_cred = std::getenv(\"RTPROTECT_ACTIVATION_CREDENTIAL\");\n";
+    ss << "  if (!rtprotect_client::VerifyClientIntegrityAndLicense(env_cred)) {\n";
+    ss << "    if (rtprotect_client::kActivationServerUrl[0] == '\\0' || rtprotect_client::kAllowDevTokenFallback) {\n";
+    ss << "      std::fprintf(stderr, \"[RTProtect] Fatal: Integrity or license verification failed. Terminating.\\n\");\n";
+    ss << "      std::exit(1);\n";
+    ss << "    }\n";
     ss << "  }\n";
     ss << "}\n";
     ss << "#endif\n";
@@ -1644,7 +1719,7 @@ IntegrationReport ExecuteIntegration(const IntegrationOptions& options) {
   {
     integrity::Manifest manifest;
     manifest.release_version = options.release_version;
-    manifest.release_sequence = 1;
+    manifest.release_sequence = options.minimum_release_sequence;
 
     std::uint64_t cfg_size = 0;
     auto cfg_hash = integrity::Sha256File(config_header_path.string(), &cfg_size);
@@ -1744,7 +1819,7 @@ IntegrationReport ExecuteIntegration(const IntegrationOptions& options) {
     // Measure the actual compiled executable via streaming SHA-256
     integrity::Manifest manifest;
     manifest.release_version = options.release_version;
-    manifest.release_sequence = 1;
+    manifest.release_sequence = options.minimum_release_sequence;
 
     std::uint64_t cfg_size = 0;
     auto cfg_hash = integrity::Sha256File(config_header_path.string(), &cfg_size);

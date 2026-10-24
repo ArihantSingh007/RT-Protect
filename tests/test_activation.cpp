@@ -1,6 +1,7 @@
 // tests/test_activation.cpp
 
 #include "licensing/activation.h"
+#include "licensing/activation_client.h"
 #include "licensing/activation_server.h"
 #include "licensing/secure_storage.h"
 #include "licensing/hardware_id.h"
@@ -473,6 +474,90 @@ MT_TEST(SecureStorage_LegacyAeadFileMigration) {
   MT_CHECK(migrated_tok->vm_root == legacy_tok.vm_root);
 
   std::filesystem::remove(file_path, ec);
+}
+
+MT_TEST(SecureStorage_UnpackContainer_StrictLength) {
+  std::string key = "test_strict_container_len";
+  SecureStorage::Delete(key);
+
+  std::vector<std::uint8_t> secret_data = {'S', 't', 'r', 'i', 'c', 't', '1', '2', '3'};
+  MT_CHECK(SecureStorage::Store(key, secret_data));
+
+  std::string file_path = SecureStorage::GetStorageFilePath(key);
+  auto raw = rtprotect::tooling::ReadFile(file_path);
+  MT_CHECK(raw.has_value());
+
+  // 1. Appending trailing bytes must cause Load() to fail closed
+  auto tampered_trailing = *raw;
+  tampered_trailing.push_back(0xAA);
+  tampered_trailing.push_back(0xBB);
+  MT_CHECK(rtprotect::tooling::WriteFile(file_path, tampered_trailing.data(), tampered_trailing.size()));
+  MT_CHECK(!SecureStorage::Load(key).has_value());
+
+  // 2. Truncating bytes must cause Load() to fail closed
+  if (raw->size() > 14) {
+    auto tampered_trunc = *raw;
+    tampered_trunc.pop_back();
+    MT_CHECK(rtprotect::tooling::WriteFile(file_path, tampered_trunc.data(), tampered_trunc.size()));
+    MT_CHECK(!SecureStorage::Load(key).has_value());
+  }
+
+  SecureStorage::Delete(key);
+}
+
+MT_TEST(SecureStorage_RequireDpapi_PolicyEnforcement) {
+  bool original_setting = SecureStorage::IsRequireDpapi();
+
+  SecureStorage::SetRequireDpapi(true);
+  MT_CHECK(SecureStorage::IsRequireDpapi());
+
+  SecureStorage::SetRequireDpapi(false);
+  MT_CHECK(!SecureStorage::IsRequireDpapi());
+
+  SecureStorage::SetRequireDpapi(original_setting);
+}
+
+MT_TEST(ActivationClient_ParseUrl_FailClosed) {
+  // Empty URL
+  MT_CHECK(!ParseUrl("").has_value());
+
+  // Missing or invalid scheme
+  MT_CHECK(!ParseUrl("localhost:8080/api").has_value());
+  MT_CHECK(!ParseUrl("ftp://example.com/api").has_value());
+  MT_CHECK(!ParseUrl("file:///C:/secrets.dat").has_value());
+
+  // Embedded credentials rejected
+  MT_CHECK(!ParseUrl("https://admin:pass@licensing.vendor.com/v1").has_value());
+  MT_CHECK(!ParseUrl("http://user@127.0.0.1:8080/v1").has_value());
+
+  // Valid HTTP URL
+  auto u1 = ParseUrl("http://localhost:8080/api/activate");
+  MT_CHECK(u1.has_value());
+  MT_CHECK(!u1->is_https);
+  MT_CHECK(u1->host == "localhost");
+  MT_CHECK(u1->port == 8080);
+  MT_CHECK(u1->path == "/api/activate");
+
+  // Valid HTTPS URL (default port 443)
+  auto u2 = ParseUrl("https://licensing.vendor.com/v1");
+  MT_CHECK(u2.has_value());
+  MT_CHECK(u2->is_https);
+  MT_CHECK(u2->host == "licensing.vendor.com");
+  MT_CHECK(u2->port == 443);
+  MT_CHECK(u2->path == "/v1");
+
+  // Valid IPv6 URL with port
+  auto u3 = ParseUrl("https://[::1]:9443/v1/renew");
+  MT_CHECK(u3.has_value());
+  MT_CHECK(u3->is_https);
+  MT_CHECK(u3->host == "::1");
+  MT_CHECK(u3->port == 9443);
+  MT_CHECK(u3->path == "/v1/renew");
+
+  // Invalid port specifications
+  MT_CHECK(!ParseUrl("https://example.com:999999/api").has_value());
+  MT_CHECK(!ParseUrl("https://example.com:-1/api").has_value());
+  MT_CHECK(!ParseUrl("https://example.com:abc/api").has_value());
 }
 
 MT_MAIN()

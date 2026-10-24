@@ -52,6 +52,7 @@ void PrintUsage() {
             << "  --provision-vault <id> <pub>   Generate key directly into vault, export public key to <pub>, and exit\n"
             << "  --tls-cert <path>              TLS server certificate PEM file\n"
             << "  --tls-key <path>               TLS server private key PEM file\n"
+            << "  --allow-insecure-file-vault    Permit file-backed secret storage ('file' / guarded file) in production mode\n"
             << "  --production                   Explicitly enforce strict production mode (active by default unless --insecure-dev-only)\n"
             << "  --insecure-dev-only            Development escape hatch: permit plaintext --key files, ephemeral keys, and unencrypted HTTP\n"
             << "  --admin-token <token>          Shared secret token for administrative /events and /analytics endpoints\n"
@@ -103,6 +104,7 @@ int main(int argc, char* argv[]) {
   std::string admin_token_file;
   bool insecure_dev_only = false;
   bool explicit_production = false;
+  bool allow_insecure_file_vault = false;
 
   std::string reg_lic_id;
   std::string reg_prod_id;
@@ -144,6 +146,8 @@ int main(int argc, char* argv[]) {
       tls_key_path = argv[++i];
     } else if (arg == "--insecure-dev-only") {
       insecure_dev_only = true;
+    } else if (arg == "--allow-insecure-file-vault") {
+      allow_insecure_file_vault = true;
     } else if (arg == "--production") {
       explicit_production = true;
     } else if (arg == "--admin-token" && i + 1 < argc) {
@@ -260,6 +264,16 @@ int main(int argc, char* argv[]) {
       }
       ptype = *parsed;
     }
+    if (is_production && ptype != SecretProviderType::kWindowsDpapiVault) {
+      if (!allow_insecure_file_vault) {
+        std::cerr << "Error: Secret vault type '" << ToString(ptype)
+                  << "' is prohibited in production mode. Production servers must use 'dpapi' (Windows DPAPI hardware-backed vault).\n"
+                  << "       To override this restriction for testing/staging, pass --allow-insecure-file-vault.\n";
+        return 1;
+      }
+      std::cout << "[SECURITY WARNING] Running with " << ToString(ptype)
+                << " secret vault in production mode (--allow-insecure-file-vault override active).\n";
+    }
     auto provider = CreateSecretProvider(ptype, vault_dir);
     if (!provider) {
       std::cerr << "Error: Failed to initialize secret provider " << ToString(ptype) << "\n";
@@ -289,6 +303,16 @@ int main(int argc, char* argv[]) {
         return 1;
       }
       ptype = *parsed;
+    }
+    if (is_production && ptype != SecretProviderType::kWindowsDpapiVault) {
+      if (!allow_insecure_file_vault) {
+        std::cerr << "Error: Secret vault type '" << ToString(ptype)
+                  << "' is prohibited in production mode. Production servers must use 'dpapi' (Windows DPAPI hardware-backed vault).\n"
+                  << "       To override this restriction for testing/staging, pass --allow-insecure-file-vault.\n";
+        return 1;
+      }
+      std::cout << "[SECURITY WARNING] Running with " << ToString(ptype)
+                << " secret vault in production mode (--allow-insecure-file-vault override active).\n";
     }
     auto provider = CreateSecretProvider(ptype, vault_dir);
     if (!provider) {
