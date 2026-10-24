@@ -76,7 +76,9 @@ class AbuseAnalyticsEngine {
                                        std::uint64_t current_time = 0,
                                        std::uint64_t window_seconds = 7 * 86400);
 
-  // Evaluates risk for a specific license ID
+  // Evaluates risk for a specific license ID.
+  // If the license ID is not registered in the database, evaluating an unregistered key with active
+  // sessions or telemetry events will flag UNREGISTERED_LICENSE_ACTIVITY and mandate SUSPEND_LICENSE.
   static LicenseRiskReport AnalyzeLicense(const ActivationDatabase& db,
                                           const std::string& license_id,
                                           std::uint64_t current_time = 0,

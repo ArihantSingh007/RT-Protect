@@ -1409,9 +1409,23 @@ MT_TEST(AbuseAnalytics_EdgeCasesAndHardenedScoring) {
   MT_CHECK(found_churn);
 
   // 5. Unknown License handling
+  // Clean inquiry with no events/sessions: LOW severity, ALLOW action
   auto rep_unknown = AbuseAnalyticsEngine::AnalyzeLicense(db, "lic-nonexistent", 1700002000, 86400);
   MT_CHECK(rep_unknown.severity == RiskSeverity::kLow);
   MT_CHECK(rep_unknown.action == RecommendedAction::kAllow);
+
+  // Unregistered license with telemetry events: UNREGISTERED_LICENSE_ACTIVITY, SUSPEND_LICENSE
+  db.RecordEvent(ActivationEvent{1700001080ULL, ActivationEventType::kActivationFailed, "lic-unregistered-active", "DEV-FAKE", "192.168.1.1", "Invalid"});
+  auto rep_unreg_active = AbuseAnalyticsEngine::AnalyzeLicense(db, "lic-unregistered-active", 1700002000, 86400);
+  MT_CHECK(rep_unreg_active.action == RecommendedAction::kSuspendLicense);
+  bool found_unreg_flag = false;
+  for (const auto& f : rep_unreg_active.anomaly_flags) {
+    if (f.flag_code == "UNREGISTERED_LICENSE_ACTIVITY") {
+      found_unreg_flag = true;
+      MT_CHECK(f.score_impact >= 0.30);
+    }
+  }
+  MT_CHECK(found_unreg_flag);
 
   // 6. Future Timestamp Events Ignored
   db.RecordEvent(ActivationEvent{1700009999ULL, ActivationEventType::kReplayBlocked, "lic-burst", "DEV-FUTURE", "192.168.1.1", "Future"});

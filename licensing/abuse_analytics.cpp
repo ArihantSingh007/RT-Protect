@@ -268,18 +268,22 @@ LicenseRiskReport AbuseAnalyticsEngine::AnalyzeLicense(
     report.anomaly_flags.push_back(flag);
   }
 
-  // 7. Activity on Revoked or Refunded License
-  if (lic_opt.has_value() && lic_opt->status != LicenseRecordStatus::kActive) {
-    if (total_events > 0 || report.active_seats > 0) {
-      double impact = (std::min)(0.50, 0.30 + static_cast<double>(report.active_seats) * 0.10);
-      raw_score += impact;
-      LicenseAnomalyFlag flag;
+  // 7. Activity on Unregistered, Revoked, or Refunded License
+  bool is_non_active = (!lic_opt.has_value()) || (lic_opt->status != LicenseRecordStatus::kActive);
+  if (is_non_active && (total_events > 0 || report.active_seats > 0)) {
+    double impact = (std::min)(0.50, 0.30 + static_cast<double>(report.active_seats) * 0.10);
+    raw_score += impact;
+    LicenseAnomalyFlag flag;
+    if (!lic_opt.has_value()) {
+      flag.flag_code = "UNREGISTERED_LICENSE_ACTIVITY";
+      flag.description = "Active seat sessions or activation attempts for unregistered license key";
+    } else {
       flag.flag_code = "REVOKED_LICENSE_ACTIVITY";
       flag.description = "Active seat sessions or activation attempts for " +
                          std::string(ToString(lic_opt->status)) + " license";
-      flag.score_impact = impact;
-      report.anomaly_flags.push_back(flag);
     }
+    flag.score_impact = impact;
+    report.anomaly_flags.push_back(flag);
   }
 
   report.risk_score = (std::min)(1.0, (std::max)(0.0, raw_score));
@@ -299,8 +303,13 @@ LicenseRiskReport AbuseAnalyticsEngine::AnalyzeLicense(
     report.action = RecommendedAction::kAllow;
   }
 
-  // Hard override: A revoked or refunded license can NEVER have an ALLOW or MONITOR recommendation
+  // Hard override: A revoked or refunded license can NEVER have an ALLOW or MONITOR recommendation;
+  // similarly, an unregistered key with active sessions or telemetry events must be suspended.
   if (lic_opt.has_value() && lic_opt->status != LicenseRecordStatus::kActive) {
+    if (report.action == RecommendedAction::kAllow || report.action == RecommendedAction::kMonitor) {
+      report.action = RecommendedAction::kSuspendLicense;
+    }
+  } else if (!lic_opt.has_value() && (total_events > 0 || report.active_seats > 0)) {
     if (report.action == RecommendedAction::kAllow || report.action == RecommendedAction::kMonitor) {
       report.action = RecommendedAction::kSuspendLicense;
     }
