@@ -1440,6 +1440,54 @@ MT_TEST(AbuseAnalytics_EdgeCasesAndHardenedScoring) {
   std::filesystem::remove(db_path, ec);
 }
 
+MT_TEST(Database_ReserveSeatAtomic_StalePurgeRollback) {
+  std::string db_path = MakeTempDbPath();
+  std::error_code ec;
+  std::filesystem::remove(db_path, ec);
+
+  ActivationDatabase db(db_path);
+
+  LicenseRecord lic;
+  lic.license_id = "lic-purge-test";
+  lic.product_id = "com.vendor.product";
+  lic.max_seats = 2;
+  lic.created_at = 1700000000;
+  lic.vm_root.fill(0x88);
+  MT_CHECK(db.RegisterLicense(lic));
+
+  // Seed two activations at timestamp 1000
+  MT_CHECK(db.RecordActivation(ActivationRecord{"lic-purge-test", "DEV-STALE-1", 1000, 1000, 1}));
+  MT_CHECK(db.RecordActivation(ActivationRecord{"lic-purge-test", "DEV-STALE-2", 1000, 1000, 1}));
+  MT_CHECK(db.GetActivations("lic-purge-test").size() == 2);
+
+  // 1. Attempt reservation with capacity 0 (guaranteed capacity rejection in step 3)
+  // Even though stale timeout (500s) has elapsed at current_time=2000, rejection MUST rollback in-memory purge
+  auto res_fail = db.ReserveSeatAtomic("lic-purge-test", "DEV-NEW", 0, 2000, 500);
+  MT_CHECK(!res_fail.success);
+  // Both stale activations must remain intact in memory
+  auto in_mem_acts = db.GetActivations("lic-purge-test");
+  MT_CHECK(in_mem_acts.size() == 2);
+  MT_CHECK(in_mem_acts[0].device_fingerprint == "DEV-STALE-1");
+  MT_CHECK(in_mem_acts[1].device_fingerprint == "DEV-STALE-2");
+
+  // 2. Successful reservation with capacity 2 at current_time=2000
+  // Stale activations are purged and new seat is persisted
+  auto res_ok = db.ReserveSeatAtomic("lic-purge-test", "DEV-NEW", 2, 2000, 500);
+  MT_CHECK(res_ok.success);
+  MT_CHECK(res_ok.is_new_seat);
+  auto post_acts = db.GetActivations("lic-purge-test");
+  MT_CHECK(post_acts.size() == 1);
+  MT_CHECK(post_acts[0].device_fingerprint == "DEV-NEW");
+
+  // 3. Verify on-disk persistence matches in-memory state
+  ActivationDatabase db_disk(db_path);
+  auto disk_acts = db_disk.GetActivations("lic-purge-test");
+  MT_CHECK(disk_acts.size() == 1);
+  MT_CHECK(disk_acts[0].device_fingerprint == "DEV-NEW");
+
+  std::filesystem::remove(db_path, ec);
+}
+
 MT_TEST(HttpServer_Analytics_AdminAuthRequired) {
   std::string db_path = MakeTempDbPath();
   std::error_code ec;

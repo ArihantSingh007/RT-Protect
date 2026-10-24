@@ -411,15 +411,24 @@ std::optional<ActivationRecord> ActivationDatabase::GetActivation(
 bool ActivationDatabase::RecordActivation(const ActivationRecord& record) {
   std::lock_guard<std::mutex> lock(mutex_);
   auto& list = activations_[record.license_id];
+  auto original_list = list;
   for (auto& existing : list) {
     if (existing.device_fingerprint == record.device_fingerprint) {
       existing.last_seen = record.last_seen;
       existing.sequence_number = record.sequence_number;
-      return SaveLocked();
+      if (!SaveLocked()) {
+        list = std::move(original_list);
+        return false;
+      }
+      return true;
     }
   }
   list.push_back(record);
-  return SaveLocked();
+  if (!SaveLocked()) {
+    list = std::move(original_list);
+    return false;
+  }
+  return true;
 }
 
 bool ActivationDatabase::RemoveActivation(const std::string& license_id, const std::string& device_fingerprint) {
@@ -427,10 +436,15 @@ bool ActivationDatabase::RemoveActivation(const std::string& license_id, const s
   auto it = activations_.find(license_id);
   if (it == activations_.end()) return false;
   auto& list = it->second;
+  auto original_list = list;
   for (auto s_it = list.begin(); s_it != list.end(); ++s_it) {
     if (s_it->device_fingerprint == device_fingerprint) {
       list.erase(s_it);
-      return SaveLocked();
+      if (!SaveLocked()) {
+        list = std::move(original_list);
+        return false;
+      }
+      return true;
     }
   }
   return false;
@@ -450,6 +464,7 @@ SeatReservationResult ActivationDatabase::ReserveSeatAtomic(
   }
 
   auto& acts = activations_[license_id];
+  std::vector<ActivationRecord> original_acts = acts;
 
   // 1. Purge stale activations exceeding lease timeout (stale-seat recovery)
   if (stale_timeout_seconds > 0) {
@@ -464,14 +479,12 @@ SeatReservationResult ActivationDatabase::ReserveSeatAtomic(
   // 2. Existing activation for this device: re-activate/bump sequence
   for (auto& a : acts) {
     if (a.device_fingerprint == device_fingerprint) {
-      auto old_last_seen = a.last_seen;
       res.previous_sequence_number = a.sequence_number;
-      res.previous_last_seen = old_last_seen;
+      res.previous_last_seen = a.last_seen;
       a.last_seen = current_time;
       a.sequence_number++;
       if (!SaveLocked()) {
-        a.last_seen = old_last_seen;
-        a.sequence_number = res.previous_sequence_number;
+        acts = std::move(original_acts);
         res.success = false;
         res.error = "Database write-through persistence failed";
         return res;
@@ -486,8 +499,9 @@ SeatReservationResult ActivationDatabase::ReserveSeatAtomic(
 
   // 3. New activation: enforce capacity limit
   if (acts.size() >= max_seats) {
+    acts = std::move(original_acts);
     res.success = false;
-    res.error = "Concurrent seat limit reached (" + std::to_string(acts.size()) + " of " +
+    res.error = "Concurrent seat limit reached (" + std::to_string(original_acts.size()) + " of " +
                 std::to_string(max_seats) + " seats active)";
     return res;
   }
@@ -502,7 +516,7 @@ SeatReservationResult ActivationDatabase::ReserveSeatAtomic(
   acts.push_back(new_rec);
 
   if (!SaveLocked()) {
-    acts.pop_back();
+    acts = std::move(original_acts);
     res.success = false;
     res.error = "Database write-through persistence failed";
     return res;
@@ -523,12 +537,17 @@ bool ActivationDatabase::RollbackSeatAtomic(
   auto it = activations_.find(license_id);
   if (it == activations_.end()) return false;
   auto& acts = it->second;
+  auto original_acts = acts;
 
   if (reservation.is_new_seat) {
     for (auto s_it = acts.begin(); s_it != acts.end(); ++s_it) {
       if (s_it->device_fingerprint == device_fingerprint) {
         acts.erase(s_it);
-        return SaveLocked();
+        if (!SaveLocked()) {
+          acts = std::move(original_acts);
+          return false;
+        }
+        return true;
       }
     }
   } else {
@@ -536,7 +555,11 @@ bool ActivationDatabase::RollbackSeatAtomic(
       if (a.device_fingerprint == device_fingerprint) {
         a.sequence_number = reservation.previous_sequence_number;
         a.last_seen = reservation.previous_last_seen;
-        return SaveLocked();
+        if (!SaveLocked()) {
+          acts = std::move(original_acts);
+          return false;
+        }
+        return true;
       }
     }
   }
