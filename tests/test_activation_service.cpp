@@ -30,6 +30,7 @@
 #include "licensing/hardware_id.h"
 #include "tests/micro_test.h"
 #include "tooling/file_io.h"
+#include "tooling/simple_json.h"
 
 using namespace rtprotect::licensing;
 using namespace rtprotect::integrity;
@@ -588,13 +589,10 @@ MT_TEST(Database_FailClosed_RejectsCorruptedStatus) {
 
   ActivationDatabase db(db_path);
 
-  // Malformed status must NOT be loaded or defaulted to kActive
+  // Atomic database loader must reject unknown status, fail open, and refuse to load partial state
+  MT_CHECK(!db.IsOpen());
   MT_CHECK(!db.GetLicense("lic-corrupted").has_value());
-
-  // Legitimate active status must be loaded correctly
-  auto legit = db.GetLicense("lic-legit");
-  MT_CHECK(legit.has_value());
-  MT_CHECK(legit->status == LicenseRecordStatus::kActive);
+  MT_CHECK(!db.GetLicense("lic-legit").has_value());
 
   std::filesystem::remove(db_path, ec);
 }
@@ -1742,6 +1740,112 @@ MT_TEST(Database_CommitRenewalAndDeactivationAtomic) {
   MT_CHECK(!db.GetActivation("lic-atomic-test", "DEV-ATOMIC").has_value());
 
   std::filesystem::remove(db_path, ec);
+}
+
+MT_TEST(Database_AadBinding_CrossRecordSubstitutionRejection) {
+  std::string db_path = MakeTempDbPath();
+  std::error_code ec;
+  std::filesystem::remove(db_path, ec);
+
+  std::array<std::uint8_t, 32> expected_root{};
+  expected_root.fill(0x55);
+
+  {
+    ActivationDatabase db(db_path);
+    LicenseRecord lic;
+    lic.license_id = "lic-victim";
+    lic.product_id = "com.vendor.productA";
+    lic.max_seats = 1;
+    lic.created_at = 1700000000;
+    lic.vm_root = expected_root;
+    MT_CHECK(db.RegisterLicense(lic));
+    MT_CHECK(db.Save());
+  }
+
+  // Read content on disk
+  auto raw = rtprotect::tooling::ReadFile(db_path);
+  MT_CHECK(raw.has_value());
+  std::string content(reinterpret_cast<const char*>(raw->data()), raw->size());
+
+  // Adversary copies ciphertext to an attacker-controlled license ID ("lic-attacker")
+  auto pos = content.find("lic-victim");
+  MT_CHECK(pos != std::string::npos);
+  std::string tampered = content;
+  tampered.replace(pos, 10, "lic-attack"); // replace license ID but keep ciphertext
+
+  MT_CHECK(rtprotect::tooling::WriteTextFile(db_path, tampered));
+
+  // Loading database must fail closed: AAD mismatch on license ID
+  ActivationDatabase db_tampered(db_path);
+  MT_CHECK(!db_tampered.IsOpen());
+  MT_CHECK(!db_tampered.GetLicense("lic-attack").has_value());
+
+  std::filesystem::remove(db_path, ec);
+}
+
+MT_TEST(Database_AtomicOpen_CorruptedRow_RefusesOverwrite) {
+  std::string db_path = MakeTempDbPath();
+  std::error_code ec;
+  std::filesystem::remove(db_path, ec);
+
+  {
+    ActivationDatabase db(db_path);
+    LicenseRecord lic;
+    lic.license_id = "lic-valid-row";
+    lic.product_id = "com.vendor.valid";
+    lic.max_seats = 2;
+    lic.created_at = 1700000000;
+    lic.vm_root.fill(0xAA);
+    MT_CHECK(db.RegisterLicense(lic));
+    MT_CHECK(db.Save());
+  }
+
+  // Corrupt database by appending malformed data
+  auto raw = rtprotect::tooling::ReadFile(db_path);
+  MT_CHECK(raw.has_value());
+  std::string corrupted(reinterpret_cast<const char*>(raw->data()), raw->size());
+  corrupted += "\n[licenses]\nmalformed|corrupted|line\n";
+  MT_CHECK(rtprotect::tooling::WriteTextFile(db_path, corrupted));
+
+  // Open must detect corruption and fail closed
+  ActivationDatabase db_corrupt(db_path);
+  MT_CHECK(!db_corrupt.IsOpen());
+  MT_CHECK(!db_corrupt.GetLastOpenError().empty());
+
+  // Calling Save on a corrupt database must REFUSE to overwrite disk
+  MT_CHECK(!db_corrupt.Save());
+
+  // File on disk must remain unchanged (intact)
+  auto after = rtprotect::tooling::ReadFile(db_path);
+  MT_CHECK(after.has_value());
+  std::string after_str(reinterpret_cast<const char*>(after->data()), after->size());
+  MT_CHECK(after_str == corrupted);
+
+  std::filesystem::remove(db_path, ec);
+}
+
+MT_TEST(JsonValue_StrictInteger_And_RangeSafety) {
+  // Strict 64-bit integer parsing
+  auto j1 = rtprotect::tooling::JsonValue::Parse("{\"timestamp\": 1718000000, \"large_seq\": 9223372036854775800}");
+  MT_CHECK(j1.has_value());
+  MT_CHECK((*j1)["timestamp"].is_integer());
+  MT_CHECK((*j1)["timestamp"].as_int() == 1718000000);
+  MT_CHECK((*j1)["large_seq"].is_integer());
+  MT_CHECK((*j1)["large_seq"].as_int64() == 9223372036854775800LL);
+  MT_CHECK((*j1)["large_seq"].as_uint64().has_value());
+
+  // Floating point
+  auto j2 = rtprotect::tooling::JsonValue::Parse("{\"ratio\": 3.14159}");
+  MT_CHECK(j2.has_value());
+  MT_CHECK((*j2)["ratio"].is_number());
+  MT_CHECK(!(*j2)["ratio"].is_integer());
+
+  // Negative integer
+  auto j3 = rtprotect::tooling::JsonValue::Parse("{\"delta\": -42}");
+  MT_CHECK(j3.has_value());
+  MT_CHECK((*j3)["delta"].is_integer());
+  MT_CHECK((*j3)["delta"].as_int() == -42);
+  MT_CHECK(!(*j3)["delta"].as_uint64().has_value()); // negative int cannot be uint64
 }
 
 MT_MAIN()

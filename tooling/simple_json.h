@@ -10,7 +10,10 @@
 
 #include <cctype>
 #include <charconv>
+#include <cmath>
 #include <cstddef>
+#include <cstdint>
+#include <limits>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -34,7 +37,15 @@ class JsonValue {
 
   JsonValue() : type_(JsonType::kNull) {}
   explicit JsonValue(bool b) : type_(JsonType::kBool), bool_val_(b) {}
-  explicit JsonValue(double n) : type_(JsonType::kNumber), num_val_(n) {}
+  explicit JsonValue(std::int64_t i) : type_(JsonType::kNumber), is_integer_(true), int_val_(i), num_val_(static_cast<double>(i)) {}
+  explicit JsonValue(int i) : type_(JsonType::kNumber), is_integer_(true), int_val_(i), num_val_(static_cast<double>(i)) {}
+  explicit JsonValue(double n) : type_(JsonType::kNumber), is_integer_(false), num_val_(n) {
+    if (std::isfinite(n) && n >= -9223372036854775808.0 && n <= 9223372036854775807.0 &&
+        std::floor(n) == n) {
+      is_integer_ = true;
+      int_val_ = static_cast<std::int64_t>(n);
+    }
+  }
   explicit JsonValue(std::string s) : type_(JsonType::kString), str_val_(std::move(s)) {}
   explicit JsonValue(std::vector<JsonValue> a) : type_(JsonType::kArray), arr_val_(std::move(a)) {}
   explicit JsonValue(std::unordered_map<std::string, JsonValue> o) : type_(JsonType::kObject), obj_val_(std::move(o)) {}
@@ -43,6 +54,7 @@ class JsonValue {
   bool is_null() const { return type_ == JsonType::kNull; }
   bool is_bool() const { return type_ == JsonType::kBool; }
   bool is_number() const { return type_ == JsonType::kNumber; }
+  bool is_integer() const { return is_number() && is_integer_; }
   bool is_string() const { return type_ == JsonType::kString; }
   bool is_array() const { return type_ == JsonType::kArray; }
   bool is_object() const { return type_ == JsonType::kObject; }
@@ -54,7 +66,30 @@ class JsonValue {
 
   bool as_bool() const { return is_bool() && bool_val_; }
   double as_number() const { return is_number() ? num_val_ : 0.0; }
-  long long as_int() const { return is_number() ? static_cast<long long>(num_val_) : 0; }
+  long long as_int() const {
+    if (!is_number()) return 0;
+    if (is_integer_) return int_val_;
+    if (!std::isfinite(num_val_)) return 0;
+    if (num_val_ > 9223372036854775807.0) return 9223372036854775807LL;
+    if (num_val_ < -9223372036854775808.0) return (-9223372036854775807LL - 1);
+    return static_cast<long long>(num_val_);
+  }
+  std::optional<std::int64_t> as_int64() const {
+    if (!is_number()) return std::nullopt;
+    if (is_integer_) return int_val_;
+    if (!std::isfinite(num_val_)) return std::nullopt;
+    if (num_val_ < -9223372036854775808.0 || num_val_ > 9223372036854775807.0) return std::nullopt;
+    return static_cast<std::int64_t>(num_val_);
+  }
+  std::optional<std::uint64_t> as_uint64() const {
+    if (!is_number()) return std::nullopt;
+    if (is_integer_) {
+      if (int_val_ < 0) return std::nullopt;
+      return static_cast<std::uint64_t>(int_val_);
+    }
+    if (!std::isfinite(num_val_) || num_val_ < 0.0 || num_val_ > 18446744073709551615.0) return std::nullopt;
+    return static_cast<std::uint64_t>(num_val_);
+  }
 
   const std::vector<JsonValue>& as_array() const {
     static const std::vector<JsonValue> s_empty;
@@ -210,9 +245,20 @@ class JsonValue {
         while (pos < sv.size() && std::isdigit(static_cast<unsigned char>(sv[pos]))) ++pos;
       }
       std::string num_str(sv.substr(start, pos - start));
+      bool is_float = (num_str.find('.') != std::string::npos ||
+                       num_str.find('e') != std::string::npos ||
+                       num_str.find('E') != std::string::npos);
+      if (!is_float) {
+        char* end_ptr = nullptr;
+        errno = 0;
+        long long iv = std::strtoll(num_str.c_str(), &end_ptr, 10);
+        if (errno == 0 && end_ptr == num_str.c_str() + num_str.size()) {
+          return JsonValue(static_cast<std::int64_t>(iv));
+        }
+      }
       char* end_ptr = nullptr;
       double val = std::strtod(num_str.c_str(), &end_ptr);
-      if (end_ptr != num_str.c_str() + num_str.size()) {
+      if (end_ptr != num_str.c_str() + num_str.size() || !std::isfinite(val)) {
         return std::nullopt;
       }
       return JsonValue(val);
@@ -291,6 +337,8 @@ class JsonValue {
 
   JsonType type_;
   bool bool_val_ = false;
+  bool is_integer_ = false;
+  std::int64_t int_val_ = 0;
   double num_val_ = 0.0;
   std::string str_val_;
   std::vector<JsonValue> arr_val_;

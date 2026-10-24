@@ -50,11 +50,22 @@ std::string BytesToHex(const std::uint8_t* data, std::size_t len) {
 bool HexToBytes(const std::string& hex, std::uint8_t* out, std::size_t expected_len) {
   if (hex.size() != expected_len * 2) return false;
   for (std::size_t i = 0; i < expected_len; ++i) {
-    char h[3] = { hex[i * 2], hex[i * 2 + 1], '\0' };
-    char* end = nullptr;
-    long v = std::strtol(h, &end, 16);
-    if (end != h + 2 || v < 0 || v > 255) return false;
-    out[i] = static_cast<std::uint8_t>(v);
+    char c1 = hex[i * 2];
+    char c2 = hex[i * 2 + 1];
+    if (!std::isxdigit(static_cast<unsigned char>(c1)) ||
+        !std::isxdigit(static_cast<unsigned char>(c2))) {
+      return false;
+    }
+    auto hex_val = [](char c) -> int {
+      if (c >= '0' && c <= '9') return c - '0';
+      if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+      if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+      return -1;
+    };
+    int v1 = hex_val(c1);
+    int v2 = hex_val(c2);
+    if (v1 < 0 || v2 < 0) return false;
+    out[i] = static_cast<std::uint8_t>((v1 << 4) | v2);
   }
   return true;
 }
@@ -149,27 +160,74 @@ ActivationDatabase::ActivationDatabase(const std::string& db_path, const crypto:
   Open(db_path);
 }
 
+bool ActivationDatabase::IsOpen() const {
+  std::lock_guard<std::mutex> lock(mutex_);
+  return is_open_valid_;
+}
+
+std::string ActivationDatabase::GetLastOpenError() const {
+  std::lock_guard<std::mutex> lock(mutex_);
+  return last_open_error_;
+}
+
+void ActivationDatabase::SetAllowLegacyPlaintext(bool allow) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  allow_legacy_plaintext_ = allow;
+}
+
+bool ActivationDatabase::MigrateToEnvelopeEncryption() {
+  std::lock_guard<std::mutex> lock(mutex_);
+  if (!is_open_valid_) return false;
+  envelope_encryption_enabled_ = true;
+  return SaveLocked();
+}
+
 bool ActivationDatabase::Open(const std::string& db_path) {
   std::lock_guard<std::mutex> lock(mutex_);
   db_path_ = db_path;
-  licenses_.clear();
-  activations_.clear();
-  used_nonces_.clear();
-  events_.clear();
+  is_open_valid_ = false;
+  last_open_error_.clear();
 
-  if (db_path_.empty() || !std::filesystem::exists(db_path_)) {
+  if (db_path_.empty()) {
+    is_open_valid_ = true;
+    return true;
+  }
+  if (!std::filesystem::exists(db_path_)) {
+    licenses_.clear();
+    activations_.clear();
+    used_nonces_.clear();
+    events_.clear();
+    is_open_valid_ = true;
     return true; // Fresh database
   }
 
   auto data = tooling::ReadFile(db_path_);
-  if (!data.has_value() || data->empty()) return false;
+  if (!data.has_value()) {
+    last_open_error_ = "Failed to read database file: " + db_path_;
+    return false;
+  }
+  if (data->empty()) {
+    licenses_.clear();
+    activations_.clear();
+    used_nonces_.clear();
+    events_.clear();
+    is_open_valid_ = true;
+    return true;
+  }
+
+  std::unordered_map<std::string, LicenseRecord> staged_licenses;
+  std::unordered_map<std::string, std::vector<ActivationRecord>> staged_activations;
+  std::unordered_map<std::string, std::uint64_t> staged_used_nonces;
+  std::vector<ActivationEvent> staged_events;
 
   std::string content(reinterpret_cast<const char*>(data->data()), data->size());
   std::istringstream stream(content);
   std::string line;
   std::string section;
+  std::size_t line_no = 0;
 
   while (std::getline(stream, line)) {
+    ++line_no;
     while (!line.empty() && (line.back() == '\r' || line.back() == '\n' || line.back() == ' ')) {
       line.pop_back();
     }
@@ -196,21 +254,27 @@ bool ActivationDatabase::Open(const std::string& db_path) {
         rec.product_id = UnescapeField(prod_id);
         auto st = ParseLicenseRecordStatus(status_str);
         if (!st.has_value()) {
-          // Fail closed: ignore corrupted or unknown status instead of defaulting to kActive
-          continue;
+          last_open_error_ = "Line " + std::to_string(line_no) + ": unrecognized license status '" + status_str + "'";
+          return false;
         }
         rec.status = *st;
         if (!ParseU32Strict(seats_str, &rec.max_seats) || rec.max_seats == 0) {
-          continue; // Malformed seat count
+          last_open_error_ = "Line " + std::to_string(line_no) + ": invalid max_seats '" + seats_str + "'";
+          return false;
         }
-        if (!DecryptVmRootLocked(root_hex, rec.vm_root)) {
-          continue; // Corrupted, malformed, or unauthenticated vm_root
+        if (!DecryptVmRootLocked(rec.license_id, rec.product_id, root_hex, rec.vm_root)) {
+          last_open_error_ = "Line " + std::to_string(line_no) + ": failed to decrypt or authenticate vm_root for license " + rec.license_id;
+          return false;
         }
         if (!ParseU64Strict(created_str, &rec.created_at)) {
-          continue; // Malformed created timestamp
+          last_open_error_ = "Line " + std::to_string(line_no) + ": invalid created timestamp '" + created_str + "'";
+          return false;
         }
         rec.activation_credential_hash = UnescapeField(cred_hash);
-        licenses_[rec.license_id] = rec;
+        staged_licenses[rec.license_id] = rec;
+      } else {
+        last_open_error_ = "Line " + std::to_string(line_no) + ": malformed license row";
+        return false;
       }
     } else if (section == "[activations]") {
       // Format: license_id|device_fingerprint|first_seen|last_seen|sequence_number
@@ -226,18 +290,27 @@ bool ActivationDatabase::Open(const std::string& db_path) {
         if (!ParseU64Strict(first_str, &rec.first_seen) ||
             !ParseU64Strict(last_str, &rec.last_seen) ||
             !ParseU64Strict(seq_str, &rec.sequence_number)) {
-          continue; // Malformed numeric activation fields
+          last_open_error_ = "Line " + std::to_string(line_no) + ": malformed numeric activation fields";
+          return false;
         }
-        activations_[rec.license_id].push_back(rec);
+        staged_activations[rec.license_id].push_back(rec);
+      } else {
+        last_open_error_ = "Line " + std::to_string(line_no) + ": malformed activation row";
+        return false;
       }
     } else if (section == "[used_nonces]") {
       // Format: nonce_hex|expires_at
       std::string nonce_hex, exp_str;
       if (std::getline(row, nonce_hex, '|') && std::getline(row, exp_str, '|')) {
         std::uint64_t exp = 0;
-        if (ParseU64Strict(exp_str, &exp)) {
-          used_nonces_[nonce_hex] = exp;
+        if (!ParseU64Strict(exp_str, &exp)) {
+          last_open_error_ = "Line " + std::to_string(line_no) + ": malformed nonce expiry";
+          return false;
         }
+        staged_used_nonces[nonce_hex] = exp;
+      } else {
+        last_open_error_ = "Line " + std::to_string(line_no) + ": malformed nonce row";
+        return false;
       }
     } else if (section == "[events]") {
       // Format: timestamp|event_type|license_id|device_fingerprint|ip_address|details
@@ -250,20 +323,33 @@ bool ActivationDatabase::Open(const std::string& db_path) {
           std::getline(row, details)) {
         auto et = ParseActivationEventType(type_str);
         std::uint64_t ts = 0;
-        if (et.has_value() && ParseU64Strict(ts_str, &ts)) {
-          ActivationEvent evt;
-          evt.timestamp = ts;
-          evt.type = *et;
-          evt.license_id = UnescapeField(lic_id);
-          evt.device_fingerprint = UnescapeField(dev_fp);
-          evt.ip_address = UnescapeField(ip_str);
-          evt.details = UnescapeField(details);
-          events_.push_back(evt);
+        if (!et.has_value() || !ParseU64Strict(ts_str, &ts)) {
+          last_open_error_ = "Line " + std::to_string(line_no) + ": malformed event row";
+          return false;
         }
+        ActivationEvent evt;
+        evt.timestamp = ts;
+        evt.type = *et;
+        evt.license_id = UnescapeField(lic_id);
+        evt.device_fingerprint = UnescapeField(dev_fp);
+        evt.ip_address = UnescapeField(ip_str);
+        evt.details = UnescapeField(details);
+        staged_events.push_back(evt);
+      } else {
+        last_open_error_ = "Line " + std::to_string(line_no) + ": malformed event format";
+        return false;
       }
+    } else {
+      last_open_error_ = "Line " + std::to_string(line_no) + ": unknown section or syntax '" + line + "'";
+      return false;
     }
   }
 
+  licenses_ = std::move(staged_licenses);
+  activations_ = std::move(staged_activations);
+  used_nonces_ = std::move(staged_used_nonces);
+  events_ = std::move(staged_events);
+  is_open_valid_ = true;
   return true;
 }
 
@@ -290,29 +376,39 @@ std::optional<crypto::Aes256Key> ActivationDatabase::GetEffectiveEncryptionKeyLo
   if (derived.has_value()) {
     return crypto::Aes256Key::FromBytes(derived->data(), derived->size());
   }
-  std::array<std::uint8_t, 32> fallback_raw{};
-  for (std::size_t i = 0; i < 32; ++i) fallback_raw[i] = static_cast<std::uint8_t>(0xA5 ^ i);
-  return crypto::Aes256Key::FromBytes(fallback_raw.data(), fallback_raw.size());
+  return std::nullopt;
 }
 
-std::string ActivationDatabase::EncryptVmRootLocked(const std::array<std::uint8_t, 32>& root) const {
+std::optional<std::string> ActivationDatabase::EncryptVmRootLocked(
+    const std::string& license_id,
+    const std::string& product_id,
+    const std::array<std::uint8_t, 32>& root) const {
   if (!envelope_encryption_enabled_) {
+    if (!allow_legacy_plaintext_) {
+      return std::nullopt; // Strictly fail closed: plaintext disallowed
+    }
     return BytesToHex(root.data(), root.size());
   }
   auto key = GetEffectiveEncryptionKeyLocked();
   if (!key.has_value()) {
-    return BytesToHex(root.data(), root.size());
+    return std::nullopt; // Fail closed: key unavailable
   }
-  auto enc = crypto::Encrypt(*key, root.data(), root.size());
+  std::string aad = "rtprotect:db:v1:" + license_id + ":" + product_id;
+  auto enc = crypto::Encrypt(*key, root.data(), root.size(),
+                             reinterpret_cast<const std::uint8_t*>(aad.data()), aad.size());
   if (!enc.has_value()) {
-    return BytesToHex(root.data(), root.size());
+    return std::nullopt; // Fail closed: encryption failure
   }
   return "enc:" + BytesToHex(enc->nonce.bytes, crypto::kGcmNonceLen) + ":" +
          BytesToHex(enc->tag, crypto::kGcmTagLen) + ":" +
          BytesToHex(enc->ciphertext.data(), enc->ciphertext.size());
 }
 
-bool ActivationDatabase::DecryptVmRootLocked(const std::string& field, std::array<std::uint8_t, 32>& out_root) const {
+bool ActivationDatabase::DecryptVmRootLocked(
+    const std::string& license_id,
+    const std::string& product_id,
+    const std::string& field,
+    std::array<std::uint8_t, 32>& out_root) const {
   if (field.rfind("enc:", 0) == 0) {
     auto colon1 = field.find(':', 4);
     if (colon1 == std::string::npos) return false;
@@ -326,33 +422,44 @@ bool ActivationDatabase::DecryptVmRootLocked(const std::string& field, std::arra
     crypto::EncryptedMessage msg;
     if (!HexToBytes(iv_hex, msg.nonce.bytes, crypto::kGcmNonceLen)) return false;
     if (!HexToBytes(tag_hex, msg.tag, crypto::kGcmTagLen)) return false;
+    if (ct_hex.size() % 2 != 0) return false;
     msg.ciphertext.resize(ct_hex.size() / 2);
     if (!HexToBytes(ct_hex, msg.ciphertext.data(), msg.ciphertext.size())) return false;
 
     auto key = GetEffectiveEncryptionKeyLocked();
     if (!key.has_value()) return false;
+    std::string aad = "rtprotect:db:v1:" + license_id + ":" + product_id;
     crypto::AeadError err = crypto::AeadError::kNone;
-    auto plain = crypto::Decrypt(*key, msg, nullptr, 0, &err);
+    auto plain = crypto::Decrypt(*key, msg,
+                                 reinterpret_cast<const std::uint8_t*>(aad.data()), aad.size(),
+                                 &err);
     if (!plain.has_value() || plain->size() != 32) return false;
 
     std::memcpy(out_root.data(), plain->data(), 32);
     return true;
   }
+  if (!allow_legacy_plaintext_) {
+    return false; // Reject legacy plaintext hex unless explicitly enabled
+  }
   return HexToBytes(field, out_root.data(), out_root.size());
 }
 
-std::string ActivationDatabase::SerializeLocked() const {
+std::optional<std::string> ActivationDatabase::SerializeLocked() const {
   std::ostringstream ss;
   ss << "# RTProtect Activation Authority Database\n\n";
 
   ss << "[licenses]\n";
   for (const auto& pair : licenses_) {
     const auto& l = pair.second;
+    auto enc_root = EncryptVmRootLocked(l.license_id, l.product_id, l.vm_root);
+    if (!enc_root.has_value()) {
+      return std::nullopt; // Fail closed if encryption fails
+    }
     ss << EscapeField(l.license_id) << "|"
        << EscapeField(l.product_id) << "|"
        << ToString(l.status) << "|"
        << l.max_seats << "|"
-       << EncryptVmRootLocked(l.vm_root) << "|"
+       << *enc_root << "|"
        << l.created_at;
     if (!l.activation_credential_hash.empty()) {
       ss << "|" << EscapeField(l.activation_credential_hash);
@@ -390,17 +497,51 @@ std::string ActivationDatabase::SerializeLocked() const {
 }
 
 bool ActivationDatabase::SaveLocked() const {
+  if (!is_open_valid_) return false;
   if (db_path_.empty()) return true;
-  std::string content = SerializeLocked();
-  return tooling::WriteFile(db_path_, reinterpret_cast<const std::uint8_t*>(content.data()), content.size());
+  auto content = SerializeLocked();
+  if (!content.has_value()) return false;
+
+  std::string tmp_path = db_path_ + ".tmp";
+  if (!tooling::WriteFile(tmp_path, reinterpret_cast<const std::uint8_t*>(content->data()), content->size())) {
+    return false;
+  }
+  std::error_code ec;
+  std::filesystem::rename(tmp_path, db_path_, ec);
+  if (ec) {
+    std::filesystem::remove(db_path_, ec);
+    std::filesystem::rename(tmp_path, db_path_, ec);
+    if (ec) {
+      std::filesystem::remove(tmp_path, ec);
+      return false;
+    }
+  }
+  return true;
 }
 
 bool ActivationDatabase::Save(const std::string& db_path) {
   std::lock_guard<std::mutex> lock(mutex_);
+  if (!is_open_valid_) return false;
   const std::string& target = db_path.empty() ? db_path_ : db_path;
   if (target.empty()) return true;
-  std::string content = SerializeLocked();
-  return tooling::WriteFile(target, reinterpret_cast<const std::uint8_t*>(content.data()), content.size());
+  auto content = SerializeLocked();
+  if (!content.has_value()) return false;
+
+  std::string tmp_path = target + ".tmp";
+  if (!tooling::WriteFile(tmp_path, reinterpret_cast<const std::uint8_t*>(content->data()), content->size())) {
+    return false;
+  }
+  std::error_code ec;
+  std::filesystem::rename(tmp_path, target, ec);
+  if (ec) {
+    std::filesystem::remove(target, ec);
+    std::filesystem::rename(tmp_path, target, ec);
+    if (ec) {
+      std::filesystem::remove(tmp_path, ec);
+      return false;
+    }
+  }
+  return true;
 }
 
 bool ActivationDatabase::RegisterLicense(const LicenseRecord& record, bool allow_overwrite) {
@@ -800,6 +941,10 @@ bool ActivationDatabase::RecordEvent(const ActivationEvent& event) {
   // Cap max in-memory events to prevent unbounded growth
   if (events_.size() > 5000) {
     events_.erase(events_.begin(), events_.begin() + 1000);
+  }
+  // Finding 7.3: Avoid full synchronous database rewrites on ephemeral rate-limiting events
+  if (event.type == ActivationEventType::kRateLimited) {
+    return true;
   }
   return SaveLocked();
 }

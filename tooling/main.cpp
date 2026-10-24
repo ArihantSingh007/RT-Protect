@@ -501,17 +501,27 @@ int CmdIntegrate(int argc, char** argv) {
     } else if (arg == "--activation-pubkey" && i + 1 < argc) {
       options.activation_pubkey_path = argv[++i];
     } else if (arg == "--release-sequence" && i + 1 < argc) {
+      std::string seq_str = argv[++i];
       char* end = nullptr;
-      options.minimum_release_sequence = std::strtoull(argv[++i], &end, 10);
+      unsigned long long seq = std::strtoull(seq_str.c_str(), &end, 10);
+      if (end != seq_str.c_str() + seq_str.size() || seq == 0) {
+        std::fprintf(stderr, "error: Invalid --release-sequence (must be positive integer >= 1): %s\n", seq_str.c_str());
+        return 1;
+      }
+      options.minimum_release_sequence = seq;
     } else if (arg == "--sign-manifest-key" && i + 1 < argc) {
       options.sign_manifest_key_path = argv[++i];
       if (!options.use_dev_keys) {
-        std::fprintf(stderr, "[SECURITY WARNING] Passing vendor private signing keys to 'integrate' exposes them to the build environment. Recommended: integrate using public keys and pre-issued license, then run 'rtprotect-tool sign-release' on an isolated signing server.\n");
+        std::fprintf(stderr, "error: Passing vendor private signing keys (--sign-manifest-key) to customer build integration is prohibited in production mode.\n"
+                             "       Integrate using public verification keys (--manifest-pubkey, --license-pubkey, --activation-pubkey), and sign release artifacts with 'rtprotect-tool sign-release' in an isolated signing environment.\n");
+        return 1;
       }
     } else if (arg == "--sign-license-key" && i + 1 < argc) {
       options.sign_license_key_path = argv[++i];
       if (!options.use_dev_keys) {
-        std::fprintf(stderr, "[SECURITY WARNING] Passing vendor private signing keys to 'integrate' exposes them to the build environment. Recommended: integrate using public keys and pre-issued license, then run 'rtprotect-tool sign-release' on an isolated signing server.\n");
+        std::fprintf(stderr, "error: Passing vendor private signing keys (--sign-license-key) to customer build integration is prohibited in production mode.\n"
+                             "       Integrate using public verification keys (--manifest-pubkey, --license-pubkey, --activation-pubkey), and sign release artifacts with 'rtprotect-tool sign-release' in an isolated signing environment.\n");
+        return 1;
       }
     } else if (arg == "--license-file" && i + 1 < argc) {
       options.license_file_path = argv[++i];

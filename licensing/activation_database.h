@@ -96,6 +96,12 @@ class ActivationDatabase {
   // Envelope encryption for sensitive fields (vm_root)
   void SetEncryptionKey(const crypto::Aes256Key& key);
   void EnableEnvelopeEncryption(bool enable = true);
+  void SetAllowLegacyPlaintext(bool allow);
+  bool MigrateToEnvelopeEncryption();
+
+  // State validity and diagnostics
+  bool IsOpen() const;
+  std::string GetLastOpenError() const;
 
   // Activation & seat tracking
   std::size_t GetActiveSeatCount(const std::string& license_id) const;
@@ -155,10 +161,10 @@ class ActivationDatabase {
 
  private:
   bool SaveLocked() const;
-  std::string SerializeLocked() const;
+  std::optional<std::string> SerializeLocked() const;
   std::optional<crypto::Aes256Key> GetEffectiveEncryptionKeyLocked() const;
-  std::string EncryptVmRootLocked(const std::array<std::uint8_t, 32>& root) const;
-  bool DecryptVmRootLocked(const std::string& field, std::array<std::uint8_t, 32>& out_root) const;
+  std::optional<std::string> EncryptVmRootLocked(const std::string& license_id, const std::string& product_id, const std::array<std::uint8_t, 32>& root) const;
+  bool DecryptVmRootLocked(const std::string& license_id, const std::string& product_id, const std::string& field, std::array<std::uint8_t, 32>& out_root) const;
 
   mutable std::mutex mutex_;
   std::string db_path_;
@@ -168,6 +174,9 @@ class ActivationDatabase {
   std::vector<ActivationEvent> events_;                                        // audit event log
   std::optional<std::array<std::uint8_t, 32>> encryption_key_raw_;
   bool envelope_encryption_enabled_ = true;
+  bool allow_legacy_plaintext_ = false;
+  bool is_open_valid_ = true;
+  std::string last_open_error_;
 };
 
 }  // namespace rtprotect::licensing

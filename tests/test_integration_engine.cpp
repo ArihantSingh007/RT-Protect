@@ -473,8 +473,22 @@ void TestSignReleaseKeyMismatchRejected() {
   auto kp_wrong = integrity::GenerateEd25519KeyPair();
   assert(kp_correct.has_value() && kp_wrong.has_value());
 
-  // Set up project with kp_correct public key
+  // Set up project with kp_correct public key and valid client license
   WriteFile((test_dir / "release.pub").string(), kp_correct->public_key.data(), kp_correct->public_key.size());
+
+  auto lic_kp = integrity::GenerateEd25519KeyPair();
+  assert(lic_kp.has_value());
+  WriteFile((test_dir / "license.pub").string(), lic_kp->public_key.data(), lic_kp->public_key.size());
+  licensing::License lic;
+  lic.license_id = "lic-sign-1";
+  lic.product_id = "com.client.protected";
+  lic.edition = "Production";
+  lic.customer_id = "tester";
+  lic.capabilities = licensing::kCapCoreExecution;
+  lic.issued_at = static_cast<std::uint64_t>(std::time(nullptr));
+  licensing::SignLicense(lic, lic_kp->private_key);
+  auto lic_bytes = licensing::SerializeLicense(lic);
+  WriteFile((test_dir / "client.license").string(), lic_bytes.data(), lic_bytes.size());
 
   // Create a minimal manifest
   integrity::Manifest m;
@@ -1375,6 +1389,123 @@ void TestTargetScopedSourceDiscoveryAndFailClosedVirtualization() {
   std::printf("  PASSED: Scoped source discovery, fail-closed virtualization, and key separation verified.\n");
 }
 
+void TestSignReleaseProductBindingAndMissingLicenseRejection() {
+  std::printf("Running TestSignReleaseProductBindingAndMissingLicenseRejection...\n");
+
+  fs::path test_dir = "temp_test_sign_prod_bind";
+  CleanDir(test_dir);
+  fs::create_directories(test_dir);
+
+  auto man_kp = integrity::GenerateEd25519KeyPair();
+  auto lic_kp = integrity::GenerateEd25519KeyPair();
+  assert(man_kp.has_value() && lic_kp.has_value());
+
+  WriteFile((test_dir / "release.pub").string(), man_kp->public_key.data(), man_kp->public_key.size());
+  WriteFile((test_dir / "license.pub").string(), lic_kp->public_key.data(), lic_kp->public_key.size());
+  fs::path priv_file = test_dir / "man.priv";
+  WriteSecretFile(priv_file.string(), man_kp->private_key.data(), man_kp->private_key.size());
+
+  // Create config with product ID
+  std::string cfg_text = "#pragma once\nnamespace rtprotect_client {\ninline constexpr const char* kProductId = \"com.test.validproduct\";\n}\n";
+  WriteTextFile((test_dir / "rtprotect_config.h").string(), cfg_text);
+
+  // Manifest
+  integrity::Manifest m;
+  m.release_version = "1.0.0";
+  m.release_sequence = 1;
+  std::string dummy = "app";
+  WriteTextFile((test_dir / "app.exe").string(), dummy);
+  m.AddResource("app.exe", reinterpret_cast<const std::uint8_t*>(dummy.data()), dummy.size());
+  auto m_bytes = integrity::SerializeManifest(m);
+  WriteFile((test_dir / "release.manifest").string(), m_bytes.data(), m_bytes.size());
+
+  std::string err;
+  // 1. Missing client.license MUST fail
+  bool ok_nolic = SignRelease(test_dir.string(), priv_file.string(), "", &err);
+  assert(!ok_nolic);
+  assert(err.find("client.license is missing") != std::string::npos);
+
+  // 2. Mismatched product ID in license MUST fail
+  licensing::License bad_lic;
+  bad_lic.license_id = "lic-bad-prod";
+  bad_lic.product_id = "com.other.product";
+  bad_lic.edition = "Production";
+  bad_lic.customer_id = "tester";
+  bad_lic.capabilities = licensing::kCapCoreExecution;
+  bad_lic.issued_at = static_cast<std::uint64_t>(std::time(nullptr));
+  licensing::SignLicense(bad_lic, lic_kp->private_key);
+  auto bad_lic_bytes = licensing::SerializeLicense(bad_lic);
+  fs::path bad_lic_file = test_dir / "bad.license";
+  WriteFile(bad_lic_file.string(), bad_lic_bytes.data(), bad_lic_bytes.size());
+
+  bool ok_badprod = SignRelease(test_dir.string(), priv_file.string(), bad_lic_file.string(), &err);
+  assert(!ok_badprod);
+  assert(err.find("License product ID mismatch") != std::string::npos || err.find("com.other.product") != std::string::npos);
+
+  // 3. Valid license matching product ID MUST succeed
+  licensing::License good_lic;
+  good_lic.license_id = "lic-good-prod";
+  good_lic.product_id = "com.test.validproduct";
+  good_lic.edition = "Production";
+  good_lic.customer_id = "tester";
+  good_lic.capabilities = licensing::kCapCoreExecution;
+  good_lic.issued_at = static_cast<std::uint64_t>(std::time(nullptr));
+  licensing::SignLicense(good_lic, lic_kp->private_key);
+  auto good_lic_bytes = licensing::SerializeLicense(good_lic);
+  fs::path good_lic_file = test_dir / "good.license";
+  WriteFile(good_lic_file.string(), good_lic_bytes.data(), good_lic_bytes.size());
+
+  bool ok_good = SignRelease(test_dir.string(), priv_file.string(), good_lic_file.string(), &err);
+  assert(ok_good);
+  assert(fs::exists(test_dir / "release.sig"));
+  assert(fs::exists(test_dir / "client.license"));
+
+  CleanDir(test_dir);
+  std::printf("  PASSED: SignRelease product ID binding and missing license rejection verified.\n");
+}
+
+void TestProductionBuildRejectsPrivateSigningKeys() {
+  std::printf("Running TestProductionBuildRejectsPrivateSigningKeys...\n");
+
+  fs::path test_dir = "temp_test_prod_build_privkey";
+  CleanDir(test_dir);
+  fs::create_directories(test_dir);
+
+  auto kp = integrity::GenerateEd25519KeyPair();
+  assert(kp.has_value());
+
+  fs::path man_pub_file = test_dir / "man.pub";
+  fs::path lic_pub_file = test_dir / "lic.pub";
+  fs::path act_pub_file = test_dir / "act.pub";
+  fs::path priv_file = test_dir / "signing.priv";
+
+  WriteFile(man_pub_file.string(), kp->public_key.data(), kp->public_key.size());
+  WriteFile(lic_pub_file.string(), kp->public_key.data(), kp->public_key.size());
+  WriteFile(act_pub_file.string(), kp->public_key.data(), kp->public_key.size());
+  WriteSecretFile(priv_file.string(), kp->private_key.data(), kp->private_key.size());
+
+  WriteTextFile((test_dir / "CMakeLists.txt").string(), "cmake_minimum_required(VERSION 3.20)\nproject(TestApp)\nadd_executable(testapp main.cpp)\n");
+  WriteTextFile((test_dir / "main.cpp").string(), "int main() { return 0; }\n");
+
+  IntegrationOptions opts;
+  opts.target_project_path = test_dir.string();
+  opts.manifest_pubkey_path = man_pub_file.string();
+  opts.license_pubkey_path = lic_pub_file.string();
+  opts.activation_pubkey_path = act_pub_file.string();
+  opts.sign_manifest_key_path = priv_file.string(); // Supplying private signing key
+  opts.use_dev_keys = false;                        // Production mode
+  opts.run_build = true;                            // Build enabled
+
+  auto rep = ExecuteIntegration(opts);
+  // Security policy: Passing vendor private keys to customer build execution MUST fail closed!
+  assert(!rep.success);
+  assert(rep.error_message.find("Security Policy Violation") != std::string::npos ||
+         rep.error_message.find("private signing keys") != std::string::npos);
+
+  CleanDir(test_dir);
+  std::printf("  PASSED: Production build strictly rejects vendor private signing keys.\n");
+}
+
 }  // namespace
 
 int main() {
@@ -1389,6 +1520,8 @@ int main() {
   TestBuildFailureFailsClosed();
   TestStreamingSha256LargeFile();
   TestSignReleaseKeyMismatchRejected();
+  TestSignReleaseProductBindingAndMissingLicenseRejection();
+  TestProductionBuildRejectsPrivateSigningKeys();
   TestNoBuildReportsIntegratedState();
   TestProductionLicenseSigningWorkflow();
   TestValidateProtectedBuildEnforcesLicenseIntegrity();

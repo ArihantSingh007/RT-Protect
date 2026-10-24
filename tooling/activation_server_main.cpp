@@ -42,9 +42,12 @@ void PrintUsage() {
             << "Usage:\n"
             << "  rtprotect-activation-server [options]\n\n"
             << "Options:\n"
-            << "  --port <p>                     Listen port (default: 8080)\n"
+            << "  --port <p>                     Listen port (1-65535, default: 8080)\n"
             << "  --host <h>                     Listen address (default: 127.0.0.1)\n"
             << "  --db <path>                    Database file path (default: activations.db)\n"
+            << "  --db-key <hex|file>            Database AES-256 envelope encryption key (64 hex chars or 32-byte binary file)\n"
+            << "  --allow-legacy-db-plaintext    Permit loading unencrypted legacy VM roots\n"
+            << "  --migrate-db                   Re-encrypt all database VM roots under configured envelope key and exit\n"
             << "  --key <path>                   Ed25519 signing private key file (unencrypted; requires --insecure-dev-only)\n"
             << "  --key-vault <type>             Vault type: 'dpapi' (default), 'env', or 'file'\n"
             << "  --vault-id <id>                Retrieve signing key from secret store by ID (mandatory in production)\n"
@@ -77,11 +80,22 @@ std::string BytesToHex(const std::uint8_t* data, std::size_t len) {
 bool HexToBytes(const std::string& hex, std::uint8_t* out, std::size_t expected_len) {
   if (hex.size() != expected_len * 2) return false;
   for (std::size_t i = 0; i < expected_len; ++i) {
-    char h[3] = { hex[i * 2], hex[i * 2 + 1], '\0' };
-    char* end = nullptr;
-    long v = std::strtol(h, &end, 16);
-    if (end != h + 2 || v < 0 || v > 255) return false;
-    out[i] = static_cast<std::uint8_t>(v);
+    char c1 = hex[i * 2];
+    char c2 = hex[i * 2 + 1];
+    if (!std::isxdigit(static_cast<unsigned char>(c1)) ||
+        !std::isxdigit(static_cast<unsigned char>(c2))) {
+      return false;
+    }
+    auto hex_val = [](char c) -> int {
+      if (c >= '0' && c <= '9') return c - '0';
+      if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+      if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+      return -1;
+    };
+    int v1 = hex_val(c1);
+    int v2 = hex_val(c2);
+    if (v1 < 0 || v2 < 0) return false;
+    out[i] = static_cast<std::uint8_t>((v1 << 4) | v2);
   }
   return true;
 }
@@ -92,6 +106,9 @@ int main(int argc, char* argv[]) {
   std::uint16_t port = 8080;
   std::string host = "127.0.0.1";
   std::string db_path = "activations.db";
+  std::string db_key_arg;
+  bool allow_legacy_db_plaintext = false;
+  bool migrate_db_flag = false;
   std::string key_path;
   std::string vault_type_str;
   std::string vault_id;
@@ -124,11 +141,24 @@ int main(int argc, char* argv[]) {
       std::cout << "rtprotect-activation-server v2.0.0\n";
       return 0;
     } else if (arg == "--port" && i + 1 < argc) {
-      port = static_cast<std::uint16_t>(std::strtoul(argv[++i], nullptr, 10));
+      std::string pstr = argv[++i];
+      char* end = nullptr;
+      long p = std::strtol(pstr.c_str(), &end, 10);
+      if (end != pstr.c_str() + pstr.size() || p <= 0 || p > 65535) {
+        std::cerr << "Error: Invalid port number: " << pstr << " (expected 1-65535)\n";
+        return 1;
+      }
+      port = static_cast<std::uint16_t>(p);
     } else if (arg == "--host" && i + 1 < argc) {
       host = argv[++i];
     } else if (arg == "--db" && i + 1 < argc) {
       db_path = argv[++i];
+    } else if (arg == "--db-key" && i + 1 < argc) {
+      db_key_arg = argv[++i];
+    } else if (arg == "--allow-legacy-db-plaintext") {
+      allow_legacy_db_plaintext = true;
+    } else if (arg == "--migrate-db") {
+      migrate_db_flag = true;
     } else if (arg == "--key" && i + 1 < argc) {
       key_path = argv[++i];
     } else if (arg == "--key-vault" && i + 1 < argc) {
@@ -161,7 +191,14 @@ int main(int argc, char* argv[]) {
     } else if (arg == "--register-license" && i + 3 < argc) {
       reg_lic_id = argv[++i];
       reg_prod_id = argv[++i];
-      reg_seats = static_cast<std::uint32_t>(std::strtoul(argv[++i], nullptr, 10));
+      std::string sstr = argv[++i];
+      char* end = nullptr;
+      long s = std::strtol(sstr.c_str(), &end, 10);
+      if (end != sstr.c_str() + sstr.size() || s <= 0 || s > 1000000) {
+        std::cerr << "Error: Invalid seat count: " << sstr << " (expected positive integer >= 1)\n";
+        return 1;
+      }
+      reg_seats = static_cast<std::uint32_t>(s);
       if (i + 1 < argc && argv[i + 1][0] != '-') {
         reg_vm_root_hex = argv[++i];
       }
@@ -176,7 +213,45 @@ int main(int argc, char* argv[]) {
   }
   bool is_production = explicit_production || !insecure_dev_only;
 
-  ActivationDatabase db(db_path);
+  std::optional<crypto::Aes256Key> db_encryption_key;
+  if (!db_key_arg.empty()) {
+    if (db_key_arg.size() == 64) {
+      std::array<std::uint8_t, 32> raw{};
+      if (HexToBytes(db_key_arg, raw.data(), 32)) {
+        db_encryption_key = crypto::Aes256Key::FromBytes(raw.data(), raw.size());
+      }
+    }
+    if (!db_encryption_key.has_value()) {
+      auto fbytes = tooling::ReadFile(db_key_arg);
+      if (fbytes.has_value() && fbytes->size() == 32) {
+        db_encryption_key = crypto::Aes256Key::FromBytes(fbytes->data(), fbytes->size());
+      }
+    }
+    if (!db_encryption_key.has_value()) {
+      std::cerr << "Error: Invalid --db-key (expected 64 hex characters or 32-byte binary file)\n";
+      return 1;
+    }
+  }
+
+  ActivationDatabase db(db_path, db_encryption_key ? &(*db_encryption_key) : nullptr);
+  if (allow_legacy_db_plaintext) {
+    db.SetAllowLegacyPlaintext(true);
+    db.Open(db_path);
+  }
+  if (!db.IsOpen()) {
+    std::cerr << "Error: Activation database failed to load safely: " << db.GetLastOpenError() << "\n"
+              << "       Refusing to start server to prevent licensing state corruption or loss.\n";
+    return 1;
+  }
+
+  if (migrate_db_flag) {
+    if (!db.MigrateToEnvelopeEncryption()) {
+      std::cerr << "Error: Failed to migrate database to envelope encryption.\n";
+      return 1;
+    }
+    std::cout << "Successfully migrated database " << db_path << " to envelope encryption.\n";
+    return 0;
+  }
 
   if (!reg_lic_id.empty()) {
     if (reg_credential.empty() && !reg_generate_cred && is_production) {
