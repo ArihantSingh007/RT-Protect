@@ -11,6 +11,7 @@
 #include <filesystem>
 #include <fstream>
 #include <sstream>
+#include <unordered_map>
 
 #include <windows.h>
 
@@ -467,7 +468,7 @@ bool TransformSourceFile(const fs::path& file_path,
            << FormatByteArrayLiteral(encrypted->tag, sizeof(encrypted->tag)) << "\n    };\n";
     rep_ss << "    static const std::uint8_t s_fn_salt[] = {\n        "
            << FormatByteArrayLiteral(fn_salt.data(), fn_salt.size()) << "\n    };\n";
-    rep_ss << "    static std::uint64_t s_tamper_accum = 0;\n";
+    rep_ss << "    std::uint64_t s_tamper_accum = 0;\n";
     rep_ss << "    rtprotect::antitamper::ScatterTamperCheck(\"" << fn_name << "_entry\", &s_tamper_accum);\n";
     rep_ss << "    auto s_risk = rtprotect::antitamper::AssessFastEnvironmentRisk();\n";
     rep_ss << "    if (s_tamper_accum != 0) s_risk.risk_score = 100;\n";
@@ -515,6 +516,9 @@ bool TransformSourceFile(const fs::path& file_path,
     rep_ss << "    }\n";
     rep_ss << "    std::uint64_t s_delta = rtprotect::antitamper::FoldTamperStateDelta(s_risk, 0x5EEDCAFEULL) ^ s_tamper_accum;\n";
     rep_ss << "    rtprotect::antitamper::FunctionCrossLink::DepositToken(" << fn_hash << "ULL, static_cast<std::uint64_t>(s_res.value) ^ 0xFEEDFACECAFEULL);\n";
+    rep_ss << "    if (!rtprotect::antitamper::FunctionCrossLink::VerifyToken(" << fn_hash << "ULL, static_cast<std::uint64_t>(s_res.value) ^ 0xFEEDFACECAFEULL)) {\n";
+    rep_ss << "        s_delta ^= 0xBADF00D1ULL;\n";
+    rep_ss << "    }\n";
     if (is_void) {
       rep_ss << "    return;\n";
     } else {
@@ -677,6 +681,8 @@ std::string IntegrationReport::ToJson() const {
   ss << "  \"public_key_file\": \"" << EscapeJson(public_key_file) << "\",\n";
   ss << "  \"manifest_public_key_file\": \"" << EscapeJson(manifest_public_key_file) << "\",\n";
   ss << "  \"license_public_key_file\": \"" << EscapeJson(license_public_key_file) << "\",\n";
+  ss << "  \"activation_public_key_file\": \"" << EscapeJson(activation_public_key_file) << "\",\n";
+  ss << "  \"countermeasure_public_key_file\": \"" << EscapeJson(countermeasure_public_key_file) << "\",\n";
   if (!private_key_file.empty()) {
     ss << "  \"private_key_file\": \"" << EscapeJson(private_key_file) << "\",\n";
   }
@@ -792,6 +798,7 @@ ChangePlan PlanIntegration(const IntegrationOptions& options) {
   plan.files_to_create.push_back((proj_path / "release.pub").string());
   plan.files_to_create.push_back((proj_path / "license.pub").string());
   plan.files_to_create.push_back((proj_path / "activation.pub").string());
+  plan.files_to_create.push_back((proj_path / "countermeasure.pub").string());
   plan.files_to_create.push_back((proj_path / "release.manifest").string());
   plan.files_to_create.push_back((proj_path / "release.sig").string());
   plan.files_to_create.push_back((proj_path / "client.license").string());
@@ -908,13 +915,17 @@ IntegrationReport ExecuteIntegration(const IntegrationOptions& options) {
   integrity::Ed25519PublicKey manifest_pubkey{};
   integrity::Ed25519PublicKey license_pubkey{};
   integrity::Ed25519PublicKey activation_pubkey{};
+  integrity::Ed25519PublicKey countermeasure_pubkey{};
   std::optional<integrity::Ed25519PrivateKey> manifest_privkey;
   std::optional<integrity::Ed25519PrivateKey> license_privkey;
   std::optional<integrity::Ed25519PrivateKey> activation_privkey;
+  std::optional<integrity::Ed25519PrivateKey> countermeasure_privkey;
   bool has_manifest_privkey = false;
   bool has_license_privkey = false;
   bool has_activation_privkey = false;
+  bool has_countermeasure_privkey = false;
   (void)has_activation_privkey;
+  (void)has_countermeasure_privkey;
 
   if (options.use_dev_keys) {
     // Development-only testing workflow
@@ -943,7 +954,8 @@ IntegrationReport ExecuteIntegration(const IntegrationOptions& options) {
     auto man_kp = integrity::GenerateEd25519KeyPair();
     auto lic_kp = integrity::GenerateEd25519KeyPair();
     auto act_kp = integrity::GenerateEd25519KeyPair();
-    if (!man_kp.has_value() || !lic_kp.has_value() || !act_kp.has_value()) {
+    auto cm_kp = integrity::GenerateEd25519KeyPair();
+    if (!man_kp.has_value() || !lic_kp.has_value() || !act_kp.has_value() || !cm_kp.has_value()) {
       report.success = false;
       report.state = IntegrationState::kFailed;
       report.error_message = "Failed to generate ephemeral development keypairs.";
@@ -953,13 +965,16 @@ IntegrationReport ExecuteIntegration(const IntegrationOptions& options) {
     manifest_pubkey = man_kp->public_key;
     license_pubkey = lic_kp->public_key;
     activation_pubkey = act_kp->public_key;
+    countermeasure_pubkey = cm_kp->public_key;
 
     fs::path dev_man_priv = dev_keys_dir / "manifest.priv";
     fs::path dev_lic_priv = dev_keys_dir / "license.priv";
     fs::path dev_act_priv = dev_keys_dir / "activation.priv";
+    fs::path dev_cm_priv = dev_keys_dir / "countermeasure.priv";
     if (!WriteSecretFile(dev_man_priv.string(), man_kp->private_key.data(), man_kp->private_key.size()) ||
         !WriteSecretFile(dev_lic_priv.string(), lic_kp->private_key.data(), lic_kp->private_key.size()) ||
-        !WriteSecretFile(dev_act_priv.string(), act_kp->private_key.data(), act_kp->private_key.size())) {
+        !WriteSecretFile(dev_act_priv.string(), act_kp->private_key.data(), act_kp->private_key.size()) ||
+        !WriteSecretFile(dev_cm_priv.string(), cm_kp->private_key.data(), cm_kp->private_key.size())) {
       report.success = false;
       report.state = IntegrationState::kFailed;
       report.error_message = "Failed to write development private keys to secure storage";
@@ -969,9 +984,11 @@ IntegrationReport ExecuteIntegration(const IntegrationOptions& options) {
     manifest_privkey = std::move(man_kp->private_key);
     license_privkey = std::move(lic_kp->private_key);
     activation_privkey = std::move(act_kp->private_key);
+    countermeasure_privkey = std::move(cm_kp->private_key);
     has_manifest_privkey = true;
     has_license_privkey = true;
     has_activation_privkey = true;
+    has_countermeasure_privkey = true;
 
     report.private_key_file = dev_man_priv.string();
     report.warnings.push_back("Development test keys generated outside project at: " + dev_keys_dir.string() + " (Not for production distribution)");
@@ -1024,7 +1041,20 @@ IntegrationReport ExecuteIntegration(const IntegrationOptions& options) {
       }
     }
 
-    if (!options.use_dev_keys && (!options.sign_manifest_key_path.empty() || !options.sign_license_key_path.empty())) {
+    if (!options.countermeasure_pubkey_path.empty()) {
+      auto cm_bytes = ReadFile(options.countermeasure_pubkey_path);
+      if (!cm_bytes.has_value() || cm_bytes->size() != integrity::kEd25519PublicKeyLen) {
+        report.success = false;
+        report.state = IntegrationState::kFailed;
+        report.error_message = "Invalid or unreadable countermeasure public key file: " + options.countermeasure_pubkey_path;
+        return report;
+      }
+      std::memcpy(countermeasure_pubkey.data(), cm_bytes->data(), integrity::kEd25519PublicKeyLen);
+    } else {
+      countermeasure_pubkey = activation_pubkey;
+    }
+
+    if (!options.use_dev_keys && (!options.sign_manifest_key_path.empty() || !options.sign_license_key_path.empty() || !options.sign_countermeasure_key_path.empty())) {
       if (options.run_build) {
         report.success = false;
         report.state = IntegrationState::kFailed;
@@ -1132,9 +1162,11 @@ IntegrationReport ExecuteIntegration(const IntegrationOptions& options) {
   fs::path manifest_pub_path = proj_path / "release.pub";
   fs::path license_pub_path = proj_path / "license.pub";
   fs::path activation_pub_path = proj_path / "activation.pub";
+  fs::path countermeasure_pub_path = proj_path / "countermeasure.pub";
   if (!WriteFile(manifest_pub_path.string(), manifest_pubkey.data(), manifest_pubkey.size()) ||
       !WriteFile(license_pub_path.string(), license_pubkey.data(), license_pubkey.size()) ||
-      !WriteFile(activation_pub_path.string(), activation_pubkey.data(), activation_pubkey.size())) {
+      !WriteFile(activation_pub_path.string(), activation_pubkey.data(), activation_pubkey.size()) ||
+      !WriteFile(countermeasure_pub_path.string(), countermeasure_pubkey.data(), countermeasure_pubkey.size())) {
     report.success = false;
     report.state = IntegrationState::kFailed;
     report.error_message = "Failed to write public verification key files into project directory";
@@ -1145,9 +1177,11 @@ IntegrationReport ExecuteIntegration(const IntegrationOptions& options) {
   report.manifest_public_key_file = manifest_pub_path.string();
   report.license_public_key_file = license_pub_path.string();
   report.activation_public_key_file = activation_pub_path.string();
+  report.countermeasure_public_key_file = countermeasure_pub_path.string();
   report.generated_files.push_back(manifest_pub_path.string());
   report.generated_files.push_back(license_pub_path.string());
   report.generated_files.push_back(activation_pub_path.string());
+  report.generated_files.push_back(countermeasure_pub_path.string());
 
   std::string expected_exe_name = target_name;
 #if defined(_WIN32)
@@ -1213,7 +1247,7 @@ IntegrationReport ExecuteIntegration(const IntegrationOptions& options) {
   if (!vm_root_set && !options.activation_server_url.empty()) {
     std::string act_err;
     auto srv_token = rtprotect::licensing::RequestOnlineActivation(
-        options.activation_server_url, dev_lic_id, options.product_id, activation_pubkey, &act_err, options.activation_credential);
+        options.activation_server_url, dev_lic_id, options.product_id, activation_pubkey, &act_err, options.activation_credential, 0, &countermeasure_pubkey);
     if (srv_token.has_value()) {
       vm_root = srv_token->vm_root;
       vm_root_set = true;
@@ -1293,6 +1327,7 @@ IntegrationReport ExecuteIntegration(const IntegrationOptions& options) {
     dump_key("kManifestPublicKey", manifest_pubkey);
     dump_key("kLicensePublicKey", license_pubkey);
     dump_key("kActivationPublicKey", activation_pubkey);
+    dump_key("kCountermeasurePublicKey", countermeasure_pubkey);
     dump_key("kPublicKey", manifest_pubkey);
 
     ss << "bool VerifyClientIntegrityAndLicense(const char* activation_credential = nullptr);\n";
@@ -1440,6 +1475,8 @@ IntegrationReport ExecuteIntegration(const IntegrationOptions& options) {
     ss << "}  // namespace\n\n";
 
     ss << "bool VerifyClientIntegrityAndLicense(const char* activation_credential) {\n";
+    ss << "  s_license_validated = false;\n";
+    ss << "  s_validated_license = {};\n";
     ss << "  if (!kAllowDevTokenFallback) {\n";
     ss << "    rtprotect::licensing::SecureStorage::SetRequireDpapi(true);\n";
     ss << "  }\n";
@@ -1450,17 +1487,29 @@ IntegrationReport ExecuteIntegration(const IntegrationOptions& options) {
     ss << "        cfg.blacklisted_window_titles,\n";
     ss << "        cfg.risk_threshold_restrict,\n";
     ss << "        cfg.risk_threshold_terminate,\n";
-    ss << "        cfg.expires_at);\n";
+    ss << "        cfg.expires_at,\n";
+    ss << "        cfg.blacklisted_process_hashes,\n";
+    ss << "        cfg.blacklisted_driver_hashes,\n";
+    ss << "        cfg.enforce_hardware_breakpoints,\n";
+    ss << "        cfg.enforce_timing_checks,\n";
+    ss << "        cfg.enforce_memory_hooks,\n";
+    ss << "        cfg.enforce_anti_dump);\n";
     ss << "  });\n\n";
     ss << "  // 0b. Load and apply any active unexpired countermeasure configuration from secure storage\n";
     ss << "  auto active_cm = rtprotect::licensing::LoadCountermeasureConfig(kProductId);\n";
-    ss << "  if (active_cm.has_value() && rtprotect::licensing::VerifyCountermeasureConfigSignature(*active_cm, kManifestPublicKey)) {\n";
+    ss << "  if (active_cm.has_value() && rtprotect::licensing::VerifyCountermeasureConfigSignature(*active_cm, kCountermeasurePublicKey)) {\n";
     ss << "    rtprotect::antitamper::ApplyCountermeasures(\n";
     ss << "        active_cm->blacklisted_process_names,\n";
     ss << "        active_cm->blacklisted_window_titles,\n";
     ss << "        active_cm->risk_threshold_restrict,\n";
     ss << "        active_cm->risk_threshold_terminate,\n";
-    ss << "        active_cm->expires_at);\n";
+    ss << "        active_cm->expires_at,\n";
+    ss << "        active_cm->blacklisted_process_hashes,\n";
+    ss << "        active_cm->blacklisted_driver_hashes,\n";
+    ss << "        active_cm->enforce_hardware_breakpoints,\n";
+    ss << "        active_cm->enforce_timing_checks,\n";
+    ss << "        active_cm->enforce_memory_hooks,\n";
+    ss << "        active_cm->enforce_anti_dump);\n";
     ss << "  }\n\n";
     ss << "  // 1. Runtime environment risk assessment and launch watchdog\n";
     ss << "  rtprotect::antitamper::StartHardwareBreakpointWatchdog(500);\n";
@@ -1484,9 +1533,8 @@ IntegrationReport ExecuteIntegration(const IntegrationOptions& options) {
     ss << "  rtprotect::licensing::License lic;\n";
     ss << "  auto lic_status = rtprotect::licensing::VerifyLicenseBytes(lic_data->data(), lic_data->size(), kLicensePublicKey, ctx, &lic);\n";
     ss << "  if (lic_status != rtprotect::licensing::LicenseStatus::kValid) return false;\n";
+    ss << "  if (lic.product_id != kProductId) return false;\n";
     ss << "  if ((lic.capabilities & kRequiredCapabilities) != kRequiredCapabilities) return false;\n";
-    ss << "  s_validated_license = lic;\n";
-    ss << "  s_license_validated = true;\n";
 
     ss << "\n  // 3. Manifest signature and anti-rollback verification\n";
     ss << "  auto man_bytes = ReadAuxiliaryFile(\"release.manifest\");\n";
@@ -1529,7 +1577,7 @@ IntegrationReport ExecuteIntegration(const IntegrationOptions& options) {
     ss << "    }\n";
     ss << "    std::string act_err;\n";
     ss << "    auto online_token = rtprotect::licensing::RequestOnlineActivation(\n";
-    ss << "        kActivationServerUrl, lic.license_id, kProductId, kActivationPublicKey, &act_err, effective_cred ? effective_cred : \"\", ctx.current_time);\n";
+    ss << "        kActivationServerUrl, lic.license_id, kProductId, kActivationPublicKey, &act_err, effective_cred ? effective_cred : \"\", ctx.current_time, &kCountermeasurePublicKey);\n";
     ss << "    if (online_token.has_value()) {\n";
     ss << "      token = *online_token;\n";
     ss << "      rtprotect::licensing::SaveActivationToken(kProductId, token);\n";
@@ -1558,6 +1606,8 @@ IntegrationReport ExecuteIntegration(const IntegrationOptions& options) {
     ss << "  if (!res) return false; // Mandatory executable resource missing in manifest -> FAIL\n";
     ss << "  if (res->size != actual_size || res->sha256 != *actual_hash) return false;\n";
 
+    ss << "\n  s_validated_license = lic;\n";
+    ss << "  s_license_validated = true;\n";
     ss << "  return true;\n";
     ss << "}\n\n";
 
@@ -1616,16 +1666,46 @@ IntegrationReport ExecuteIntegration(const IntegrationOptions& options) {
   // 6a-3. Whole-Program Automated Candidate Selection (--auto-virtualize)
   if (options.auto_virtualize) {
     auto candidates = ClangAstScanner::AnalyzeProjectCandidates(plan.detected_sources, nullptr, options.virtualization_budget);
+    std::unordered_map<std::string, std::vector<FunctionSuitabilityScore>> file_to_candidates;
     for (const auto& cand : candidates) {
-      if (!cand.is_eligible) continue;
-      auto file_content = ReadTextFile(cand.file_path);
-      if (!file_content.has_value()) continue;
-      std::size_t lookback = cand.start_offset > 50 ? 50 : cand.start_offset;
-      std::string prefix = file_content->substr(cand.start_offset - lookback, lookback);
-      if (prefix.find("RTPROTECT_VIRTUALIZE") == std::string::npos &&
-          prefix.find("[[rtprotect::virtualize]]") == std::string::npos) {
-        file_content->insert(cand.start_offset, "RTPROTECT_VIRTUALIZE\n");
-        WriteTextFile(cand.file_path, *file_content);
+      if (cand.is_eligible) {
+        file_to_candidates[cand.file_path].push_back(cand);
+      }
+    }
+
+    for (auto& [file_path, cands] : file_to_candidates) {
+      auto file_content = ReadTextFile(file_path);
+      if (!file_content.has_value()) {
+        report.success = false;
+        report.state = IntegrationState::kFailed;
+        report.error_message = "Failed to read source file for auto-virtualization: " + file_path;
+        return report;
+      }
+
+      // Sort candidates descending by start_offset so insertions don't invalidate subsequent offsets
+      std::sort(cands.begin(), cands.end(), [](const FunctionSuitabilityScore& a, const FunctionSuitabilityScore& b) {
+        return a.start_offset > b.start_offset;
+      });
+
+      bool file_modified = false;
+      for (const auto& cand : cands) {
+        if (cand.start_offset > file_content->size()) continue;
+        std::size_t lookback = cand.start_offset > 50 ? 50 : cand.start_offset;
+        std::string prefix = file_content->substr(cand.start_offset - lookback, lookback);
+        if (prefix.find("RTPROTECT_VIRTUALIZE") == std::string::npos &&
+            prefix.find("[[rtprotect::virtualize]]") == std::string::npos) {
+          file_content->insert(cand.start_offset, "RTPROTECT_VIRTUALIZE\n");
+          file_modified = true;
+        }
+      }
+
+      if (file_modified) {
+        if (!WriteTextFile(file_path, *file_content)) {
+          report.success = false;
+          report.state = IntegrationState::kFailed;
+          report.error_message = "Failed to write modified source file during auto-virtualization: " + file_path;
+          return report;
+        }
       }
     }
   }
@@ -2175,8 +2255,10 @@ bool ExecuteRollback(const std::string& target_project_path,
     "release.pub",
     "license.pub",
     "activation.pub",
+    "countermeasure.pub",
     "release.priv",
     "activation.priv",
+    "countermeasure.priv",
     "release.manifest",
     "release.sig",
     "client.license"

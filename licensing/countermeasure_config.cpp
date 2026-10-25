@@ -4,6 +4,7 @@
 
 #include "licensing/countermeasure_config.h"
 
+#include <atomic>
 #include <ctime>
 #include <cstring>
 #include <vector>
@@ -72,6 +73,21 @@ bool ReadString(const std::uint8_t*& p, const std::uint8_t* end, std::string& ou
 }  // namespace
 
 std::vector<std::uint8_t> SerializeCountermeasureConfigForSigning(const CountermeasureConfig& cfg) {
+  // Enforce list limits to prevent malformed or oversized payloads
+  if (cfg.blacklisted_process_names.size() > 1000 ||
+      cfg.blacklisted_process_hashes.size() > 5000 ||
+      cfg.blacklisted_window_titles.size() > 1000 ||
+      cfg.blacklisted_driver_hashes.size() > 5000) {
+    return {};
+  }
+
+  // Validate threshold ranges
+  if (cfg.risk_threshold_restrict < 0 || cfg.risk_threshold_restrict > 100 ||
+      cfg.risk_threshold_terminate < 0 || cfg.risk_threshold_terminate > 100 ||
+      cfg.risk_threshold_restrict >= cfg.risk_threshold_terminate) {
+    return {};
+  }
+
   std::vector<std::uint8_t> buf;
   buf.reserve(512);
 
@@ -81,10 +97,13 @@ std::vector<std::uint8_t> SerializeCountermeasureConfigForSigning(const Counterm
   WriteU64(buf, cfg.issued_at);
   WriteU64(buf, cfg.expires_at);
 
+  // Product ID binding
+  if (!WriteString(buf, cfg.product_id)) return {};
+
   // Blacklisted process names
   WriteU32(buf, static_cast<std::uint32_t>(cfg.blacklisted_process_names.size()));
   for (const auto& name : cfg.blacklisted_process_names) {
-    WriteString(buf, name);
+    if (!WriteString(buf, name)) return {};
   }
 
   // Blacklisted process hashes
@@ -96,7 +115,7 @@ std::vector<std::uint8_t> SerializeCountermeasureConfigForSigning(const Counterm
   // Blacklisted window titles
   WriteU32(buf, static_cast<std::uint32_t>(cfg.blacklisted_window_titles.size()));
   for (const auto& title : cfg.blacklisted_window_titles) {
-    WriteString(buf, title);
+    if (!WriteString(buf, title)) return {};
   }
 
   // Blacklisted driver hashes
@@ -118,6 +137,7 @@ std::vector<std::uint8_t> SerializeCountermeasureConfigForSigning(const Counterm
 
 std::vector<std::uint8_t> SerializeCountermeasureConfig(const CountermeasureConfig& cfg) {
   auto buf = SerializeCountermeasureConfigForSigning(cfg);
+  if (buf.empty()) return {};
   buf.insert(buf.end(), cfg.signature.begin(), cfg.signature.end());
   return buf;
 }
@@ -136,6 +156,9 @@ std::optional<CountermeasureConfig> DeserializeCountermeasureConfig(const std::u
   if (!ReadU64(p, end, cfg.sequence_number)) return std::nullopt;
   if (!ReadU64(p, end, cfg.issued_at)) return std::nullopt;
   if (!ReadU64(p, end, cfg.expires_at)) return std::nullopt;
+
+  // Product ID binding
+  if (!ReadString(p, end, cfg.product_id)) return std::nullopt;
 
   // Process names
   std::uint32_t proc_name_count = 0;
@@ -172,6 +195,9 @@ std::optional<CountermeasureConfig> DeserializeCountermeasureConfig(const std::u
   // Thresholds & flags
   std::uint32_t thresh_res = 0, thresh_term = 0;
   if (!ReadU32(p, end, thresh_res) || !ReadU32(p, end, thresh_term)) return std::nullopt;
+  if (thresh_res > 100 || thresh_term > 100 || thresh_res >= thresh_term) {
+    return std::nullopt;
+  }
   cfg.risk_threshold_restrict = static_cast<int>(thresh_res);
   cfg.risk_threshold_terminate = static_cast<int>(thresh_term);
 
@@ -191,6 +217,7 @@ std::optional<CountermeasureConfig> DeserializeCountermeasureConfig(const std::u
 
 bool SignCountermeasureConfig(CountermeasureConfig& cfg, const integrity::Ed25519PrivateKey& privkey) {
   auto signable = SerializeCountermeasureConfigForSigning(cfg);
+  if (signable.empty()) return false;
   EVP_PKEY* pkey = EVP_PKEY_new_raw_private_key(
       EVP_PKEY_ED25519, nullptr, privkey.data(), integrity::kEd25519PrivateKeyLen);
   if (!pkey) return false;
@@ -213,11 +240,14 @@ bool SignCountermeasureConfig(CountermeasureConfig& cfg, const integrity::Ed2551
 
 bool VerifyCountermeasureConfigSignature(const CountermeasureConfig& cfg, const integrity::Ed25519PublicKey& pubkey) {
   auto signable = SerializeCountermeasureConfigForSigning(cfg);
+  if (signable.empty()) return false;
   return integrity::VerifyManifestSignature(signable, cfg.signature, pubkey);
 }
 
 bool SaveCountermeasureConfig(const std::string& product_id, const CountermeasureConfig& cfg) {
+  if (!cfg.product_id.empty() && cfg.product_id != product_id) return false;
   auto serialized = SerializeCountermeasureConfig(cfg);
+  if (serialized.empty()) return false;
   return SecureStorage::Store(product_id + "_countermeasures", serialized, "rtprotect_countermeasures");
 }
 
@@ -226,6 +256,7 @@ std::optional<CountermeasureConfig> LoadCountermeasureConfig(const std::string& 
   if (!data.has_value()) return std::nullopt;
   auto cfg = DeserializeCountermeasureConfig(data->data(), data->size());
   if (!cfg.has_value()) return std::nullopt;
+  if (!cfg->product_id.empty() && cfg->product_id != product_id) return std::nullopt;
   std::uint64_t now = static_cast<std::uint64_t>(std::time(nullptr));
   if (cfg->IsExpired(now)) {
     return std::nullopt;
@@ -234,16 +265,17 @@ std::optional<CountermeasureConfig> LoadCountermeasureConfig(const std::string& 
 }
 
 namespace {
-CountermeasureUpdateHook s_cm_hook = nullptr;
+std::atomic<CountermeasureUpdateHook> s_cm_hook{nullptr};
 }  // namespace
 
 void SetCountermeasureUpdateHook(CountermeasureUpdateHook hook) {
-  s_cm_hook = hook;
+  s_cm_hook.store(hook, std::memory_order_release);
 }
 
 void NotifyCountermeasureUpdate(const CountermeasureConfig& cfg) {
-  if (s_cm_hook) {
-    s_cm_hook(cfg);
+  auto hook = s_cm_hook.load(std::memory_order_acquire);
+  if (hook) {
+    hook(cfg);
   }
 }
 

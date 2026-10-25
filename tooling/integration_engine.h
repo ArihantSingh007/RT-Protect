@@ -58,9 +58,11 @@ struct IntegrationOptions {
   std::string manifest_pubkey_path;  // External manifest public key
   std::string license_pubkey_path;   // External license public key
   std::string activation_pubkey_path;// External activation token public key (separated from manifest/license)
+  std::string countermeasure_pubkey_path;// External countermeasure config public key
   std::string sign_manifest_key_path;// Optional vendor release signing private key
   std::string sign_license_key_path; // Optional vendor license signing private key
   std::string sign_activation_key_path; // Optional activation token signing private key
+  std::string sign_countermeasure_key_path; // Optional countermeasure config signing private key
   std::string license_file_path;     // Optional pre-issued client.license to deploy
   std::string dev_keys_dir;          // Output directory for dev keys (must be outside client project)
   std::string activation_server_url; // Online Activation Authority URL (e.g. "https://license.vendor.com")
@@ -103,6 +105,7 @@ struct IntegrationReport {
   std::string manifest_public_key_file; // Manifest verification public key
   std::string license_public_key_file;  // License verification public key
   std::string activation_public_key_file; // Activation token verification public key
+  std::string countermeasure_public_key_file; // Countermeasure config verification public key
   std::string private_key_file;         // Populated only in --dev-keys mode (in external dev_keys_dir)
   std::string manifest_file;
   std::string signature_file;

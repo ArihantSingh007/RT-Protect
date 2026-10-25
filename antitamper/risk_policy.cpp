@@ -32,13 +32,20 @@ namespace {
 
 std::mutex s_cm_mutex;
 std::vector<std::string> s_active_blacklisted_procs;
+std::vector<std::uint32_t> s_active_blacklisted_proc_hashes;
 std::vector<std::string> s_active_blacklisted_windows;
+std::vector<std::uint32_t> s_active_blacklisted_driver_hashes;
 int s_restrict_thresh = 50;
 int s_terminate_thresh = 80;
+bool s_enforce_hwbp = true;
+bool s_enforce_timing = true;
+bool s_enforce_memhooks = true;
+bool s_enforce_antidump = true;
 std::uint64_t s_cm_expires_at = 0;
 
-bool CheckBlacklistedProcesses(const std::vector<std::string>& procs) {
-  if (procs.empty()) return false;
+bool CheckBlacklistedProcesses(const std::vector<std::string>& procs,
+                               const std::vector<std::uint32_t>& hashes = {}) {
+  if (procs.empty() && hashes.empty()) return false;
   auto pCreateToolhelp32Snapshot = ResolveApi<HANDLE(WINAPI*)(DWORD, DWORD)>(kHashKernel32, kHashCreateToolhelp32Snapshot);
   auto pProcess32First = ResolveApi<BOOL(WINAPI*)(HANDLE, LPPROCESSENTRY32)>(kHashKernel32, HashApi("Process32First"));
   auto pProcess32Next = ResolveApi<BOOL(WINAPI*)(HANDLE, LPPROCESSENTRY32)>(kHashKernel32, HashApi("Process32Next"));
@@ -66,6 +73,17 @@ bool CheckBlacklistedProcesses(const std::vector<std::string>& procs) {
         }
       }
       if (found) break;
+
+      if (!hashes.empty()) {
+        std::uint32_t exe_hash = HashApi(exe.c_str());
+        for (auto h : hashes) {
+          if (exe_hash == h) {
+            found = true;
+            break;
+          }
+        }
+      }
+      if (found) break;
     } while (pProcess32Next(hSnap, &pe));
   }
   pCloseHandle(hSnap);
@@ -90,21 +108,39 @@ void ApplyCountermeasures(const std::vector<std::string>& blacklisted_procs,
                           const std::vector<std::string>& blacklisted_windows,
                           int restrict_thresh,
                           int terminate_thresh,
-                          std::uint64_t expires_at) {
+                          std::uint64_t expires_at,
+                          const std::vector<std::uint32_t>& blacklisted_proc_hashes,
+                          const std::vector<std::uint32_t>& blacklisted_driver_hashes,
+                          bool enforce_hwbp,
+                          bool enforce_timing,
+                          bool enforce_memhooks,
+                          bool enforce_antidump) {
   std::lock_guard<std::mutex> lock(s_cm_mutex);
   s_active_blacklisted_procs = blacklisted_procs;
+  s_active_blacklisted_proc_hashes = blacklisted_proc_hashes;
   s_active_blacklisted_windows = blacklisted_windows;
+  s_active_blacklisted_driver_hashes = blacklisted_driver_hashes;
   s_restrict_thresh = restrict_thresh;
   s_terminate_thresh = terminate_thresh;
+  s_enforce_hwbp = enforce_hwbp;
+  s_enforce_timing = enforce_timing;
+  s_enforce_memhooks = enforce_memhooks;
+  s_enforce_antidump = enforce_antidump;
   s_cm_expires_at = expires_at;
 }
 
 void ResetCountermeasuresForTesting() {
   std::lock_guard<std::mutex> lock(s_cm_mutex);
   s_active_blacklisted_procs.clear();
+  s_active_blacklisted_proc_hashes.clear();
   s_active_blacklisted_windows.clear();
+  s_active_blacklisted_driver_hashes.clear();
   s_restrict_thresh = 50;
   s_terminate_thresh = 80;
+  s_enforce_hwbp = true;
+  s_enforce_timing = true;
+  s_enforce_memhooks = true;
+  s_enforce_antidump = true;
   s_cm_expires_at = 0;
 }
 
@@ -122,32 +158,32 @@ RiskAssessment AssessEnvironmentRisk() {
     r.hypervisor_vendor = GetHypervisorVendor();
   }
 
+  bool enforce_hwbp = true, enforce_timing = true, enforce_memhooks = true, enforce_antidump = true;
   int score = 0;
-  if (r.debugger_present || r.remote_debugger_present) {
-    score = obfuscation::MbaAdd(score, 40);
-    // Small corroboration bump if both distinct indicators hit
-    if (r.debugger_present && r.remote_debugger_present) {
-      score = obfuscation::MbaAdd(score, 10);
-    }
-  }
-  if (r.hardware_breakpoints_detected) score = obfuscation::MbaAdd(score, 50);
-  if (r.timing_anomaly_detected) score = obfuscation::MbaAdd(score, 30);
-  if (r.memory_tampered) score = obfuscation::MbaAdd(score, 40);
-  if (r.memory_dump_detected) score = obfuscation::MbaAdd(score, 40);
-  if (r.memory_probing_detected) score = obfuscation::MbaAdd(score, 30);
-  if (r.hypervisor_detected) score = obfuscation::MbaAdd(score, 15); // Low risk by itself to avoid penalizing legitimate VMs
 
   {
     std::lock_guard<std::mutex> lock(s_cm_mutex);
     std::uint64_t now = static_cast<std::uint64_t>(std::time(nullptr));
     if (s_cm_expires_at != 0 && s_cm_expires_at < now) {
       s_active_blacklisted_procs.clear();
+      s_active_blacklisted_proc_hashes.clear();
       s_active_blacklisted_windows.clear();
+      s_active_blacklisted_driver_hashes.clear();
       s_restrict_thresh = 50;
       s_terminate_thresh = 80;
+      s_enforce_hwbp = true;
+      s_enforce_timing = true;
+      s_enforce_memhooks = true;
+      s_enforce_antidump = true;
       s_cm_expires_at = 0;
     }
-    if (!s_active_blacklisted_procs.empty() && CheckBlacklistedProcesses(s_active_blacklisted_procs)) {
+    enforce_hwbp = s_enforce_hwbp;
+    enforce_timing = s_enforce_timing;
+    enforce_memhooks = s_enforce_memhooks;
+    enforce_antidump = s_enforce_antidump;
+
+    if ((!s_active_blacklisted_procs.empty() || !s_active_blacklisted_proc_hashes.empty()) &&
+        CheckBlacklistedProcesses(s_active_blacklisted_procs, s_active_blacklisted_proc_hashes)) {
       r.blacklisted_process_detected = true;
       score = obfuscation::MbaAdd(score, 50);
     }
@@ -156,6 +192,19 @@ RiskAssessment AssessEnvironmentRisk() {
       score = obfuscation::MbaAdd(score, 50);
     }
   }
+
+  if (r.debugger_present || r.remote_debugger_present) {
+    score = obfuscation::MbaAdd(score, 40);
+    if (r.debugger_present && r.remote_debugger_present) {
+      score = obfuscation::MbaAdd(score, 10);
+    }
+  }
+  if (enforce_hwbp && r.hardware_breakpoints_detected) score = obfuscation::MbaAdd(score, 50);
+  if (enforce_timing && r.timing_anomaly_detected) score = obfuscation::MbaAdd(score, 30);
+  if (enforce_memhooks && r.memory_tampered) score = obfuscation::MbaAdd(score, 40);
+  if (enforce_antidump && r.memory_dump_detected) score = obfuscation::MbaAdd(score, 40);
+  if (enforce_antidump && r.memory_probing_detected) score = obfuscation::MbaAdd(score, 30);
+  if (r.hypervisor_detected) score = obfuscation::MbaAdd(score, 15);
 
   if (score > 100) score = 100;
   r.risk_score = score;
@@ -176,31 +225,32 @@ RiskAssessment AssessFastEnvironmentRisk() {
     r.hypervisor_vendor = GetHypervisorVendor();
   }
 
+  bool enforce_hwbp = true, enforce_timing = true, enforce_memhooks = true, enforce_antidump = true;
   int score = 0;
-  if (r.debugger_present || r.remote_debugger_present) {
-    score = obfuscation::MbaAdd(score, 40);
-    if (r.debugger_present && r.remote_debugger_present) {
-      score = obfuscation::MbaAdd(score, 10);
-    }
-  }
-  if (r.hardware_breakpoints_detected) score = obfuscation::MbaAdd(score, 50);
-  if (r.timing_anomaly_detected) score = obfuscation::MbaAdd(score, 30);
-  if (r.memory_tampered) score = obfuscation::MbaAdd(score, 40);
-  if (r.memory_dump_detected) score = obfuscation::MbaAdd(score, 40);
-  if (r.memory_probing_detected) score = obfuscation::MbaAdd(score, 30);
-  if (r.hypervisor_detected) score = obfuscation::MbaAdd(score, 15);
 
   {
     std::lock_guard<std::mutex> lock(s_cm_mutex);
     std::uint64_t now = static_cast<std::uint64_t>(std::time(nullptr));
     if (s_cm_expires_at != 0 && s_cm_expires_at < now) {
       s_active_blacklisted_procs.clear();
+      s_active_blacklisted_proc_hashes.clear();
       s_active_blacklisted_windows.clear();
+      s_active_blacklisted_driver_hashes.clear();
       s_restrict_thresh = 50;
       s_terminate_thresh = 80;
+      s_enforce_hwbp = true;
+      s_enforce_timing = true;
+      s_enforce_memhooks = true;
+      s_enforce_antidump = true;
       s_cm_expires_at = 0;
     }
-    if (!s_active_blacklisted_procs.empty() && CheckBlacklistedProcesses(s_active_blacklisted_procs)) {
+    enforce_hwbp = s_enforce_hwbp;
+    enforce_timing = s_enforce_timing;
+    enforce_memhooks = s_enforce_memhooks;
+    enforce_antidump = s_enforce_antidump;
+
+    if ((!s_active_blacklisted_procs.empty() || !s_active_blacklisted_proc_hashes.empty()) &&
+        CheckBlacklistedProcesses(s_active_blacklisted_procs, s_active_blacklisted_proc_hashes)) {
       r.blacklisted_process_detected = true;
       score = obfuscation::MbaAdd(score, 50);
     }
@@ -209,6 +259,19 @@ RiskAssessment AssessFastEnvironmentRisk() {
       score = obfuscation::MbaAdd(score, 50);
     }
   }
+
+  if (r.debugger_present || r.remote_debugger_present) {
+    score = obfuscation::MbaAdd(score, 40);
+    if (r.debugger_present && r.remote_debugger_present) {
+      score = obfuscation::MbaAdd(score, 10);
+    }
+  }
+  if (enforce_hwbp && r.hardware_breakpoints_detected) score = obfuscation::MbaAdd(score, 50);
+  if (enforce_timing && r.timing_anomaly_detected) score = obfuscation::MbaAdd(score, 30);
+  if (enforce_memhooks && r.memory_tampered) score = obfuscation::MbaAdd(score, 40);
+  if (enforce_antidump && r.memory_dump_detected) score = obfuscation::MbaAdd(score, 40);
+  if (enforce_antidump && r.memory_probing_detected) score = obfuscation::MbaAdd(score, 30);
+  if (r.hypervisor_detected) score = obfuscation::MbaAdd(score, 15);
 
   if (score > 100) score = 100;
   r.risk_score = score;

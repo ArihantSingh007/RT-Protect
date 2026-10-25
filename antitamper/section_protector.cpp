@@ -8,6 +8,7 @@
 #include <cstring>
 #include <limits>
 #include <mutex>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 #include <windows.h>
@@ -197,6 +198,14 @@ bool EncryptProtectedSectionInMemory(const tooling::PeProtectedSectionHeader& he
   bool enc_ok = Aes256GcmEncrypt(header.key, header.iv, sec_addr, header.section_size, encrypted.data(), new_tag);
   if (enc_ok) {
     std::memcpy(sec_addr, encrypted.data(), header.section_size);
+    // Update modifiable_header->tag so that subsequent decrypt operations succeed
+    auto* modifiable_header = const_cast<tooling::PeProtectedSectionHeader*>(&header);
+    DWORD hdr_old_protect = 0;
+    if (pVirtualProtect(modifiable_header, sizeof(tooling::PeProtectedSectionHeader), PAGE_READWRITE, &hdr_old_protect)) {
+      std::memcpy(modifiable_header->tag, new_tag, sizeof(modifiable_header->tag));
+      DWORD hdr_temp = 0;
+      pVirtualProtect(modifiable_header, sizeof(tooling::PeProtectedSectionHeader), hdr_old_protect, &hdr_temp);
+    }
   } else {
     OPENSSL_cleanse(encrypted.data(), encrypted.size());
     DWORD temp = 0;
@@ -218,7 +227,7 @@ bool EncryptProtectedSectionInMemory(const tooling::PeProtectedSectionHeader& he
 }
 
 namespace {
-std::atomic<int> s_scoped_section_refcount{0};
+std::unordered_map<const void*, int> s_section_refcounts;
 std::mutex s_scoped_section_mutex;
 }  // namespace
 
@@ -234,13 +243,14 @@ ScopedSectionExecution::ScopedSectionExecution(const tooling::PeProtectedSection
   }
 
   std::lock_guard<std::mutex> lock(s_scoped_section_mutex);
-  if (s_scoped_section_refcount == 0) {
+  int& refcount = s_section_refcounts[header_];
+  if (refcount == 0) {
     active_ = DecryptProtectedSectionInMemory(*header_, module_base_);
     if (active_) {
-      ++s_scoped_section_refcount;
+      ++refcount;
     }
   } else {
-    ++s_scoped_section_refcount;
+    ++refcount;
     active_ = true;
   }
 }
@@ -249,8 +259,12 @@ ScopedSectionExecution::~ScopedSectionExecution() {
   if (!header_ || !active_) return;
 
   std::lock_guard<std::mutex> lock(s_scoped_section_mutex);
-  if (s_scoped_section_refcount > 0 && --s_scoped_section_refcount == 0) {
-    EncryptProtectedSectionInMemory(*header_, module_base_);
+  auto it = s_section_refcounts.find(header_);
+  if (it != s_section_refcounts.end() && it->second > 0) {
+    if (--it->second == 0) {
+      s_section_refcounts.erase(it);
+      EncryptProtectedSectionInMemory(*header_, module_base_);
+    }
   }
 }
 
@@ -264,8 +278,12 @@ ScopedSectionExecution& ScopedSectionExecution::operator=(ScopedSectionExecution
   if (this != &other) {
     if (header_ && active_) {
       std::lock_guard<std::mutex> lock(s_scoped_section_mutex);
-      if (s_scoped_section_refcount > 0 && --s_scoped_section_refcount == 0) {
-        EncryptProtectedSectionInMemory(*header_, module_base_);
+      auto it = s_section_refcounts.find(header_);
+      if (it != s_section_refcounts.end() && it->second > 0) {
+        if (--it->second == 0) {
+          s_section_refcounts.erase(it);
+          EncryptProtectedSectionInMemory(*header_, module_base_);
+        }
       }
     }
     header_ = other.header_;

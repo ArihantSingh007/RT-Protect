@@ -272,6 +272,112 @@ class WindowsDpapiVaultProvider : public IServerSecretProvider {
     return true;
   }
 
+  std::optional<std::vector<std::uint8_t>> RetrieveSymmetricKey(
+      const std::string& key_identifier,
+      std::string* error_out) override {
+    if (!IsValidKeyIdentifier(key_identifier)) {
+      if (error_out) *error_out = "Invalid key identifier: " + key_identifier;
+      return std::nullopt;
+    }
+    fs::path vault_file = fs::path(base_dir_) / (key_identifier + ".sym.vault");
+    auto raw_container = tooling::ReadFile(vault_file.string());
+    if (!raw_container.has_value() || raw_container->size() < 12) {
+      if (error_out) *error_out = "Symmetric vault key file not found or corrupted: " + vault_file.string();
+      return std::nullopt;
+    }
+    std::uint32_t magic = 0, ver = 0, payload_len = 0;
+    std::memcpy(&magic, raw_container->data(), 4);
+    std::memcpy(&ver, raw_container->data() + 4, 4);
+    std::memcpy(&payload_len, raw_container->data() + 8, 4);
+    if (magic != kVaultMagic || ver != kVaultVersion || raw_container->size() != 12 + payload_len) {
+      if (error_out) *error_out = "Invalid vault container header or length mismatch";
+      return std::nullopt;
+    }
+
+#if defined(_WIN32)
+    DATA_BLOB in_blob{};
+    in_blob.pbData = raw_container->data() + 12;
+    in_blob.cbData = payload_len;
+
+    DATA_BLOB entropy_blob{};
+    entropy_blob.pbData = const_cast<BYTE*>(kVaultEntropy);
+    entropy_blob.cbData = sizeof(kVaultEntropy);
+
+    DATA_BLOB out_blob{};
+    if (!CryptUnprotectData(&in_blob, nullptr, &entropy_blob, nullptr, nullptr, 0, &out_blob)) {
+      if (error_out) *error_out = "CryptUnprotectData failed to decrypt symmetric key";
+      return std::nullopt;
+    }
+
+    std::vector<std::uint8_t> plain(out_blob.pbData, out_blob.pbData + out_blob.cbData);
+    LocalFree(out_blob.pbData);
+    return plain;
+#else
+    if (error_out) *error_out = "DPAPI vault requires Windows environment";
+    return std::nullopt;
+#endif
+  }
+
+  bool StoreSymmetricKey(
+      const std::string& key_identifier,
+      const std::uint8_t* key_data,
+      std::size_t key_len,
+      std::string* error_out) override {
+    if (!IsValidKeyIdentifier(key_identifier)) {
+      if (error_out) *error_out = "Invalid key identifier: " + key_identifier;
+      return false;
+    }
+    if (!key_data || key_len == 0 || key_len > 1024) {
+      if (error_out) *error_out = "Invalid symmetric key length";
+      return false;
+    }
+#if defined(_WIN32)
+    DATA_BLOB in_blob{};
+    in_blob.pbData = const_cast<BYTE*>(key_data);
+    in_blob.cbData = static_cast<DWORD>(key_len);
+
+    DATA_BLOB entropy_blob{};
+    entropy_blob.pbData = const_cast<BYTE*>(kVaultEntropy);
+    entropy_blob.cbData = sizeof(kVaultEntropy);
+
+    DATA_BLOB out_blob{};
+    if (!CryptProtectData(&in_blob, L"RTProtect Symmetric Key", &entropy_blob, nullptr, nullptr, CRYPTPROTECT_LOCAL_MACHINE, &out_blob)) {
+      if (!CryptProtectData(&in_blob, L"RTProtect Symmetric Key", &entropy_blob, nullptr, nullptr, 0, &out_blob)) {
+        if (error_out) *error_out = "CryptProtectData failed to encrypt symmetric key with OS DPAPI";
+        return false;
+      }
+    }
+
+    std::vector<std::uint8_t> container(12 + out_blob.cbData);
+    std::uint32_t magic = kVaultMagic;
+    std::uint32_t ver = kVaultVersion;
+    std::uint32_t payload_len = out_blob.cbData;
+    std::memcpy(container.data(), &magic, 4);
+    std::memcpy(container.data() + 4, &ver, 4);
+    std::memcpy(container.data() + 8, &payload_len, 4);
+    std::memcpy(container.data() + 12, out_blob.pbData, out_blob.cbData);
+    LocalFree(out_blob.pbData);
+
+    fs::path vault_file = fs::path(base_dir_) / (key_identifier + ".sym.vault");
+    fs::path tmp_file = fs::path(base_dir_) / (key_identifier + ".sym.tmp." + std::to_string(std::chrono::high_resolution_clock::now().time_since_epoch().count()));
+    if (!tooling::WriteSecretFile(tmp_file.string(), container.data(), container.size())) {
+      if (error_out) *error_out = "Failed to write temporary symmetric vault file";
+      return false;
+    }
+    std::error_code ec;
+    fs::rename(tmp_file, vault_file, ec);
+    if (ec) {
+      fs::remove(tmp_file, ec);
+      if (error_out) *error_out = "Failed to atomically rename symmetric vault file: " + ec.message();
+      return false;
+    }
+    return true;
+#else
+    if (error_out) *error_out = "DPAPI vault requires Windows environment";
+    return false;
+#endif
+  }
+
  private:
   std::string base_dir_;
 };
@@ -365,6 +471,38 @@ class EnvironmentSecretProvider : public IServerSecretProvider {
       const integrity::Ed25519KeyPair&,
       std::string* error_out) override {
     if (error_out) *error_out = "Environment secret provider is read-only at runtime; inject variables via orchestrator / secrets manager";
+    return false;
+  }
+
+  std::optional<std::vector<std::uint8_t>> RetrieveSymmetricKey(
+      const std::string& key_identifier,
+      std::string* error_out) override {
+    std::string env_name = key_identifier;
+    if (env_name.empty()) env_name = "RTPROTECT_DB_KEY";
+    const char* val = std::getenv(env_name.c_str());
+    if (!val || std::strlen(val) == 0) {
+      if (error_out) *error_out = "Environment variable not found or empty: " + env_name;
+      return std::nullopt;
+    }
+    std::string hex_str(val);
+    if (hex_str.size() % 2 != 0) {
+      if (error_out) *error_out = "Environment variable " + env_name + " must contain an even number of hex characters";
+      return std::nullopt;
+    }
+    std::vector<std::uint8_t> bytes(hex_str.size() / 2);
+    if (!HexToBytes(hex_str, bytes.data(), bytes.size())) {
+      if (error_out) *error_out = "Invalid hex formatting in environment variable: " + env_name;
+      return std::nullopt;
+    }
+    return bytes;
+  }
+
+  bool StoreSymmetricKey(
+      const std::string&,
+      const std::uint8_t*,
+      std::size_t,
+      std::string* error_out) override {
+    if (error_out) *error_out = "Environment secret provider is read-only at runtime";
     return false;
   }
 
@@ -501,6 +639,35 @@ class GuardedFileSecretProvider : public IServerSecretProvider {
     }
     return true;
   }
+
+  std::optional<std::vector<std::uint8_t>> RetrieveSymmetricKey(
+      const std::string& key_identifier,
+      std::string* error_out) override {
+    fs::path key_path(key_identifier);
+    auto kbytes = tooling::ReadFile(key_path.string());
+    if (!kbytes.has_value()) {
+      if (error_out) *error_out = "Unable to read symmetric key from " + key_path.string();
+      return std::nullopt;
+    }
+    return kbytes;
+  }
+
+  bool StoreSymmetricKey(
+      const std::string& key_identifier,
+      const std::uint8_t* key_data,
+      std::size_t key_len,
+      std::string* error_out) override {
+    if (!key_data || key_len == 0) {
+      if (error_out) *error_out = "Invalid symmetric key data";
+      return false;
+    }
+    fs::path key_path(key_identifier);
+    if (!tooling::WriteSecretFile(key_path.string(), key_data, key_len)) {
+      if (error_out) *error_out = "Failed to write symmetric key file: " + key_path.string();
+      return false;
+    }
+    return true;
+  }
 };
 
 }  // namespace
@@ -563,6 +730,20 @@ bool ProvisionSigningKeyInVault(
   }
 
   return true;
+}
+
+bool ProvisionDatabaseKeyInVault(
+    IServerSecretProvider& provider,
+    const std::string& key_identifier,
+    std::string* error_out) {
+  std::array<std::uint8_t, 32> key{};
+  if (RAND_bytes(key.data(), static_cast<int>(key.size())) != 1) {
+    if (error_out) *error_out = "Cryptographic RNG failure generating 256-bit AES database key";
+    return false;
+  }
+  bool ok = provider.StoreSymmetricKey(key_identifier, key.data(), key.size(), error_out);
+  OPENSSL_cleanse(key.data(), key.size());
+  return ok;
 }
 
 }  // namespace rtprotect::licensing

@@ -3,6 +3,7 @@
 #include "licensing/activation.h"
 #include "licensing/activation_client.h"
 #include "licensing/activation_server.h"
+#include "licensing/activation_database.h"
 #include "licensing/countermeasure_config.h"
 #include "licensing/secure_storage.h"
 #include "licensing/hardware_id.h"
@@ -673,6 +674,82 @@ MT_TEST(CountermeasureConfig_AntiRollbackAndExpiryEnforcement) {
   MT_CHECK(newer_accepted); // Accepted!
   NotifyCountermeasureUpdate(newer);
   MT_CHECK(s_hook_received_seq == 11);
+}
+
+MT_TEST(ActivationDatabase_RequireExplicitKey_RejectsHardwareFallback) {
+  std::string db_file = "test_explicit_key_enforcement.db";
+  std::filesystem::remove(db_file);
+
+  // 1. Without explicit key and require_explicit_key = true, Open must fail
+  ActivationDatabase db_strict(db_file, nullptr, /*require_explicit_key=*/true);
+  MT_CHECK(!db_strict.IsOpen());
+  MT_CHECK(db_strict.IsExplicitKeyRequired());
+
+  // 2. With explicit key and require_explicit_key = true, Open succeeds
+  auto explicit_key = rtprotect::crypto::Aes256Key::Generate();
+  ActivationDatabase db_valid(db_file, &explicit_key, /*require_explicit_key=*/true);
+  MT_CHECK(db_valid.IsOpen());
+  MT_CHECK(db_valid.Save());
+
+  // 3. Opening existing db without explicit key when require_explicit_key = true fails
+  ActivationDatabase db_reopen_fail(db_file, nullptr, /*require_explicit_key=*/true);
+  MT_CHECK(!db_reopen_fail.IsOpen());
+
+  // 4. Opening existing db with explicit key succeeds
+  ActivationDatabase db_reopen_ok(db_file, &explicit_key, /*require_explicit_key=*/true);
+  MT_CHECK(db_reopen_ok.IsOpen());
+
+  std::filesystem::remove(db_file);
+}
+
+MT_TEST(CountermeasureConfig_ValidationAndProductBinding) {
+  auto kp = MakeKeyPair();
+
+  // A. Threshold range validation: restrict must be < terminate, 0 <= r < t <= 100
+  CountermeasureConfig cfg_bad_thresh;
+  cfg_bad_thresh.risk_threshold_restrict = 80;
+  cfg_bad_thresh.risk_threshold_terminate = 50; // Inverted!
+  MT_CHECK(!SignCountermeasureConfig(cfg_bad_thresh, kp.private_key));
+
+  CountermeasureConfig cfg_neg_thresh;
+  cfg_neg_thresh.risk_threshold_restrict = -5;
+  cfg_neg_thresh.risk_threshold_terminate = 50;
+  MT_CHECK(!SignCountermeasureConfig(cfg_neg_thresh, kp.private_key));
+
+  CountermeasureConfig cfg_excess_thresh;
+  cfg_excess_thresh.risk_threshold_restrict = 50;
+  cfg_excess_thresh.risk_threshold_terminate = 101;
+  MT_CHECK(!SignCountermeasureConfig(cfg_excess_thresh, kp.private_key));
+
+  // B. List bounds validation: <= 1000 process/window names, <= 5000 hashes
+  CountermeasureConfig cfg_overflow_names;
+  cfg_overflow_names.blacklisted_process_names.resize(1001, "proc.exe");
+  cfg_overflow_names.risk_threshold_restrict = 30;
+  cfg_overflow_names.risk_threshold_terminate = 80;
+  MT_CHECK(!SignCountermeasureConfig(cfg_overflow_names, kp.private_key));
+
+  CountermeasureConfig cfg_overflow_hashes;
+  cfg_overflow_hashes.blacklisted_process_hashes.resize(5001, 0x12345678u);
+  cfg_overflow_hashes.risk_threshold_restrict = 30;
+  cfg_overflow_hashes.risk_threshold_terminate = 80;
+  MT_CHECK(!SignCountermeasureConfig(cfg_overflow_hashes, kp.private_key));
+
+  // C. Product ID binding: saving config for "prod_A" and loading for "prod_B" fails
+  CountermeasureConfig cfg_bound;
+  cfg_bound.product_id = "product_alpha";
+  cfg_bound.sequence_number = 1;
+  cfg_bound.risk_threshold_restrict = 40;
+  cfg_bound.risk_threshold_terminate = 80;
+  MT_CHECK(SignCountermeasureConfig(cfg_bound, kp.private_key));
+  MT_CHECK(SaveCountermeasureConfig("product_alpha", cfg_bound));
+
+  // Loading with different product_id must reject or fail verification
+  auto loaded_wrong = LoadCountermeasureConfig("product_beta");
+  MT_CHECK(!loaded_wrong.has_value());
+
+  auto loaded_correct = LoadCountermeasureConfig("product_alpha");
+  MT_CHECK(loaded_correct.has_value());
+  MT_CHECK(loaded_correct->product_id == "product_alpha");
 }
 
 MT_MAIN()

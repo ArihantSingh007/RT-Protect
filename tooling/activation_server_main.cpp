@@ -46,6 +46,8 @@ void PrintUsage() {
             << "  --host <h>                     Listen address (default: 127.0.0.1)\n"
             << "  --db <path>                    Database file path (default: activations.db)\n"
             << "  --db-key <hex|file>            Database AES-256 envelope encryption key (64 hex chars or 32-byte binary file)\n"
+            << "  --db-vault-id <id>             Retrieve database AES-256 key from secret vault by ID\n"
+            << "  --provision-db-vault <id>      Generate 256-bit AES database key directly into vault and exit\n"
             << "  --allow-legacy-db-plaintext    Permit loading unencrypted legacy VM roots\n"
             << "  --migrate-db                   Re-encrypt all database VM roots under configured envelope key and exit\n"
             << "  --key <path>                   Ed25519 signing private key file (unencrypted; requires --insecure-dev-only)\n"
@@ -107,6 +109,8 @@ int main(int argc, char* argv[]) {
   std::string host = "127.0.0.1";
   std::string db_path = "activations.db";
   std::string db_key_arg;
+  std::string db_vault_id;
+  std::string provision_db_vault_id;
   bool allow_legacy_db_plaintext = false;
   bool migrate_db_flag = false;
   std::string key_path;
@@ -155,6 +159,10 @@ int main(int argc, char* argv[]) {
       db_path = argv[++i];
     } else if (arg == "--db-key" && i + 1 < argc) {
       db_key_arg = argv[++i];
+    } else if (arg == "--db-vault-id" && i + 1 < argc) {
+      db_vault_id = argv[++i];
+    } else if (arg == "--provision-db-vault" && i + 1 < argc) {
+      provision_db_vault_id = argv[++i];
     } else if (arg == "--allow-legacy-db-plaintext") {
       allow_legacy_db_plaintext = true;
     } else if (arg == "--migrate-db") {
@@ -213,8 +221,80 @@ int main(int argc, char* argv[]) {
   }
   bool is_production = explicit_production || !insecure_dev_only;
 
+  if (!provision_db_vault_id.empty()) {
+    SecretProviderType ptype = SecretProviderType::kWindowsDpapiVault;
+    if (!vault_type_str.empty()) {
+      auto parsed = ParseSecretProviderType(vault_type_str);
+      if (!parsed) {
+        std::cerr << "Error: Unknown secret vault type: " << vault_type_str
+                  << " (supported: 'dpapi', 'env', 'file')\n";
+        return 1;
+      }
+      ptype = *parsed;
+    }
+    if (is_production && ptype != SecretProviderType::kWindowsDpapiVault) {
+      if (!allow_insecure_file_vault) {
+        std::cerr << "Error: Secret vault type '" << ToString(ptype)
+                  << "' is prohibited in production mode. Production servers must use 'dpapi' (Windows DPAPI hardware-backed vault).\n"
+                  << "       To override this restriction for testing/staging, pass --allow-insecure-file-vault.\n";
+        return 1;
+      }
+      std::cout << "[SECURITY WARNING] Running with " << ToString(ptype)
+                << " secret vault in production mode (--allow-insecure-file-vault override active).\n";
+    }
+    auto provider = CreateSecretProvider(ptype, vault_dir);
+    if (!provider) {
+      std::cerr << "Error: Failed to initialize secret provider " << ToString(ptype) << "\n";
+      return 1;
+    }
+    std::string err;
+    if (!ProvisionDatabaseKeyInVault(*provider, provision_db_vault_id, &err)) {
+      std::cerr << "Error: Failed to provision database key in vault: " << err << "\n";
+      return 1;
+    }
+    std::cout << "Successfully generated and provisioned 256-bit AES database key into "
+              << provider->Name() << " under ID '" << provision_db_vault_id << "'.\n";
+    return 0;
+  }
+
   std::optional<crypto::Aes256Key> db_encryption_key;
-  if (!db_key_arg.empty()) {
+  if (!db_vault_id.empty()) {
+    SecretProviderType ptype = SecretProviderType::kWindowsDpapiVault;
+    if (!vault_type_str.empty()) {
+      auto parsed = ParseSecretProviderType(vault_type_str);
+      if (!parsed) {
+        std::cerr << "Error: Unknown secret vault type: " << vault_type_str
+                  << " (supported: 'dpapi', 'env', 'file')\n";
+        return 1;
+      }
+      ptype = *parsed;
+    }
+    if (is_production && ptype != SecretProviderType::kWindowsDpapiVault) {
+      if (!allow_insecure_file_vault) {
+        std::cerr << "Error: Secret vault type '" << ToString(ptype)
+                  << "' is prohibited in production mode. Production servers must use 'dpapi' (Windows DPAPI hardware-backed vault).\n"
+                  << "       To override this restriction for testing/staging, pass --allow-insecure-file-vault.\n";
+        return 1;
+      }
+      std::cout << "[SECURITY WARNING] Running with " << ToString(ptype)
+                << " secret vault in production mode (--allow-insecure-file-vault override active).\n";
+    }
+    auto provider = CreateSecretProvider(ptype, vault_dir);
+    if (!provider) {
+      std::cerr << "Error: Failed to initialize secret provider " << ToString(ptype) << "\n";
+      return 1;
+    }
+    std::string err;
+    auto sym_bytes = provider->RetrieveSymmetricKey(db_vault_id, &err);
+    if (!sym_bytes.has_value() || sym_bytes->size() != 32) {
+      std::cerr << "Error: Failed to retrieve 32-byte database encryption key '" << db_vault_id
+                << "' from vault (" << provider->Name() << "): " << err << "\n";
+      return 1;
+    }
+    db_encryption_key = crypto::Aes256Key::FromBytes(sym_bytes->data(), sym_bytes->size());
+    std::cout << "Securely retrieved database encryption key from " << provider->Name()
+              << " (Vault ID: " << db_vault_id << ")\n";
+  } else if (!db_key_arg.empty()) {
     if (db_key_arg.size() == 64) {
       std::array<std::uint8_t, 32> raw{};
       if (HexToBytes(db_key_arg, raw.data(), 32)) {
@@ -233,7 +313,14 @@ int main(int argc, char* argv[]) {
     }
   }
 
-  ActivationDatabase db(db_path, db_encryption_key ? &(*db_encryption_key) : nullptr);
+  if (is_production && !db_encryption_key.has_value()) {
+    std::cerr << "Error: Running activation server in production mode requires an explicit database encryption key.\n"
+              << "       Supply --db-vault-id <id> (or --db-key <hex/path> for staging) to protect activation records.\n"
+              << "       Hardware-derived fallback database keys are prohibited in production.\n";
+    return 1;
+  }
+
+  ActivationDatabase db(db_path, db_encryption_key ? &(*db_encryption_key) : nullptr, /*require_explicit_key=*/is_production);
   if (allow_legacy_db_plaintext) {
     db.SetAllowLegacyPlaintext(true);
     db.Open(db_path);

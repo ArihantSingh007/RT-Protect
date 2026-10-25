@@ -384,6 +384,11 @@ bool IsValidVmType(const std::string& type_str, bool allow_void) {
 }  // namespace
 
 bool ClangAstScanner::ValidateVirtualizationEligibility(const ClangFunctionDecl& fn, std::string* out_reason) {
+  if (fn.name == "main" || fn.name == "wmain" || fn.name == "WinMain" || fn.name == "DllMain") {
+    if (out_reason) *out_reason = "Application entry-point function cannot be virtualized: " + fn.name;
+    return false;
+  }
+
   if (fn.has_unsupported_constructs) {
     if (out_reason) *out_reason = fn.unsupported_reason;
     return false;
@@ -613,6 +618,9 @@ std::vector<LexicalFunction> ExtractLexicalFunctions(const std::string& src) {
               while (ret_start > 0 && src[ret_start - 1] != ';' && src[ret_start - 1] != '}' && src[ret_start - 1] != '\n') {
                 --ret_start;
               }
+              while (ret_start < ret_end && std::isspace(static_cast<unsigned char>(src[ret_start]))) {
+                ++ret_start;
+              }
               std::string ret_type = src.substr(ret_start, ret_end - ret_start);
               while (!ret_type.empty() && std::isspace(static_cast<unsigned char>(ret_type.front()))) ret_type.erase(0, 1);
               while (!ret_type.empty() && std::isspace(static_cast<unsigned char>(ret_type.back()))) ret_type.pop_back();
@@ -622,7 +630,7 @@ std::vector<LexicalFunction> ExtractLexicalFunctions(const std::string& src) {
               lf.name = fn_name;
               lf.return_type = ret_type;
               lf.body = src.substr(body_start, cur - body_start);
-              lf.start_offset = name_start;
+              lf.start_offset = ret_start;
               lf.end_offset = cur;
               fns.push_back(lf);
 
@@ -671,6 +679,9 @@ std::vector<FunctionSuitabilityScore> ClangAstScanner::AnalyzeProjectCandidates(
   for (const auto& [file, content] : file_contents) {
     auto lexical_fns = ExtractLexicalFunctions(content);
     for (const auto& lfn : lexical_fns) {
+      if (lfn.name == "main" || lfn.name == "wmain" || lfn.name == "WinMain" || lfn.name == "DllMain") {
+        continue;
+      }
       FunctionSuitabilityScore score;
       score.name = lfn.name;
       score.file_path = file;

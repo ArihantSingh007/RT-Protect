@@ -151,7 +151,8 @@ std::optional<ActivationEventType> ParseActivationEventType(const std::string& s
   return std::nullopt;
 }
 
-ActivationDatabase::ActivationDatabase(const std::string& db_path, const crypto::Aes256Key* encryption_key) {
+ActivationDatabase::ActivationDatabase(const std::string& db_path, const crypto::Aes256Key* encryption_key, bool require_explicit_key) {
+  require_explicit_key_ = require_explicit_key;
   if (encryption_key) {
     std::array<std::uint8_t, 32> raw{};
     std::memcpy(raw.data(), encryption_key->bytes().data(), 32);
@@ -187,6 +188,12 @@ bool ActivationDatabase::Open(const std::string& db_path) {
   db_path_ = db_path;
   is_open_valid_ = false;
   last_open_error_.clear();
+
+  if (require_explicit_key_ && !encryption_key_raw_.has_value()) {
+    last_open_error_ = "Database encryption key is required (hardware fallback disabled in production mode)";
+    is_open_valid_ = false;
+    return false;
+  }
 
   if (db_path_.empty()) {
     is_open_valid_ = true;
@@ -360,6 +367,16 @@ void ActivationDatabase::SetEncryptionKey(const crypto::Aes256Key& key) {
   encryption_key_raw_ = raw;
 }
 
+void ActivationDatabase::SetRequireExplicitKey(bool require) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  require_explicit_key_ = require;
+}
+
+bool ActivationDatabase::IsExplicitKeyRequired() const {
+  std::lock_guard<std::mutex> lock(mutex_);
+  return require_explicit_key_;
+}
+
 void ActivationDatabase::EnableEnvelopeEncryption(bool enable) {
   std::lock_guard<std::mutex> lock(mutex_);
   envelope_encryption_enabled_ = enable;
@@ -368,6 +385,9 @@ void ActivationDatabase::EnableEnvelopeEncryption(bool enable) {
 std::optional<crypto::Aes256Key> ActivationDatabase::GetEffectiveEncryptionKeyLocked() const {
   if (encryption_key_raw_.has_value()) {
     return crypto::Aes256Key::FromBytes(encryption_key_raw_->data(), encryption_key_raw_->size());
+  }
+  if (require_explicit_key_) {
+    return std::nullopt; // Strictly reject hardware fallback in production mode
   }
   std::string hwid = GetLocalHardwareId();
   crypto::SecureBuffer sec_hwid(reinterpret_cast<const std::uint8_t*>(hwid.data()), hwid.size());

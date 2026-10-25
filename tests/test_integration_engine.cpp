@@ -732,6 +732,9 @@ void TestFunctionVirtualization() {
   opts.run_build = false;
 
   auto rep = ExecuteIntegration(opts);
+  if (!rep.success) {
+    std::fprintf(stderr, "AutoVirt Execution Error: %s\n", rep.error_message.c_str());
+  }
   assert(rep.success);
   assert(!rep.virtualized_functions.empty());
   assert(rep.virtualized_functions[0] == "compute_auth");
@@ -768,6 +771,19 @@ void TestFunctionVirtualization() {
   assert(cfg->find("kAuthShard") == std::string::npos);
   assert(cfg->find("kAuthMask") == std::string::npos);
   assert(cfg->find("#ifndef RTPROTECT_STRING") != std::string::npos);
+  assert(cfg->find("kCountermeasurePublicKey") != std::string::npos);
+
+  assert(transformed_main->find("std::uint64_t s_tamper_accum = 0;") != std::string::npos);
+  assert(transformed_main->find("static std::uint64_t s_tamper_accum = 0;") == std::string::npos);
+  assert(transformed_main->find("FunctionCrossLink::VerifyToken") != std::string::npos);
+
+  auto glue = ReadTextFile((test_dir / "rtprotect_runtime_glue.cpp").string());
+  assert(glue.has_value());
+  assert(glue->find("s_license_validated = false;") != std::string::npos);
+  assert(glue->find("s_validated_license = {};") != std::string::npos);
+  assert(glue->find("lic.product_id != kProductId") != std::string::npos);
+  assert(glue->find("VerifyCountermeasureConfigSignature(*active_cm, kCountermeasurePublicKey)") != std::string::npos);
+  assert(glue->find("&kCountermeasurePublicKey") != std::string::npos);
 
   // Assert that release.manifest does NOT commit rtprotect_vm_root (master secrets are not shipped in manifests)
   auto man_bytes = ReadFile((test_dir / "release.manifest").string());
@@ -932,6 +948,9 @@ void TestFunctionExtractionHandlesCommentsAndStrings() {
   opts.run_build = false;
 
   auto rep = ExecuteIntegration(opts);
+  if (!rep.success) {
+    std::fprintf(stderr, "AutoVirt Execution Error: %s\n", rep.error_message.c_str());
+  }
   assert(rep.success);
   assert(!rep.virtualized_functions.empty());
   assert(rep.virtualized_functions[0] == "complex_calc");
@@ -966,6 +985,9 @@ void TestDetailedJsonReporting() {
   opts.report_json_path = (test_dir / "report.json").string();
 
   auto rep = ExecuteIntegration(opts);
+  if (!rep.success) {
+    std::fprintf(stderr, "AutoVirt Execution Error: %s\n", rep.error_message.c_str());
+  }
   assert(rep.success);
 
   std::string json = rep.ToJson();
@@ -1605,6 +1627,56 @@ void TestEntanglementLinter() {
   std::printf("  PASSED: AST Weak Entanglement Linter flags bypassable boolean gates.\n");
 }
 
+void TestAutoVirtualizeMultiCandidateDescendingOffsets() {
+  std::printf("Running TestAutoVirtualizeMultiCandidateDescendingOffsets...\n");
+
+  fs::path test_dir = fs::current_path() / "build" / "test_autovirt_multicand";
+  CleanDir(test_dir);
+  fs::create_directories(test_dir);
+
+  std::string cmake_text = "cmake_minimum_required(VERSION 3.20)\nproject(AutoVirtMulti)\nadd_executable(autovirt main.cpp)\n";
+  WriteTextFile((test_dir / "CMakeLists.txt").string(), cmake_text);
+
+  // File with multiple candidate functions without manual annotations
+  std::string main_cpp =
+      "#include \"rtprotect_config.h\"\n"
+      "#include <cstdint>\n\n"
+      "int first_critical_algorithm(int x) {\n"
+      "    int a = x * 3;\n"
+      "    return a + 7;\n"
+      "}\n\n"
+      "int second_critical_algorithm(int y) {\n"
+      "    int b = y ^ 0x42;\n"
+      "    return b * 5;\n"
+      "}\n\n"
+      "int main() {\n"
+      "    return first_critical_algorithm(1) + second_critical_algorithm(2);\n"
+      "}\n";
+  WriteTextFile((test_dir / "main.cpp").string(), main_cpp);
+
+  IntegrationOptions opts;
+  opts.target_project_path = test_dir.string();
+  opts.use_dev_keys = true;
+  opts.run_build = false;
+  opts.auto_virtualize = true;
+  opts.virtualization_budget = 100.0;
+
+  auto rep = ExecuteIntegration(opts);
+  if (!rep.success) {
+    std::fprintf(stderr, "AutoVirt Execution Error: %s\n", rep.error_message.c_str());
+  }
+  assert(rep.success);
+  assert(rep.virtualized_functions.size() >= 2);
+
+  auto transformed = ReadTextFile((test_dir / "main.cpp").string());
+  assert(transformed.has_value());
+  assert(transformed->find("[RTProtect Bytecode-Virtualized Function: first_critical_algorithm]") != std::string::npos);
+  assert(transformed->find("[RTProtect Bytecode-Virtualized Function: second_critical_algorithm]") != std::string::npos);
+
+  CleanDir(test_dir);
+  std::printf("  PASSED: Multi-candidate auto-virtualization with descending offset processing.\n");
+}
+
 }  // namespace
 
 int main() {
@@ -1635,6 +1707,7 @@ int main() {
   TestTargetScopedSourceDiscoveryAndFailClosedVirtualization();
   TestCandidateSelectionAndSuitabilityScoring();
   TestEntanglementLinter();
+  TestAutoVirtualizeMultiCandidateDescendingOffsets();
   std::printf("ALL INTEGRATION ENGINE TESTS PASSED.\n");
   return 0;
 }

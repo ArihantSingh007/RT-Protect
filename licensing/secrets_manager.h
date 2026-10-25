@@ -45,6 +45,18 @@ class IServerSecretProvider {
       const integrity::Ed25519KeyPair& key_pair,
       std::string* error_out = nullptr) = 0;
 
+  // Retrieves an arbitrary symmetric secret (e.g. 256-bit AES database encryption key).
+  virtual std::optional<std::vector<std::uint8_t>> RetrieveSymmetricKey(
+      const std::string& key_identifier,
+      std::string* error_out = nullptr) = 0;
+
+  // Stores an arbitrary symmetric secret into the vault, encrypted at rest.
+  virtual bool StoreSymmetricKey(
+      const std::string& key_identifier,
+      const std::uint8_t* key_data,
+      std::size_t key_len,
+      std::string* error_out = nullptr) = 0;
+
   // Deletes a key from the vault.
   virtual bool DeleteSigningKeyPair(
       const std::string& key_identifier,
@@ -64,6 +76,13 @@ bool ProvisionSigningKeyInVault(
     const std::string& key_identifier,
     const std::string& export_pubkey_path,
     integrity::Ed25519PublicKey* out_pubkey = nullptr,
+    std::string* error_out = nullptr);
+
+// Helper to provision a new 256-bit AES database encryption key directly into the vault.
+// Generates a cryptographically strong 32-byte random key and stores it encrypted at rest.
+bool ProvisionDatabaseKeyInVault(
+    IServerSecretProvider& provider,
+    const std::string& key_identifier,
     std::string* error_out = nullptr);
 
 }  // namespace rtprotect::licensing

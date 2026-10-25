@@ -143,9 +143,11 @@ void PrintUsage() {
       "      --manifest-pubkey <file>          External Ed25519 public key for manifest verification\n"
       "      --license-pubkey <file>           External Ed25519 public key for license verification\n"
       "      --activation-pubkey <file>        External Ed25519 public key for activation token verification\n"
+      "      --countermeasure-pubkey <file>    External Ed25519 public key for countermeasure config verification\n"
       "      --release-sequence <num>          Monotonically increasing minimum release sequence (default: 1)\n"
       "      --sign-manifest-key <file>        Vendor private key for manifest signing\n"
       "      --sign-license-key <file>         Vendor private key for license signing\n"
+      "      --sign-countermeasure-key <file>  Vendor private key for countermeasure config signing\n"
       "      --license-file <file>             Deploy authorized vendor client.license\n"
       "      --staging                         Stage project instrumentation without signing\n"
       "      --backup-dir <dir>                Custom location for project backup\n"
@@ -502,6 +504,8 @@ int CmdIntegrate(int argc, char** argv) {
       options.license_pubkey_path = argv[++i];
     } else if (arg == "--activation-pubkey" && i + 1 < argc) {
       options.activation_pubkey_path = argv[++i];
+    } else if (arg == "--countermeasure-pubkey" && i + 1 < argc) {
+      options.countermeasure_pubkey_path = argv[++i];
     } else if (arg == "--release-sequence" && i + 1 < argc) {
       std::string seq_str = argv[++i];
       char* end = nullptr;
@@ -522,7 +526,14 @@ int CmdIntegrate(int argc, char** argv) {
       options.sign_license_key_path = argv[++i];
       if (!options.use_dev_keys) {
         std::fprintf(stderr, "error: Passing vendor private signing keys (--sign-license-key) to customer build integration is prohibited in production mode.\n"
-                             "       Integrate using public verification keys (--manifest-pubkey, --license-pubkey, --activation-pubkey), and sign release artifacts with 'rtprotect-tool sign-release' in an isolated signing environment.\n");
+                             "       Integrate using public verification keys (--manifest-pubkey, --license-pubkey, --activation-pubkey, --countermeasure-pubkey), and sign release artifacts with 'rtprotect-tool sign-release' in an isolated signing environment.\n");
+        return 1;
+      }
+    } else if (arg == "--sign-countermeasure-key" && i + 1 < argc) {
+      options.sign_countermeasure_key_path = argv[++i];
+      if (!options.use_dev_keys) {
+        std::fprintf(stderr, "error: Passing vendor private signing keys (--sign-countermeasure-key) to customer build integration is prohibited in production mode.\n"
+                             "       Integrate using public verification keys (--manifest-pubkey, --license-pubkey, --activation-pubkey, --countermeasure-pubkey), and sign release artifacts with 'rtprotect-tool sign-release' in an isolated signing environment.\n");
         return 1;
       }
     } else if (arg == "--license-file" && i + 1 < argc) {

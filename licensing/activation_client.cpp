@@ -565,7 +565,8 @@ std::optional<ActivationToken> RequestOnlineActivation(
     const integrity::Ed25519PublicKey& vendor_pubkey,
     std::string* error_out,
     const std::string& activation_credential,
-    std::uint64_t client_timestamp) {
+    std::uint64_t client_timestamp,
+    const integrity::Ed25519PublicKey* cm_pubkey) {
   std::string hwid = GetLocalHardwareId();
 
   if (client_timestamp == 0) {
@@ -669,13 +670,17 @@ std::optional<ActivationToken> RequestOnlineActivation(
       std::vector<std::uint8_t> cm_raw(cm_hex.size() / 2);
       if (HexToBytes(cm_hex, cm_raw.data(), cm_raw.size())) {
         auto cm_cfg = DeserializeCountermeasureConfig(cm_raw.data(), cm_raw.size());
-        if (cm_cfg.has_value() && VerifyCountermeasureConfigSignature(*cm_cfg, vendor_pubkey)) {
-          std::uint64_t current_time = static_cast<std::uint64_t>(std::time(nullptr));
-          if (!cm_cfg->IsExpired(current_time)) {
-            auto cur_cfg = LoadCountermeasureConfig(product_id);
-            if (!cur_cfg.has_value() || cm_cfg->sequence_number > cur_cfg->sequence_number) {
-              SaveCountermeasureConfig(product_id, *cm_cfg);
-              NotifyCountermeasureUpdate(*cm_cfg);
+        const auto& effective_cm_key = cm_pubkey ? *cm_pubkey : vendor_pubkey;
+        if (cm_cfg.has_value() && VerifyCountermeasureConfigSignature(*cm_cfg, effective_cm_key)) {
+          if (cm_cfg->product_id.empty() || cm_cfg->product_id == product_id) {
+            std::uint64_t current_time = client_timestamp != 0 ? client_timestamp : static_cast<std::uint64_t>(std::time(nullptr));
+            if (!cm_cfg->IsExpired(current_time)) {
+              auto cur_cfg = LoadCountermeasureConfig(product_id);
+              if (!cur_cfg.has_value() || cm_cfg->sequence_number > cur_cfg->sequence_number) {
+                if (SaveCountermeasureConfig(product_id, *cm_cfg)) {
+                  NotifyCountermeasureUpdate(*cm_cfg);
+                }
+              }
             }
           }
         }
@@ -690,7 +695,9 @@ std::optional<ActivationToken> RequestOnlineRenewal(
     const std::string& server_url,
     const ActivationToken& current_token,
     const integrity::Ed25519PublicKey& vendor_pubkey,
-    std::string* error_out) {
+    std::string* error_out,
+    const std::string& product_id,
+    const integrity::Ed25519PublicKey* cm_pubkey) {
   std::string hwid = GetLocalHardwareId();
 
   std::array<std::uint8_t, 32> client_nonce{};
@@ -776,8 +783,10 @@ std::optional<ActivationToken> RequestOnlineRenewal(
     return std::nullopt;
   }
 
+  std::string effective_pid = !product_id.empty() ? product_id : renewed.license_id;
+
   // Anchor renewed server timestamp for monotonic trusted time enforcement
-  TrustedTime::AnchorServerTime(renewed.license_id, renewed.issued_at);
+  TrustedTime::AnchorServerTime(effective_pid, renewed.issued_at);
 
   // Dynamic Countermeasure Updates (Continuous Response Channel)
   if (obj.contains("countermeasure_config")) {
@@ -786,13 +795,17 @@ std::optional<ActivationToken> RequestOnlineRenewal(
       std::vector<std::uint8_t> cm_raw(cm_hex.size() / 2);
       if (HexToBytes(cm_hex, cm_raw.data(), cm_raw.size())) {
         auto cm_cfg = DeserializeCountermeasureConfig(cm_raw.data(), cm_raw.size());
-        if (cm_cfg.has_value() && VerifyCountermeasureConfigSignature(*cm_cfg, vendor_pubkey)) {
-          std::uint64_t current_time = static_cast<std::uint64_t>(std::time(nullptr));
-          if (!cm_cfg->IsExpired(current_time)) {
-            auto cur_cfg = LoadCountermeasureConfig(renewed.license_id);
-            if (!cur_cfg.has_value() || cm_cfg->sequence_number > cur_cfg->sequence_number) {
-              SaveCountermeasureConfig(renewed.license_id, *cm_cfg);
-              NotifyCountermeasureUpdate(*cm_cfg);
+        const auto& effective_cm_key = cm_pubkey ? *cm_pubkey : vendor_pubkey;
+        if (cm_cfg.has_value() && VerifyCountermeasureConfigSignature(*cm_cfg, effective_cm_key)) {
+          if (cm_cfg->product_id.empty() || cm_cfg->product_id == effective_pid) {
+            std::uint64_t current_time = static_cast<std::uint64_t>(std::time(nullptr));
+            if (!cm_cfg->IsExpired(current_time)) {
+              auto cur_cfg = LoadCountermeasureConfig(effective_pid);
+              if (!cur_cfg.has_value() || cm_cfg->sequence_number > cur_cfg->sequence_number) {
+                if (SaveCountermeasureConfig(effective_pid, *cm_cfg)) {
+                  NotifyCountermeasureUpdate(*cm_cfg);
+                }
+              }
             }
           }
         }

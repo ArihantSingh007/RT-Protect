@@ -18,14 +18,19 @@ RTProtect vendors pre-built OpenSSL binaries and headers under `third_party/open
 
 ### Upstream Release Lifecycle & 3.5.x LTS Transition Roadmap
 Under OpenSSL's official release lifecycle policy:
-- **Standard Releases (such as OpenSSL 3.4.x):** Supported for one year from release (upstream EOL scheduled for late 2025).
-- **Long Term Support (LTS) Releases:** Supported for five years from release. Currently, OpenSSL 3.0.x is the active LTS release (supported until September 2026).
-- **Planned Upstream Transition Path:** OpenSSL 3.5.x is designated as the next upstream Long Term Support (LTS) series. RTProtect's architecture maintains full API and ABI compatibility with OpenSSL 3.x EVP interfaces.
-- **Migration Protocol:**
-  1. RTProtect continuously applies backported security advisories and point releases (e.g. 3.4.1) during the 3.4.x lifecycle.
-  2. As OpenSSL 3.5.0 LTS reaches General Availability (GA), RTProtect will execute the reproducible build pipeline (§3) to recompile native x64 Windows libraries with Control Flow Guard (`/GUARD:CF`) and ASLR/DEP flags enabled.
-  3. All cryptographic and integration test suites will validate the 3.5.x LTS baseline under both MSVC 2022 and MinGW-w64 before cutting a major release.
-  4. Enterprise customers requiring immediate long-term certification may link against OpenSSL 3.0.x LTS binaries without modifying any RTProtect source code.
+- **Active Release:** OpenSSL 3.4.x (Standard Release). Initial GA October 2024; upstream End-of-Life (EOL) scheduled for October 2025 (1-year standard lifecycle).
+- **Previous LTS Release:** OpenSSL 3.0.x LTS. Supported through **September 7, 2026** (5-year lifecycle from September 2021).
+- **Target Long-Term Baseline:** OpenSSL 3.5.x is designated as the next official Long Term Support (LTS) series (targeted GA Q2 2025, supported for 5 years through **2030**).
+- **Transition Architecture & Compatibility:**
+  - RTProtect uses exclusively standard OpenSSL 3.x EVP and KDF interfaces (`EVP_PKEY_ED25519`, `EVP_aes_256_gcm`, `EVP_KDF_HKDF`, `RAND_bytes`).
+  - No deprecated OpenSSL 1.1.1 or legacy internal struct accesses exist in the codebase.
+  - Forward ABI and API compatibility is guaranteed across all OpenSSL 3.x minor releases.
+- **Migration Protocol for OpenSSL 3.5.x LTS:**
+  1. **Continuous Point Release Tracking:** Apply upstream patch updates (3.4.1+) during the active 3.4.x branch lifecycle.
+  2. **Pre-GA Validation:** Monitor upstream 3.5-alpha/beta tags; perform test builds against the RTProtect cryptographic test suite in CI.
+  3. **GA LTS Adoption:** Upon OpenSSL 3.5.0 GA release, trigger the reproducible build pipeline (§3) with full Control Flow Guard (`/GUARD:CF`), ASLR, and DEP hardening flags enabled.
+  4. **Multi-Toolchain Regression:** Run full test suites under MSVC v143 (Release x64) and MinGW-w64 GCC 15.2.0 before promoting to production distribution.
+  5. **Enterprise OpenSSL 3.0 LTS Fallback:** Enterprise integrators whose compliance baselines mandate an existing certified LTS library may build RTProtect against OpenSSL 3.0.x LTS headers and libraries without code modification.
 
 ### Core Cryptographic Primitives Used by RTProtect
 - **Asymmetric Signature & Verification:** Ed25519 (`EVP_PKEY_ED25519`) for release manifests, client license tokens, and online activation tickets.

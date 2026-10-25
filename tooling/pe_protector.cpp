@@ -46,6 +46,7 @@ std::size_t RvaToFileOffset(const IMAGE_NT_HEADERS64* nt,
     if (rva >= sec_rva && static_cast<std::uint64_t>(rva) < static_cast<std::uint64_t>(sec_rva) + sec_vsize) {
       std::uint32_t offset_in_sec = rva - sec_rva;
       if (static_cast<std::size_t>(offset_in_sec) + required_bytes > sec_vsize) return 0;
+      if (static_cast<std::size_t>(offset_in_sec) + required_bytes > sec.SizeOfRawData) return 0;
       if (sec.PointerToRawData > image_size) return 0;
       if (static_cast<std::size_t>(sec.PointerToRawData) + offset_in_sec > image_size - required_bytes) return 0;
       return static_cast<std::size_t>(sec.PointerToRawData) + offset_in_sec;
@@ -215,7 +216,7 @@ bool PeProtector::ProtectMemory(std::vector<std::uint8_t>& pe_image,
 
   // Import table obfuscation with full bounds validation
   std::size_t obfuscated_count = 0;
-  if (options.obfuscate_imports) {
+  if (options.obfuscate_imports && nt->OptionalHeader.NumberOfRvaAndSizes > IMAGE_DIRECTORY_ENTRY_IMPORT) {
     const auto& import_dir = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
     if (import_dir.VirtualAddress != 0 && import_dir.Size >= sizeof(IMAGE_IMPORT_DESCRIPTOR)) {
       std::size_t import_file_offset = RvaToFileOffset(nt, sections, import_dir.VirtualAddress, import_dir.Size, pe_image.size());

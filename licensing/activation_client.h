@@ -34,7 +34,8 @@ std::optional<ActivationToken> RequestOnlineActivation(
     const integrity::Ed25519PublicKey& vendor_pubkey,
     std::string* error_out = nullptr,
     const std::string& activation_credential = "",
-    std::uint64_t client_timestamp = 0);
+    std::uint64_t client_timestamp = 0,
+    const integrity::Ed25519PublicKey* cm_pubkey = nullptr);
 
 // Requests online token lease renewal from the vendor authority server.
 // Returns renewed token with bumped expiration and identical vm_root.
@@ -42,7 +43,9 @@ std::optional<ActivationToken> RequestOnlineRenewal(
     const std::string& server_url,
     const ActivationToken& current_token,
     const integrity::Ed25519PublicKey& vendor_pubkey,
-    std::string* error_out = nullptr);
+    std::string* error_out = nullptr,
+    const std::string& product_id = "",
+    const integrity::Ed25519PublicKey* cm_pubkey = nullptr);
 
 // Requests voluntary seat deactivation, freeing up the seat on the server.
 bool RequestOnlineDeactivation(

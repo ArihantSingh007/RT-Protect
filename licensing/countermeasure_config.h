@@ -21,6 +21,7 @@ inline constexpr std::uint32_t kCountermeasureSchemaVersion = 1;
 
 struct CountermeasureConfig {
   std::uint32_t schema_version = kCountermeasureSchemaVersion;
+  std::string product_id;                 // Bound product identifier
   std::uint64_t sequence_number = 1;      // Monotonic sequence number (anti-rollback)
   std::uint64_t issued_at = 0;            // Unix timestamp seconds
   std::uint64_t expires_at = 0;           // Unix timestamp seconds (0 = perpetual)
@@ -43,7 +44,7 @@ struct CountermeasureConfig {
   integrity::Ed25519Signature signature{};
 
   bool IsExpired(std::uint64_t current_time) const {
-    return expires_at != 0 && expires_at < current_time;
+    return expires_at != 0 && current_time >= expires_at;
   }
 };
 

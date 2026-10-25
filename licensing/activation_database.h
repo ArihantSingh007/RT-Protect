@@ -80,7 +80,7 @@ struct SeatReservationResult {
 class ActivationDatabase {
  public:
   ActivationDatabase() = default;
-  explicit ActivationDatabase(const std::string& db_path, const crypto::Aes256Key* encryption_key = nullptr);
+  explicit ActivationDatabase(const std::string& db_path, const crypto::Aes256Key* encryption_key = nullptr, bool require_explicit_key = false);
 
   // Opens and loads database from file; creates empty database if file doesn't exist
   bool Open(const std::string& db_path);
@@ -95,6 +95,8 @@ class ActivationDatabase {
 
   // Envelope encryption for sensitive fields (vm_root)
   void SetEncryptionKey(const crypto::Aes256Key& key);
+  void SetRequireExplicitKey(bool require);
+  bool IsExplicitKeyRequired() const;
   void EnableEnvelopeEncryption(bool enable = true);
   void SetAllowLegacyPlaintext(bool allow);
   bool MigrateToEnvelopeEncryption();
@@ -173,6 +175,7 @@ class ActivationDatabase {
   std::unordered_map<std::string, std::uint64_t> used_nonces_;                 // nonce_hex -> expires_at
   std::vector<ActivationEvent> events_;                                        // audit event log
   std::optional<std::array<std::uint8_t, 32>> encryption_key_raw_;
+  bool require_explicit_key_ = false;
   bool envelope_encryption_enabled_ = true;
   bool allow_legacy_plaintext_ = false;
   bool is_open_valid_ = true;

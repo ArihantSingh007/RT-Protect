@@ -63,12 +63,18 @@ RiskAssessment AssessFastEnvironmentRisk();
 bool EnforceRiskPolicy(RiskAction action, const RiskAssessment& assessment);
 
 // Dynamic Countermeasure Configuration Updates (Continuous Response Channel):
-// Updates active process blacklists, window titles, and risk thresholds at runtime.
+// Updates active process blacklists, window titles, driver/process hashes, and risk thresholds at runtime.
 void ApplyCountermeasures(const std::vector<std::string>& blacklisted_procs,
                           const std::vector<std::string>& blacklisted_windows,
                           int restrict_thresh = 50,
                           int terminate_thresh = 80,
-                          std::uint64_t expires_at = 0);
+                          std::uint64_t expires_at = 0,
+                          const std::vector<std::uint32_t>& blacklisted_proc_hashes = {},
+                          const std::vector<std::uint32_t>& blacklisted_driver_hashes = {},
+                          bool enforce_hwbp = true,
+                          bool enforce_timing = true,
+                          bool enforce_memhooks = true,
+                          bool enforce_antidump = true);
 void ResetCountermeasuresForTesting();
 
 // Derives a cryptographic salt bound to the risk assessment state.
