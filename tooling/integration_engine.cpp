@@ -518,7 +518,7 @@ bool TransformSourceFile(const fs::path& file_path,
     if (is_void) {
       rep_ss << "    return;\n";
     } else {
-      rep_ss << "    return static_cast<" << ret_type << ">(s_res.value - static_cast<std::int64_t>(s_delta));\n";
+      rep_ss << "    return static_cast<" << ret_type << ">(rtprotect::obfuscation::MbaSub<std::int64_t>(s_res.value, static_cast<std::int64_t>(s_delta)));\n";
     }
     rep_ss << "}";
 
@@ -563,6 +563,7 @@ bool TransformSourceFile(const fs::path& file_path,
         "#include \"bytecode_vm/serialize.h\"",
         "#include \"crypto/aead.h\"",
         "#include \"antitamper/risk_policy.h\"",
+        "#include \"obfuscation/control_flow.h\"",
         "#include \"obfuscation/obfuscated_string.h\"",
         "#include <cstdint>",
         "#include <cstring>",
@@ -1342,6 +1343,7 @@ IntegrationReport ExecuteIntegration(const IntegrationOptions& options) {
     ss << "#include \"integrity/sha256.h\"\n";
     ss << "#include \"antitamper/risk_policy.h\"\n";
     ss << "#include \"antitamper/anti_debug.h\"\n";
+    ss << "#include \"obfuscation/control_flow.h\"\n";
     ss << "#include \"tooling/file_io.h\"\n\n";
     ss << "#include <ctime>\n";
     ss << "#include <cstdio>\n";
@@ -1377,17 +1379,38 @@ IntegrationReport ExecuteIntegration(const IntegrationOptions& options) {
     ss << "}\n\n";
 
     ss << "std::optional<rtprotect::crypto::Aes256Key> GetFunctionMasterKey(const std::uint8_t* salt, std::size_t salt_len) {\n";
+    ss << "  using namespace rtprotect::obfuscation;\n";
     ss << "  if (!s_runtime_root_initialized) return std::nullopt;\n";
+    ss << "  std::optional<rtprotect::crypto::Aes256Key> derived_key = std::nullopt;\n";
     ss << "  rtprotect::crypto::SecureBuffer raw_seed(32);\n";
-    ss << "  std::memcpy(raw_seed.data(), s_runtime_manifest_vm_root.data(), 32);\n";
-    ss << "  std::vector<std::uint8_t> hkdf_salt(kManifestPublicKey.begin(), kManifestPublicKey.end());\n";
-    ss << "  if (salt && salt_len > 0) {\n";
-    ss << "    hkdf_salt.insert(hkdf_salt.end(), salt, salt + salt_len);\n";
-    ss << "  }\n";
-    ss << "  std::string info = std::string(\"rtprotect/virtualize/\") + kProductId;\n";
-    ss << "  auto derived = rtprotect::crypto::Hkdf::DeriveKey(raw_seed, hkdf_salt, info, rtprotect::crypto::kAes256KeyLen);\n";
-    ss << "  if (!derived.has_value()) return std::nullopt;\n";
-    ss << "  return rtprotect::crypto::Aes256Key::FromBytes(derived->data(), derived->size());\n";
+    ss << "  std::vector<std::uint8_t> hkdf_salt;\n";
+    ss << "  std::string info;\n\n";
+    ss << "  RTPROTECT_FLATTEN_BEGIN(st, 0x10)\n";
+    ss << "    RTPROTECT_FLATTEN_CASE(0x10) {\n";
+    ss << "      if (OpaquePredicateTrue(static_cast<std::uint64_t>(salt_len) ^ 0x1337ULL)) {\n";
+    ss << "        RTPROTECT_FLATTEN_TRANSITION(st, 0x20);\n";
+    ss << "      } else {\n";
+    ss << "        RTPROTECT_FLATTEN_EXIT();\n";
+    ss << "      }\n";
+    ss << "    }\n";
+    ss << "    RTPROTECT_FLATTEN_CASE(0x20) {\n";
+    ss << "      std::memcpy(raw_seed.data(), s_runtime_manifest_vm_root.data(), 32);\n";
+    ss << "      hkdf_salt.assign(kManifestPublicKey.begin(), kManifestPublicKey.end());\n";
+    ss << "      if (salt && salt_len > 0) {\n";
+    ss << "        hkdf_salt.insert(hkdf_salt.end(), salt, salt + salt_len);\n";
+    ss << "      }\n";
+    ss << "      info = std::string(\"rtprotect/virtualize/\") + kProductId;\n";
+    ss << "      RTPROTECT_FLATTEN_TRANSITION(st, 0x30);\n";
+    ss << "    }\n";
+    ss << "    RTPROTECT_FLATTEN_CASE(0x30) {\n";
+    ss << "      auto derived = rtprotect::crypto::Hkdf::DeriveKey(raw_seed, hkdf_salt, info, rtprotect::crypto::kAes256KeyLen);\n";
+    ss << "      if (derived.has_value()) {\n";
+    ss << "        derived_key = rtprotect::crypto::Aes256Key::FromBytes(derived->data(), derived->size());\n";
+    ss << "      }\n";
+    ss << "      RTPROTECT_FLATTEN_EXIT();\n";
+    ss << "    }\n";
+    ss << "  RTPROTECT_FLATTEN_END();\n\n";
+    ss << "  return derived_key;\n";
     ss << "}\n\n";
 
     ss << "namespace {\n\n";

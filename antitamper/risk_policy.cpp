@@ -10,6 +10,7 @@
 #include "bytecode_vm/vm.h"
 #include "crypto/kdf.h"
 #include "integrity/sha256.h"
+#include "obfuscation/control_flow.h"
 
 #include <cctype>
 #include <cstdlib>
@@ -123,18 +124,18 @@ RiskAssessment AssessEnvironmentRisk() {
 
   int score = 0;
   if (r.debugger_present || r.remote_debugger_present) {
-    score += 40;
+    score = obfuscation::MbaAdd(score, 40);
     // Small corroboration bump if both distinct indicators hit
     if (r.debugger_present && r.remote_debugger_present) {
-      score += 10;
+      score = obfuscation::MbaAdd(score, 10);
     }
   }
-  if (r.hardware_breakpoints_detected) score += 50;
-  if (r.timing_anomaly_detected) score += 30;
-  if (r.memory_tampered) score += 40;
-  if (r.memory_dump_detected) score += 40;
-  if (r.memory_probing_detected) score += 30;
-  if (r.hypervisor_detected) score += 15; // Low risk by itself to avoid penalizing legitimate VMs
+  if (r.hardware_breakpoints_detected) score = obfuscation::MbaAdd(score, 50);
+  if (r.timing_anomaly_detected) score = obfuscation::MbaAdd(score, 30);
+  if (r.memory_tampered) score = obfuscation::MbaAdd(score, 40);
+  if (r.memory_dump_detected) score = obfuscation::MbaAdd(score, 40);
+  if (r.memory_probing_detected) score = obfuscation::MbaAdd(score, 30);
+  if (r.hypervisor_detected) score = obfuscation::MbaAdd(score, 15); // Low risk by itself to avoid penalizing legitimate VMs
 
   {
     std::lock_guard<std::mutex> lock(s_cm_mutex);
@@ -148,11 +149,11 @@ RiskAssessment AssessEnvironmentRisk() {
     }
     if (!s_active_blacklisted_procs.empty() && CheckBlacklistedProcesses(s_active_blacklisted_procs)) {
       r.blacklisted_process_detected = true;
-      score += 50;
+      score = obfuscation::MbaAdd(score, 50);
     }
     if (!s_active_blacklisted_windows.empty() && CheckBlacklistedWindows(s_active_blacklisted_windows)) {
       r.blacklisted_window_detected = true;
-      score += 50;
+      score = obfuscation::MbaAdd(score, 50);
     }
   }
 
@@ -177,17 +178,17 @@ RiskAssessment AssessFastEnvironmentRisk() {
 
   int score = 0;
   if (r.debugger_present || r.remote_debugger_present) {
-    score += 40;
+    score = obfuscation::MbaAdd(score, 40);
     if (r.debugger_present && r.remote_debugger_present) {
-      score += 10;
+      score = obfuscation::MbaAdd(score, 10);
     }
   }
-  if (r.hardware_breakpoints_detected) score += 50;
-  if (r.timing_anomaly_detected) score += 30;
-  if (r.memory_tampered) score += 40;
-  if (r.memory_dump_detected) score += 40;
-  if (r.memory_probing_detected) score += 30;
-  if (r.hypervisor_detected) score += 15;
+  if (r.hardware_breakpoints_detected) score = obfuscation::MbaAdd(score, 50);
+  if (r.timing_anomaly_detected) score = obfuscation::MbaAdd(score, 30);
+  if (r.memory_tampered) score = obfuscation::MbaAdd(score, 40);
+  if (r.memory_dump_detected) score = obfuscation::MbaAdd(score, 40);
+  if (r.memory_probing_detected) score = obfuscation::MbaAdd(score, 30);
+  if (r.hypervisor_detected) score = obfuscation::MbaAdd(score, 15);
 
   {
     std::lock_guard<std::mutex> lock(s_cm_mutex);
@@ -201,11 +202,11 @@ RiskAssessment AssessFastEnvironmentRisk() {
     }
     if (!s_active_blacklisted_procs.empty() && CheckBlacklistedProcesses(s_active_blacklisted_procs)) {
       r.blacklisted_process_detected = true;
-      score += 50;
+      score = obfuscation::MbaAdd(score, 50);
     }
     if (!s_active_blacklisted_windows.empty() && CheckBlacklistedWindows(s_active_blacklisted_windows)) {
       r.blacklisted_window_detected = true;
-      score += 50;
+      score = obfuscation::MbaAdd(score, 50);
     }
   }
 
@@ -329,23 +330,190 @@ std::uint64_t FoldTamperStateMask(const RiskAssessment& risk, std::uint64_t salt
 
 namespace {
 
-std::int64_t NativeProbePebFn(std::int64_t, void*) {
-  return CheckDebuggerPresent() ? 1 : 0;
+std::int64_t NativeProbePebFn(std::int64_t arg, void* /*user_data*/) {
+  using namespace rtprotect::obfuscation;
+  std::int64_t res = 0;
+  RTPROTECT_FLATTEN_BEGIN(st, 0x11)
+    RTPROTECT_FLATTEN_CASE(0x11) {
+      if (OpaquePredicateTrue(static_cast<std::uint32_t>(arg ^ 0x3344))) {
+        RTPROTECT_FLATTEN_TRANSITION(st, 0x24);
+      } else {
+        res = -1;
+        RTPROTECT_FLATTEN_EXIT();
+      }
+    }
+    RTPROTECT_FLATTEN_CASE(0x24) {
+      bool detected = CheckDebuggerPresent();
+      res = detected ? 1 : 0;
+      RTPROTECT_FLATTEN_TRANSITION(st, 0x39);
+    }
+    RTPROTECT_FLATTEN_CASE(0x39) {
+      if (MbaEqual(res, static_cast<std::int64_t>(1))) {
+        res = MbaAdd<std::int64_t>(0, 1);
+      }
+      RTPROTECT_FLATTEN_TRANSITION(st, 0x4D);
+    }
+    RTPROTECT_FLATTEN_CASE(0x4D) {
+      RTPROTECT_FLATTEN_EXIT();
+    }
+  RTPROTECT_FLATTEN_END();
+  return res;
 }
-std::int64_t NativeProbeDebugPortFn(std::int64_t, void*) {
-  return CheckRemoteDebugger() ? 1 : 0;
+
+std::int64_t NativeProbeDebugPortFn(std::int64_t arg, void* /*user_data*/) {
+  using namespace rtprotect::obfuscation;
+  std::int64_t res = 0;
+  RTPROTECT_FLATTEN_BEGIN(st, 0x07)
+    RTPROTECT_FLATTEN_CASE(0x07) {
+      if (OpaquePredicateTrue(static_cast<std::uint64_t>(arg) + 0x55AA1122ULL)) {
+        RTPROTECT_FLATTEN_TRANSITION(st, 0x1C);
+      } else {
+        res = -1;
+        RTPROTECT_FLATTEN_EXIT();
+      }
+    }
+    RTPROTECT_FLATTEN_CASE(0x1C) {
+      bool detected = CheckRemoteDebugger();
+      res = detected ? 1 : 0;
+      RTPROTECT_FLATTEN_TRANSITION(st, 0x2E);
+    }
+    RTPROTECT_FLATTEN_CASE(0x2E) {
+      std::int64_t one = MbaSub<std::int64_t>(2, 1);
+      if (res != 0) {
+        res = one;
+      }
+      RTPROTECT_FLATTEN_TRANSITION(st, 0x51);
+    }
+    RTPROTECT_FLATTEN_CASE(0x51) {
+      RTPROTECT_FLATTEN_EXIT();
+    }
+  RTPROTECT_FLATTEN_END();
+  return res;
 }
-std::int64_t NativeProbeHwBreakpointsFn(std::int64_t, void*) {
-  return IsHardwareBreakpointDetected() ? 1 : 0;
+
+std::int64_t NativeProbeHwBreakpointsFn(std::int64_t arg, void* /*user_data*/) {
+  using namespace rtprotect::obfuscation;
+  std::int64_t res = 0;
+  RTPROTECT_FLATTEN_BEGIN(st, 0x14)
+    RTPROTECT_FLATTEN_CASE(0x14) {
+      if (OpaquePredicateEqual(static_cast<std::int32_t>(arg), 0x7F)) {
+        RTPROTECT_FLATTEN_TRANSITION(st, 0x28);
+      } else {
+        res = -1;
+        RTPROTECT_FLATTEN_EXIT();
+      }
+    }
+    RTPROTECT_FLATTEN_CASE(0x28) {
+      bool detected = IsHardwareBreakpointDetected();
+      res = detected ? 1 : 0;
+      RTPROTECT_FLATTEN_TRANSITION(st, 0x42);
+    }
+    RTPROTECT_FLATTEN_CASE(0x42) {
+      if (MbaEqual(res, static_cast<std::int64_t>(0))) {
+        res = 0;
+      } else {
+        res = MbaXor<std::int64_t>(res, 0);
+      }
+      RTPROTECT_FLATTEN_TRANSITION(st, 0x66);
+    }
+    RTPROTECT_FLATTEN_CASE(0x66) {
+      RTPROTECT_FLATTEN_EXIT();
+    }
+  RTPROTECT_FLATTEN_END();
+  return res;
 }
-std::int64_t NativeProbeTimingFn(std::int64_t, void*) {
-  return CheckExecutionTimingAnomaly() ? 1 : 0;
+
+std::int64_t NativeProbeTimingFn(std::int64_t arg, void* /*user_data*/) {
+  using namespace rtprotect::obfuscation;
+  std::int64_t res = 0;
+  RTPROTECT_FLATTEN_BEGIN(st, 0x09)
+    RTPROTECT_FLATTEN_CASE(0x09) {
+      if (OpaquePredicateTrue(static_cast<std::uint32_t>(arg ^ 0x9B97))) {
+        RTPROTECT_FLATTEN_TRANSITION(st, 0x33);
+      } else {
+        res = -1;
+        RTPROTECT_FLATTEN_EXIT();
+      }
+    }
+    RTPROTECT_FLATTEN_CASE(0x33) {
+      bool detected = CheckExecutionTimingAnomaly();
+      res = detected ? 1 : 0;
+      RTPROTECT_FLATTEN_TRANSITION(st, 0x55);
+    }
+    RTPROTECT_FLATTEN_CASE(0x55) {
+      if (res != 0) {
+        res = MbaAdd<std::int64_t>(0, 1);
+      }
+      RTPROTECT_FLATTEN_TRANSITION(st, 0x7A);
+    }
+    RTPROTECT_FLATTEN_CASE(0x7A) {
+      RTPROTECT_FLATTEN_EXIT();
+    }
+  RTPROTECT_FLATTEN_END();
+  return res;
 }
-std::int64_t NativeProbeMemoryHooksFn(std::int64_t, void*) {
-  return CheckMemoryTampered() ? 1 : 0;
+
+std::int64_t NativeProbeMemoryHooksFn(std::int64_t arg, void* /*user_data*/) {
+  using namespace rtprotect::obfuscation;
+  std::int64_t res = 0;
+  RTPROTECT_FLATTEN_BEGIN(st, 0x15)
+    RTPROTECT_FLATTEN_CASE(0x15) {
+      if (OpaquePredicateTrue(static_cast<std::uint32_t>(arg + 0x4242))) {
+        RTPROTECT_FLATTEN_TRANSITION(st, 0x3A);
+      } else {
+        res = -1;
+        RTPROTECT_FLATTEN_EXIT();
+      }
+    }
+    RTPROTECT_FLATTEN_CASE(0x3A) {
+      bool detected = CheckMemoryTampered();
+      res = detected ? 1 : 0;
+      RTPROTECT_FLATTEN_TRANSITION(st, 0x61);
+    }
+    RTPROTECT_FLATTEN_CASE(0x61) {
+      if (MbaEqual(res, static_cast<std::int64_t>(1))) {
+        res = MbaSub<std::int64_t>(2, 1);
+      }
+      RTPROTECT_FLATTEN_TRANSITION(st, 0x88);
+    }
+    RTPROTECT_FLATTEN_CASE(0x88) {
+      RTPROTECT_FLATTEN_EXIT();
+    }
+  RTPROTECT_FLATTEN_END();
+  return res;
 }
-std::int64_t NativeProbeAntiDumpFn(std::int64_t, void*) {
-  return (DetectMemoryDumper() || DetectMemoryProbing()) ? 1 : 0;
+
+std::int64_t NativeProbeAntiDumpFn(std::int64_t arg, void* /*user_data*/) {
+  using namespace rtprotect::obfuscation;
+  std::int64_t res = 0;
+  bool dumper = false;
+  bool probing = false;
+  RTPROTECT_FLATTEN_BEGIN(st, 0x12)
+    RTPROTECT_FLATTEN_CASE(0x12) {
+      if (OpaquePredicateTrue(static_cast<std::uint64_t>(arg ^ 0xFEEDFACEULL))) {
+        RTPROTECT_FLATTEN_TRANSITION(st, 0x2B);
+      } else {
+        res = -1;
+        RTPROTECT_FLATTEN_EXIT();
+      }
+    }
+    RTPROTECT_FLATTEN_CASE(0x2B) {
+      dumper = DetectMemoryDumper();
+      RTPROTECT_FLATTEN_TRANSITION(st, 0x47);
+    }
+    RTPROTECT_FLATTEN_CASE(0x47) {
+      probing = DetectMemoryProbing();
+      RTPROTECT_FLATTEN_TRANSITION(st, 0x6D);
+    }
+    RTPROTECT_FLATTEN_CASE(0x6D) {
+      res = (dumper || probing) ? MbaAdd<std::int64_t>(0, 1) : 0;
+      RTPROTECT_FLATTEN_TRANSITION(st, 0x94);
+    }
+    RTPROTECT_FLATTEN_CASE(0x94) {
+      RTPROTECT_FLATTEN_EXIT();
+    }
+  RTPROTECT_FLATTEN_END();
+  return res;
 }
 
 const vm::NativeFunctionTable* GetGlobalAntiTamperNativeTable() {
@@ -469,25 +637,51 @@ void FunctionCrossLink::ResetForTesting() {
 
 void ScatterTamperCheck(const char* checkpoint_name, std::uint64_t* inout_state_accumulator) {
   if (!inout_state_accumulator) return;
+  using namespace rtprotect::obfuscation;
 
-  // Run lightweight low-overhead checks (sub-microsecond, zero thread spawning)
-  bool dbg = CheckDebuggerPresent();
-  bool mem = CheckMemoryTampered();
-  bool timing = CheckExecutionTimingAnomaly();
-  bool hw_bp = IsHardwareBreakpointDetected();
-  bool dumper = DetectMemoryDumper();
-  bool probing = DetectMemoryProbing();
+  bool dbg = false;
+  bool mem = false;
+  bool timing = false;
+  bool hw_bp = false;
+  bool dumper = false;
+  bool probing = false;
 
-  if (dbg || mem || timing || hw_bp || dumper || probing) {
-    // Fold non-zero poison into accumulator
-    std::uint64_t poison = 0x9E3779B97F4A7C15ULL;
-    if (checkpoint_name) {
-      for (const char* p = checkpoint_name; *p; ++p) {
-        poison = (poison ^ static_cast<std::uint64_t>(*p)) * 1099511628211ULL;
+  RTPROTECT_FLATTEN_BEGIN(st, 0x01)
+    RTPROTECT_FLATTEN_CASE(0x01) {
+      if (OpaquePredicateTrue(static_cast<std::uint64_t>(*inout_state_accumulator ^ 0xA5A5ULL))) {
+        RTPROTECT_FLATTEN_TRANSITION(st, 0x02);
+      } else {
+        RTPROTECT_FLATTEN_EXIT();
       }
     }
-    *inout_state_accumulator ^= poison;
-  }
+    RTPROTECT_FLATTEN_CASE(0x02) {
+      dbg = CheckDebuggerPresent();
+      mem = CheckMemoryTampered();
+      RTPROTECT_FLATTEN_TRANSITION(st, 0x03);
+    }
+    RTPROTECT_FLATTEN_CASE(0x03) {
+      timing = CheckExecutionTimingAnomaly();
+      hw_bp = IsHardwareBreakpointDetected();
+      RTPROTECT_FLATTEN_TRANSITION(st, 0x04);
+    }
+    RTPROTECT_FLATTEN_CASE(0x04) {
+      dumper = DetectMemoryDumper();
+      probing = DetectMemoryProbing();
+      RTPROTECT_FLATTEN_TRANSITION(st, 0x05);
+    }
+    RTPROTECT_FLATTEN_CASE(0x05) {
+      if (dbg || mem || timing || hw_bp || dumper || probing) {
+        std::uint64_t poison = 0x9E3779B97F4A7C15ULL;
+        if (checkpoint_name) {
+          for (const char* p = checkpoint_name; *p; ++p) {
+            poison = MbaXor<std::uint64_t>(poison, static_cast<std::uint64_t>(*p)) * 1099511628211ULL;
+          }
+        }
+        *inout_state_accumulator = MbaXor<std::uint64_t>(*inout_state_accumulator, poison);
+      }
+      RTPROTECT_FLATTEN_EXIT();
+    }
+  RTPROTECT_FLATTEN_END();
 }
 
 }  // namespace rtprotect::antitamper
