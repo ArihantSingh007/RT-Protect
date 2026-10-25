@@ -1305,6 +1305,63 @@ MT_TEST(Vm_NativeFFI_CallNative) {
   auto p_bad = b_bad.Build();
   auto res_bad = Run(p_bad, {10}, nullptr, nullptr, VmEngineFlavor::kStackBased, 0, &table);
   MT_CHECK(res_bad.error == VmError::kInvalidNativeCall);
+  auto res_bad_token = Run(p_bad, {10}, nullptr, nullptr, VmEngineFlavor::kIndirectTokenThreaded, 0, &table);
+  MT_CHECK(res_bad_token.error == VmError::kInvalidNativeCall);
+}
+
+MT_TEST(Vm_FlavorParity_ComprehensiveCheck) {
+  // 1. Memory and Arithmetic across all 4 flavors
+  ProgramBuilder b(1);
+  b.PushConst(128); // addr
+  b.PushConst(42);  // val
+  b.StoreMem8();
+  b.PushConst(128); // addr
+  b.LoadMem8();     // val = 42
+  b.PushLocal(0);   // arg = 10
+  b.Add();          // 52
+  b.Ret();
+  auto prog = b.Build();
+
+  for (int f = 0; f <= 3; ++f) {
+    MemoryContext mem(256);
+    auto res = Run(prog, {10}, nullptr, &mem, static_cast<VmEngineFlavor>(f));
+    MT_CHECK(res.error == VmError::kNone);
+    MT_CHECK(res.value == 52);
+  }
+
+  // 2. Float arithmetic and non-finite rejection across all 4 flavors
+  ProgramBuilder bf(0);
+  bf.PushFloat(1.0e308);
+  bf.PushFloat(2.0);
+  bf.FMul(); // Overflows to +Inf -> must return VmError::kArithmeticOverflow
+  bf.Ret();
+  auto prog_f = bf.Build();
+
+  for (int f = 0; f <= 3; ++f) {
+    auto res = Run(prog_f, {}, nullptr, nullptr, static_cast<VmEngineFlavor>(f));
+    MT_CHECK(res.error == VmError::kArithmeticOverflow);
+  }
+
+  // 3. Subroutine Call and Return across all 4 flavors
+  ProgramBuilder bs(0);
+  auto sub_label = bs.NewLabel();
+  bs.PushConst(100);
+  bs.Call(sub_label);
+  bs.PushConst(5);
+  bs.Add();
+  bs.Ret();
+
+  bs.Mark(sub_label);
+  bs.PushConst(20);
+  bs.Add();
+  bs.RetSub();
+  auto prog_s = bs.Build();
+
+  for (int f = 0; f <= 3; ++f) {
+    auto res = Run(prog_s, {}, nullptr, nullptr, static_cast<VmEngineFlavor>(f));
+    MT_CHECK(res.error == VmError::kNone);
+    MT_CHECK(res.value == 125);
+  }
 }
 
 MT_MAIN()

@@ -45,6 +45,22 @@ namespace rtprotect::tooling {
 
 namespace {
 
+std::string GetToolExecutablePath() {
+#if defined(_WIN32)
+  DWORD size = 512;
+  while (size <= 65536) {
+    std::vector<char> buf(size);
+    DWORD ret = ::GetModuleFileNameA(NULL, buf.data(), size);
+    if (ret == 0) return "";
+    if (ret < size - 1) return std::string(buf.data(), ret);
+    size *= 2;
+  }
+  return "";
+#else
+  return "";
+#endif
+}
+
 std::string EscapeJson(const std::string& str) {
   std::string out;
   out.reserve(str.size() * 2);
@@ -1317,6 +1333,7 @@ IntegrationReport ExecuteIntegration(const IntegrationOptions& options) {
     ss << "#include \"licensing/license_verifier.h\"\n";
     ss << "#include \"licensing/activation.h\"\n";
     ss << "#include \"licensing/activation_client.h\"\n";
+    ss << "#include \"licensing/countermeasure_config.h\"\n";
     ss << "#include \"licensing/trusted_time.h\"\n";
     ss << "#include \"licensing/secure_storage.h\"\n";
     ss << "#include \"licensing/hardware_id.h\"\n";
@@ -1403,6 +1420,25 @@ IntegrationReport ExecuteIntegration(const IntegrationOptions& options) {
     ss << "  if (!kAllowDevTokenFallback) {\n";
     ss << "    rtprotect::licensing::SecureStorage::SetRequireDpapi(true);\n";
     ss << "  }\n";
+    ss << "  // 0. Register countermeasure update notification hook\n";
+    ss << "  rtprotect::licensing::SetCountermeasureUpdateHook([](const rtprotect::licensing::CountermeasureConfig& cfg) {\n";
+    ss << "    rtprotect::antitamper::ApplyCountermeasures(\n";
+    ss << "        cfg.blacklisted_process_names,\n";
+    ss << "        cfg.blacklisted_window_titles,\n";
+    ss << "        cfg.risk_threshold_restrict,\n";
+    ss << "        cfg.risk_threshold_terminate,\n";
+    ss << "        cfg.expires_at);\n";
+    ss << "  });\n\n";
+    ss << "  // 0b. Load and apply any active unexpired countermeasure configuration from secure storage\n";
+    ss << "  auto active_cm = rtprotect::licensing::LoadCountermeasureConfig(kProductId);\n";
+    ss << "  if (active_cm.has_value() && rtprotect::licensing::VerifyCountermeasureConfigSignature(*active_cm, kManifestPublicKey)) {\n";
+    ss << "    rtprotect::antitamper::ApplyCountermeasures(\n";
+    ss << "        active_cm->blacklisted_process_names,\n";
+    ss << "        active_cm->blacklisted_window_titles,\n";
+    ss << "        active_cm->risk_threshold_restrict,\n";
+    ss << "        active_cm->risk_threshold_terminate,\n";
+    ss << "        active_cm->expires_at);\n";
+    ss << "  }\n\n";
     ss << "  // 1. Runtime environment risk assessment and launch watchdog\n";
     ss << "  rtprotect::antitamper::StartHardwareBreakpointWatchdog(500);\n";
     ss << "  auto risk = rtprotect::antitamper::AssessEnvironmentRisk();\n";
@@ -1623,18 +1659,37 @@ IntegrationReport ExecuteIntegration(const IntegrationOptions& options) {
     ss << "      \"" << root_str << "/third_party/openssl/include\"\n";
     ss << "  )\n";
     ss << "  target_link_directories(" << target_name << " PRIVATE\n";
-    ss << "      \"" << root_str << "/build/integrity\"\n";
-    ss << "      \"" << root_str << "/build/licensing\"\n";
-    ss << "      \"" << root_str << "/build/antitamper\"\n";
-    ss << "      \"" << root_str << "/build/crypto\"\n";
-    ss << "      \"" << root_str << "/build/bytecode_vm\"\n";
-    ss << "      \"" << root_str << "/build/obfuscation\"\n";
-    ss << "      \"" << root_str << "/build-reconst/integrity\"\n";
-    ss << "      \"" << root_str << "/build-reconst/licensing\"\n";
-    ss << "      \"" << root_str << "/build-reconst/antitamper\"\n";
-    ss << "      \"" << root_str << "/build-reconst/crypto\"\n";
-    ss << "      \"" << root_str << "/build-reconst/bytecode_vm\"\n";
-    ss << "      \"" << root_str << "/build-reconst/obfuscation\"\n";
+    std::vector<std::string> bld_prefixes = {
+      root_str + "/build",
+      root_str + "/build-mingw",
+      root_str + "/build-vs2022",
+      root_str + "/build-ninja",
+      root_str + "/build-reconst"
+    };
+    std::string tool_path_str = GetToolExecutablePath();
+    if (!tool_path_str.empty()) {
+      namespace fs = std::filesystem;
+      fs::path tp(tool_path_str);
+      fs::path p = tp.parent_path();
+      if (p.filename() == "Release" || p.filename() == "Debug" || p.filename() == "RelWithDebInfo") {
+        p = p.parent_path();
+      }
+      if (p.filename() == "tooling" || p.filename() == "bin") {
+        std::string tb = p.parent_path().string();
+        std::replace(tb.begin(), tb.end(), '\\', '/');
+        bld_prefixes.push_back(tb);
+      }
+    }
+    std::vector<std::string> submods = {"integrity", "licensing", "antitamper", "crypto", "bytecode_vm", "obfuscation"};
+    for (const auto& bfx : bld_prefixes) {
+      for (const auto& sm : submods) {
+        ss << "      \"" << bfx << "/" << sm << "\"\n";
+        ss << "      \"" << bfx << "/" << sm << "/$<CONFIG>\"\n";
+        ss << "      \"" << bfx << "/" << sm << "/Release\"\n";
+        ss << "      \"" << bfx << "/" << sm << "/Debug\"\n";
+      }
+      ss << "      \"" << bfx << "/lib\"\n";
+    }
     ss << "      \"" << root_str << "/third_party/openssl/lib\"\n";
     ss << "      \"" << root_str << "/lib\"\n";
     ss << "  )\n";
@@ -1840,6 +1895,15 @@ IntegrationReport ExecuteIntegration(const IntegrationOptions& options) {
     if (fs::exists(openssl_dir)) {
       cfg_args.push_back("-DOPENSSL_ROOT_DIR=" + openssl_dir);
     }
+    const char* env_gen = std::getenv("CMAKE_GENERATOR");
+    if (env_gen && env_gen[0] != '\0') {
+      cfg_args.push_back("-G");
+      cfg_args.push_back(env_gen);
+    }
+    const char* env_bt = std::getenv("CMAKE_BUILD_TYPE");
+    if (env_bt && env_bt[0] != '\0') {
+      cfg_args.push_back("-DCMAKE_BUILD_TYPE=" + std::string(env_bt));
+    }
 
     int cr = RunProcess("cmake", cfg_args);
     if (cr != 0) {
@@ -1850,8 +1914,10 @@ IntegrationReport ExecuteIntegration(const IntegrationOptions& options) {
       return report;
     }
 
+    std::string config_name = (env_bt && env_bt[0] != '\0') ? env_bt : "Release";
     std::vector<std::string> bld_args = {
-      "--build", build_dir.string()
+      "--build", build_dir.string(),
+      "--config", config_name
     };
     int br = RunProcess("cmake", bld_args);
     if (br != 0) {
@@ -1872,8 +1938,10 @@ IntegrationReport ExecuteIntegration(const IntegrationOptions& options) {
     fs::path built_exe;
     std::vector<fs::path> candidate_dirs = {
       build_dir,
+      build_dir / config_name,
       build_dir / "Release",
-      build_dir / "Debug"
+      build_dir / "Debug",
+      build_dir / "RelWithDebInfo"
     };
     for (const auto& cd : candidate_dirs) {
       if (fs::exists(cd / exe_filename)) {

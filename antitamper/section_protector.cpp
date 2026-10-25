@@ -197,6 +197,11 @@ bool EncryptProtectedSectionInMemory(const tooling::PeProtectedSectionHeader& he
   bool enc_ok = Aes256GcmEncrypt(header.key, header.iv, sec_addr, header.section_size, encrypted.data(), new_tag);
   if (enc_ok) {
     std::memcpy(sec_addr, encrypted.data(), header.section_size);
+  } else {
+    OPENSSL_cleanse(encrypted.data(), encrypted.size());
+    DWORD temp = 0;
+    pVirtualProtect(sec_addr, header.section_size, old_protect, &temp);
+    return false;
   }
   OPENSSL_cleanse(encrypted.data(), encrypted.size());
 
@@ -209,7 +214,7 @@ bool EncryptProtectedSectionInMemory(const tooling::PeProtectedSectionHeader& he
     pFlushInstructionCache(GetCurrentProcess(), sec_addr, header.section_size);
   }
 
-  return enc_ok;
+  return true;
 }
 
 namespace {
@@ -229,18 +234,22 @@ ScopedSectionExecution::ScopedSectionExecution(const tooling::PeProtectedSection
   }
 
   std::lock_guard<std::mutex> lock(s_scoped_section_mutex);
-  if (s_scoped_section_refcount++ == 0) {
+  if (s_scoped_section_refcount == 0) {
     active_ = DecryptProtectedSectionInMemory(*header_, module_base_);
+    if (active_) {
+      ++s_scoped_section_refcount;
+    }
   } else {
+    ++s_scoped_section_refcount;
     active_ = true;
   }
 }
 
 ScopedSectionExecution::~ScopedSectionExecution() {
-  if (!header_) return;
+  if (!header_ || !active_) return;
 
   std::lock_guard<std::mutex> lock(s_scoped_section_mutex);
-  if (--s_scoped_section_refcount == 0) {
+  if (s_scoped_section_refcount > 0 && --s_scoped_section_refcount == 0) {
     EncryptProtectedSectionInMemory(*header_, module_base_);
   }
 }
@@ -253,9 +262,9 @@ ScopedSectionExecution::ScopedSectionExecution(ScopedSectionExecution&& other) n
 
 ScopedSectionExecution& ScopedSectionExecution::operator=(ScopedSectionExecution&& other) noexcept {
   if (this != &other) {
-    if (header_) {
+    if (header_ && active_) {
       std::lock_guard<std::mutex> lock(s_scoped_section_mutex);
-      if (--s_scoped_section_refcount == 0) {
+      if (s_scoped_section_refcount > 0 && --s_scoped_section_refcount == 0) {
         EncryptProtectedSectionInMemory(*header_, module_base_);
       }
     }

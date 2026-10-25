@@ -41,6 +41,10 @@ struct CountermeasureConfig {
 
   // Cryptographic Signature
   integrity::Ed25519Signature signature{};
+
+  bool IsExpired(std::uint64_t current_time) const {
+    return expires_at != 0 && expires_at < current_time;
+  }
 };
 
 // Wire serialization & deserialization

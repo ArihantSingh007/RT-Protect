@@ -14,6 +14,7 @@
 #include <cctype>
 #include <cstdlib>
 #include <cstring>
+#include <ctime>
 #include <memory>
 #include <mutex>
 #include <sstream>
@@ -33,6 +34,7 @@ std::vector<std::string> s_active_blacklisted_procs;
 std::vector<std::string> s_active_blacklisted_windows;
 int s_restrict_thresh = 50;
 int s_terminate_thresh = 80;
+std::uint64_t s_cm_expires_at = 0;
 
 bool CheckBlacklistedProcesses(const std::vector<std::string>& procs) {
   if (procs.empty()) return false;
@@ -86,12 +88,14 @@ bool CheckBlacklistedWindows(const std::vector<std::string>& titles) {
 void ApplyCountermeasures(const std::vector<std::string>& blacklisted_procs,
                           const std::vector<std::string>& blacklisted_windows,
                           int restrict_thresh,
-                          int terminate_thresh) {
+                          int terminate_thresh,
+                          std::uint64_t expires_at) {
   std::lock_guard<std::mutex> lock(s_cm_mutex);
   s_active_blacklisted_procs = blacklisted_procs;
   s_active_blacklisted_windows = blacklisted_windows;
   s_restrict_thresh = restrict_thresh;
   s_terminate_thresh = terminate_thresh;
+  s_cm_expires_at = expires_at;
 }
 
 void ResetCountermeasuresForTesting() {
@@ -100,6 +104,7 @@ void ResetCountermeasuresForTesting() {
   s_active_blacklisted_windows.clear();
   s_restrict_thresh = 50;
   s_terminate_thresh = 80;
+  s_cm_expires_at = 0;
 }
 
 RiskAssessment AssessEnvironmentRisk() {
@@ -133,6 +138,14 @@ RiskAssessment AssessEnvironmentRisk() {
 
   {
     std::lock_guard<std::mutex> lock(s_cm_mutex);
+    std::uint64_t now = static_cast<std::uint64_t>(std::time(nullptr));
+    if (s_cm_expires_at != 0 && s_cm_expires_at < now) {
+      s_active_blacklisted_procs.clear();
+      s_active_blacklisted_windows.clear();
+      s_restrict_thresh = 50;
+      s_terminate_thresh = 80;
+      s_cm_expires_at = 0;
+    }
     if (!s_active_blacklisted_procs.empty() && CheckBlacklistedProcesses(s_active_blacklisted_procs)) {
       r.blacklisted_process_detected = true;
       score += 50;
@@ -178,6 +191,14 @@ RiskAssessment AssessFastEnvironmentRisk() {
 
   {
     std::lock_guard<std::mutex> lock(s_cm_mutex);
+    std::uint64_t now = static_cast<std::uint64_t>(std::time(nullptr));
+    if (s_cm_expires_at != 0 && s_cm_expires_at < now) {
+      s_active_blacklisted_procs.clear();
+      s_active_blacklisted_windows.clear();
+      s_restrict_thresh = 50;
+      s_terminate_thresh = 80;
+      s_cm_expires_at = 0;
+    }
     if (!s_active_blacklisted_procs.empty() && CheckBlacklistedProcesses(s_active_blacklisted_procs)) {
       r.blacklisted_process_detected = true;
       score += 50;

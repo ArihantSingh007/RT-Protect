@@ -110,11 +110,6 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Setup Ninja
-        uses: ashutoshvarma/setup-ninja@v1.1
-        with:
-          version: 1.11.1
-
       - name: Configure CMake (Clang + libFuzzer)
         shell: powershell
         run: |

@@ -20,28 +20,44 @@ template <typename T>
 constexpr T MbaAdd(T x, T y) {
   static_assert(std::is_integral_v<T>, "MBA operations require integral types");
   // Identity: x + y == (x ^ y) + 2 * (x & y) == (x | y) + (x & y)
-  return static_cast<T>((x ^ y) + ((x & y) << 1));
+  // Operate on unsigned types to eliminate undefined behavior on signed overflow under UBSan
+  using U = std::make_unsigned_t<T>;
+  U ux = static_cast<U>(x);
+  U uy = static_cast<U>(y);
+  U res = static_cast<U>((ux ^ uy) + (static_cast<U>(ux & uy) << 1));
+  return static_cast<T>(res);
 }
 
 template <typename T>
 constexpr T MbaSub(T x, T y) {
   static_assert(std::is_integral_v<T>, "MBA operations require integral types");
   // Identity: x - y == (x ^ y) - 2 * (~x & y)
-  return static_cast<T>((x ^ y) - (((~x) & y) << 1));
+  using U = std::make_unsigned_t<T>;
+  U ux = static_cast<U>(x);
+  U uy = static_cast<U>(y);
+  U res = static_cast<U>((ux ^ uy) - (static_cast<U>((~ux) & uy) << 1));
+  return static_cast<T>(res);
 }
 
 template <typename T>
 constexpr T MbaXor(T x, T y) {
   static_assert(std::is_integral_v<T>, "MBA operations require integral types");
   // Identity: x ^ y == (x | y) - (x & y)
-  return static_cast<T>((x | y) - (x & y));
+  using U = std::make_unsigned_t<T>;
+  U ux = static_cast<U>(x);
+  U uy = static_cast<U>(y);
+  U res = static_cast<U>((ux | uy) - (ux & uy));
+  return static_cast<T>(res);
 }
 
 template <typename T>
 constexpr bool MbaEqual(T x, T y) {
   static_assert(std::is_integral_v<T>, "MBA operations require integral types");
   // Identity: (x == y) <=> ((x ^ y) == 0) <=> ((x | y) == (x & y))
-  return ((x | y) - (x & y)) == 0;
+  using U = std::make_unsigned_t<T>;
+  U ux = static_cast<U>(x);
+  U uy = static_cast<U>(y);
+  return ((ux | uy) - (ux & uy)) == 0;
 }
 
 // 2. Mathematically Invariant Opaque Predicates
@@ -53,7 +69,9 @@ constexpr bool MbaEqual(T x, T y) {
 template <typename T>
 constexpr bool OpaquePredicateTrue(T seed) {
   static_assert(std::is_integral_v<T>, "Opaque predicate requires integral type");
-  T val = static_cast<T>(seed * (seed + 1));
+  using U = std::make_unsigned_t<T>;
+  U u = static_cast<U>(seed);
+  U val = static_cast<U>(u * static_cast<U>(u + 1));
   return (val & 1) == 0;
 }
 

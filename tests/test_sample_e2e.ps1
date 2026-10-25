@@ -2,10 +2,20 @@ param(
     [Parameter(Mandatory = $true)][string]$Tool,
     [Parameter(Mandatory = $true)][string]$SampleSource,
     [Parameter(Mandatory = $true)][string]$RtprotectRoot,
-    [Parameter(Mandatory = $true)][string]$BuildRoot
+    [Parameter(Mandatory = $true)][string]$BuildRoot,
+    [Parameter(Mandatory = $false)][string]$Generator = '',
+    [Parameter(Mandatory = $false)][string]$Config = 'Release'
 )
 
 $ErrorActionPreference = 'Stop'
+
+if ($Generator) {
+    $env:CMAKE_GENERATOR = $Generator
+}
+if ($Config) {
+    $env:CMAKE_BUILD_TYPE = $Config
+}
+
 $buildPath = [IO.Path]::GetFullPath($BuildRoot)
 $runRoot = Join-Path $buildPath ("rtprotect_sample_e2e_" + [guid]::NewGuid().ToString('N'))
 $projectPath = Join-Path $runRoot 'project'
@@ -48,6 +58,24 @@ try {
     $env:PATH = $opensslBin + ';' + $env:PATH
     $builtDir = Join-Path $projectPath 'build_protected'
     $executable = Join-Path $builtDir 'sample_client_app.exe'
+    if (-not (Test-Path -LiteralPath $executable)) {
+        if ($Config -and (Test-Path -LiteralPath (Join-Path $builtDir "$Config\sample_client_app.exe"))) {
+            $builtDir = Join-Path $builtDir $Config
+            $executable = Join-Path $builtDir 'sample_client_app.exe'
+        } elseif (Test-Path -LiteralPath (Join-Path $builtDir "Release\sample_client_app.exe")) {
+            $builtDir = Join-Path $builtDir 'Release'
+            $executable = Join-Path $builtDir 'sample_client_app.exe'
+        } elseif (Test-Path -LiteralPath (Join-Path $builtDir "Debug\sample_client_app.exe")) {
+            $builtDir = Join-Path $builtDir 'Debug'
+            $executable = Join-Path $builtDir 'sample_client_app.exe'
+        }
+    }
+
+    $opensslDll = Join-Path $opensslBin 'libcrypto-3-x64.dll'
+    if ((Test-Path -LiteralPath $opensslDll) -and (-not (Test-Path -LiteralPath (Join-Path $builtDir 'libcrypto-3-x64.dll')))) {
+        Copy-Item -LiteralPath $opensslDll -Destination $builtDir -Force
+    }
+
     $validOutput = & $executable 2>&1
     if ($LASTEXITCODE -ne 0) {
         throw "Protected sample exited with ${LASTEXITCODE}:`n$($validOutput -join "`n")"
@@ -66,8 +94,11 @@ try {
     $bytes[$lastByte] = [byte]($bytes[$lastByte] -bxor 1)
     [IO.File]::WriteAllBytes($tamperedExe, $bytes)
 
+    $oldEap = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
     $tamperedOutput = & $tamperedExe 2>&1
     $tamperedExitCode = $LASTEXITCODE
+    $ErrorActionPreference = $oldEap
     if ($tamperedExitCode -eq 0 -or ($tamperedOutput -join "`n") -notmatch 'Fatal: Integrity or license verification failed') {
         throw "Tampered executable was not rejected at startup (exit $tamperedExitCode):`n$($tamperedOutput -join "`n")"
     }

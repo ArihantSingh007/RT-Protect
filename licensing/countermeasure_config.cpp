@@ -4,6 +4,7 @@
 
 #include "licensing/countermeasure_config.h"
 
+#include <ctime>
 #include <cstring>
 #include <vector>
 #include <openssl/evp.h>
@@ -223,7 +224,13 @@ bool SaveCountermeasureConfig(const std::string& product_id, const Countermeasur
 std::optional<CountermeasureConfig> LoadCountermeasureConfig(const std::string& product_id) {
   auto data = SecureStorage::Load(product_id + "_countermeasures");
   if (!data.has_value()) return std::nullopt;
-  return DeserializeCountermeasureConfig(data->data(), data->size());
+  auto cfg = DeserializeCountermeasureConfig(data->data(), data->size());
+  if (!cfg.has_value()) return std::nullopt;
+  std::uint64_t now = static_cast<std::uint64_t>(std::time(nullptr));
+  if (cfg->IsExpired(now)) {
+    return std::nullopt;
+  }
+  return cfg;
 }
 
 namespace {

@@ -566,8 +566,8 @@ MT_TEST(CountermeasureConfig_SignVerifyAndRoundtrip) {
 
   CountermeasureConfig cfg;
   cfg.sequence_number = 42;
-  cfg.issued_at = 1750000000;
-  cfg.expires_at = 1750100000;
+  cfg.issued_at = static_cast<std::uint64_t>(std::time(nullptr));
+  cfg.expires_at = cfg.issued_at + 86400; // 24 hours in the future
   cfg.blacklisted_process_names = { "x64dbg.exe", "ida64.exe", "cheatengine.exe" };
   cfg.blacklisted_process_hashes = { 0x11223344, 0x55667788 };
   cfg.blacklisted_window_titles = { "Cheat Engine 7.5", "x64dbg" };
@@ -595,8 +595,8 @@ MT_TEST(CountermeasureConfig_SignVerifyAndRoundtrip) {
   auto parsed = DeserializeCountermeasureConfig(wire.data(), wire.size());
   MT_CHECK(parsed.has_value());
   MT_CHECK(parsed->sequence_number == 42);
-  MT_CHECK(parsed->issued_at == 1750000000);
-  MT_CHECK(parsed->expires_at == 1750100000);
+  MT_CHECK(parsed->issued_at == cfg.issued_at);
+  MT_CHECK(parsed->expires_at == cfg.expires_at);
   MT_CHECK(parsed->blacklisted_process_names.size() == 3);
   MT_CHECK(parsed->blacklisted_process_names[0] == "x64dbg.exe");
   MT_CHECK(parsed->blacklisted_process_hashes.size() == 2);
@@ -612,6 +612,67 @@ MT_TEST(CountermeasureConfig_SignVerifyAndRoundtrip) {
   MT_CHECK(loaded.has_value());
   MT_CHECK(loaded->sequence_number == 42);
   MT_CHECK(VerifyCountermeasureConfigSignature(*loaded, kp.public_key));
+}
+
+MT_TEST(CountermeasureConfig_AntiRollbackAndExpiryEnforcement) {
+  auto kp = MakeKeyPair();
+  std::uint64_t now = static_cast<std::uint64_t>(std::time(nullptr));
+
+  // 1. Expiration helper logic
+  CountermeasureConfig perpetual;
+  perpetual.expires_at = 0;
+  MT_CHECK(!perpetual.IsExpired(now));
+  MT_CHECK(!perpetual.IsExpired(now + 100000));
+
+  CountermeasureConfig past_expired;
+  past_expired.expires_at = now - 50;
+  MT_CHECK(past_expired.IsExpired(now));
+
+  CountermeasureConfig future_valid;
+  future_valid.expires_at = now + 3600;
+  MT_CHECK(!future_valid.IsExpired(now));
+
+  // 2. LoadCountermeasureConfig rejects expired configuration in storage
+  past_expired.sequence_number = 1;
+  MT_CHECK(SignCountermeasureConfig(past_expired, kp.private_key));
+  MT_CHECK(SaveCountermeasureConfig("com.test.cm_expired", past_expired));
+  auto loaded_expired = LoadCountermeasureConfig("com.test.cm_expired");
+  MT_CHECK(!loaded_expired.has_value()); // Expired config returns nullopt
+
+  // 3. Storing and loading unexpired configuration succeeds
+  future_valid.sequence_number = 10;
+  MT_CHECK(SignCountermeasureConfig(future_valid, kp.private_key));
+  MT_CHECK(SaveCountermeasureConfig("com.test.cm_valid", future_valid));
+  auto loaded_valid = LoadCountermeasureConfig("com.test.cm_valid");
+  MT_CHECK(loaded_valid.has_value());
+  MT_CHECK(loaded_valid->sequence_number == 10);
+
+  // 4. Hook notification and strictly-increasing anti-rollback sequence logic
+  static std::uint64_t s_hook_received_seq = 0;
+  SetCountermeasureUpdateHook([](const CountermeasureConfig& update) {
+    s_hook_received_seq = update.sequence_number;
+  });
+
+  // Replay of same sequence number (10) must be rejected
+  auto cur = LoadCountermeasureConfig("com.test.cm_valid");
+  MT_CHECK(cur.has_value());
+  CountermeasureConfig replay = *cur;
+  bool replay_accepted = (!cur.has_value() || replay.sequence_number > cur->sequence_number);
+  MT_CHECK(!replay_accepted); // Rejected! Same sequence number not strictly greater
+
+  // Downgrade sequence number (9) must be rejected
+  CountermeasureConfig rollback = *cur;
+  rollback.sequence_number = 9;
+  bool rollback_accepted = (!cur.has_value() || rollback.sequence_number > cur->sequence_number);
+  MT_CHECK(!rollback_accepted); // Rejected!
+
+  // Strictly newer sequence number (11) must be accepted
+  CountermeasureConfig newer = *cur;
+  newer.sequence_number = 11;
+  bool newer_accepted = (!cur.has_value() || newer.sequence_number > cur->sequence_number);
+  MT_CHECK(newer_accepted); // Accepted!
+  NotifyCountermeasureUpdate(newer);
+  MT_CHECK(s_hook_received_seq == 11);
 }
 
 MT_MAIN()

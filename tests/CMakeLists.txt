@@ -154,7 +154,9 @@ if(RTPROTECT_POWERSHELL_EXECUTABLE)
             -Tool "$<TARGET_FILE:rtprotect-tool>"
             -SampleSource "${CMAKE_SOURCE_DIR}/examples/sample_client_app"
             -RtprotectRoot "${CMAKE_SOURCE_DIR}"
-            -BuildRoot "${CMAKE_BINARY_DIR}")
+            -BuildRoot "${CMAKE_BINARY_DIR}"
+            -Generator "${CMAKE_GENERATOR}"
+            -Config "$<CONFIG>")
   set_tests_properties(test_sample_e2e PROPERTIES TIMEOUT 180)
 endif()
 

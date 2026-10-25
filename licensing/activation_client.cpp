@@ -670,10 +670,13 @@ std::optional<ActivationToken> RequestOnlineActivation(
       if (HexToBytes(cm_hex, cm_raw.data(), cm_raw.size())) {
         auto cm_cfg = DeserializeCountermeasureConfig(cm_raw.data(), cm_raw.size());
         if (cm_cfg.has_value() && VerifyCountermeasureConfigSignature(*cm_cfg, vendor_pubkey)) {
-          auto cur_cfg = LoadCountermeasureConfig(product_id);
-          if (!cur_cfg.has_value() || cm_cfg->sequence_number >= cur_cfg->sequence_number) {
-            SaveCountermeasureConfig(product_id, *cm_cfg);
-            NotifyCountermeasureUpdate(*cm_cfg);
+          std::uint64_t current_time = static_cast<std::uint64_t>(std::time(nullptr));
+          if (!cm_cfg->IsExpired(current_time)) {
+            auto cur_cfg = LoadCountermeasureConfig(product_id);
+            if (!cur_cfg.has_value() || cm_cfg->sequence_number > cur_cfg->sequence_number) {
+              SaveCountermeasureConfig(product_id, *cm_cfg);
+              NotifyCountermeasureUpdate(*cm_cfg);
+            }
           }
         }
       }
@@ -784,10 +787,13 @@ std::optional<ActivationToken> RequestOnlineRenewal(
       if (HexToBytes(cm_hex, cm_raw.data(), cm_raw.size())) {
         auto cm_cfg = DeserializeCountermeasureConfig(cm_raw.data(), cm_raw.size());
         if (cm_cfg.has_value() && VerifyCountermeasureConfigSignature(*cm_cfg, vendor_pubkey)) {
-          auto cur_cfg = LoadCountermeasureConfig(renewed.license_id);
-          if (!cur_cfg.has_value() || cm_cfg->sequence_number >= cur_cfg->sequence_number) {
-            SaveCountermeasureConfig(renewed.license_id, *cm_cfg);
-            NotifyCountermeasureUpdate(*cm_cfg);
+          std::uint64_t current_time = static_cast<std::uint64_t>(std::time(nullptr));
+          if (!cm_cfg->IsExpired(current_time)) {
+            auto cur_cfg = LoadCountermeasureConfig(renewed.license_id);
+            if (!cur_cfg.has_value() || cm_cfg->sequence_number > cur_cfg->sequence_number) {
+              SaveCountermeasureConfig(renewed.license_id, *cm_cfg);
+              NotifyCountermeasureUpdate(*cm_cfg);
+            }
           }
         }
       }

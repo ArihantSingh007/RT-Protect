@@ -1904,8 +1904,9 @@ VmError TH_CallProgram(TokenContext& ctx, std::uint64_t imm) {
     callee_args[k] = arg_val;
   }
   auto sub_res = Run(*callee, callee_args, ctx.opcode_map, ctx.mem_ctx, VmEngineFlavor::kIndirectTokenThreaded, ctx.recursion_depth + 1, ctx.native_table);
-  if (sub_res.error != VmError::kNone) return sub_res.error;
   ctx.executed += sub_res.instructions_executed;
+  if (sub_res.error != VmError::kNone) return sub_res.error;
+  if (ctx.executed > kMaxExecutedInstructions) return VmError::kInstructionBudgetExceeded;
   if (!ctx.push(sub_res.value)) return VmError::kStackOverflow;
   return VmError::kNone;
 }
@@ -2087,27 +2088,35 @@ RunResult RunIndirectTokenThreaded(const Program& program,
       case Opcode::kCmpEq: tok.handler = TH_CmpEq; break;
       case Opcode::kCmpLt: tok.handler = TH_CmpLt; break;
       case Opcode::kCmpGt: tok.handler = TH_CmpGt; break;
-      case Opcode::kJmp:
+      case Opcode::kJmp: {
         tok.handler = TH_Jmp;
-        tok.imm = pc_to_token_idx[ReadU16(operand)];
+        auto it = pc_to_token_idx.find(ReadU16(operand));
+        tok.imm = (it != pc_to_token_idx.end()) ? it->second : 0;
         break;
-      case Opcode::kJz:
+      }
+      case Opcode::kJz: {
         tok.handler = TH_Jz;
-        tok.imm = pc_to_token_idx[ReadU16(operand)];
+        auto it = pc_to_token_idx.find(ReadU16(operand));
+        tok.imm = (it != pc_to_token_idx.end()) ? it->second : 0;
         break;
-      case Opcode::kJnz:
+      }
+      case Opcode::kJnz: {
         tok.handler = TH_Jnz;
-        tok.imm = pc_to_token_idx[ReadU16(operand)];
+        auto it = pc_to_token_idx.find(ReadU16(operand));
+        tok.imm = (it != pc_to_token_idx.end()) ? it->second : 0;
         break;
+      }
       case Opcode::kRet: tok.handler = TH_Ret; break;
       case Opcode::kLoadMem8: tok.handler = TH_LoadMem8; break;
       case Opcode::kStoreMem8: tok.handler = TH_StoreMem8; break;
       case Opcode::kLoadMem64: tok.handler = TH_LoadMem64; break;
       case Opcode::kStoreMem64: tok.handler = TH_StoreMem64; break;
-      case Opcode::kCall:
+      case Opcode::kCall: {
         tok.handler = TH_Call;
-        tok.imm = pc_to_token_idx[ReadU16(operand)];
+        auto it = pc_to_token_idx.find(ReadU16(operand));
+        tok.imm = (it != pc_to_token_idx.end()) ? it->second : 0;
         break;
+      }
       case Opcode::kRetSub: tok.handler = TH_RetSub; break;
       case Opcode::kCallProgram:
         tok.handler = TH_CallProgram;

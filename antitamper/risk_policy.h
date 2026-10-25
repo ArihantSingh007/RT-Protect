@@ -67,7 +67,8 @@ bool EnforceRiskPolicy(RiskAction action, const RiskAssessment& assessment);
 void ApplyCountermeasures(const std::vector<std::string>& blacklisted_procs,
                           const std::vector<std::string>& blacklisted_windows,
                           int restrict_thresh = 50,
-                          int terminate_thresh = 80);
+                          int terminate_thresh = 80,
+                          std::uint64_t expires_at = 0);
 void ResetCountermeasuresForTesting();
 
 // Derives a cryptographic salt bound to the risk assessment state.
