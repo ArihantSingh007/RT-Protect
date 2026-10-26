@@ -72,8 +72,18 @@ try {
     }
 
     if (Test-Path -LiteralPath $opensslBin) {
-        Get-ChildItem -Path $opensslBin -Filter '*.dll' | ForEach-Object {
-            Copy-Item -LiteralPath $_.FullName -Destination $builtDir -Force
+        $dlls = Get-ChildItem -Path $opensslBin -Filter '*.dll'
+        foreach ($dll in $dlls) {
+            Copy-Item -LiteralPath $dll.FullName -Destination $builtDir -Force
+            if (Test-Path -LiteralPath (Join-Path $projectPath 'build_protected')) {
+                Copy-Item -LiteralPath $dll.FullName -Destination (Join-Path $projectPath 'build_protected') -Force
+            }
+            if (Test-Path -LiteralPath (Join-Path $projectPath 'build_protected\Release')) {
+                Copy-Item -LiteralPath $dll.FullName -Destination (Join-Path $projectPath 'build_protected\Release') -Force
+            }
+            if (Test-Path -LiteralPath (Join-Path $projectPath 'build_protected\Debug')) {
+                Copy-Item -LiteralPath $dll.FullName -Destination (Join-Path $projectPath 'build_protected\Debug') -Force
+            }
         }
     }
 
@@ -87,6 +97,11 @@ try {
 
     Copy-Item -LiteralPath $builtDir -Destination $tamperedPath -Recurse
     $tamperedExe = Join-Path $tamperedPath 'sample_client_app.exe'
+    if (Test-Path -LiteralPath $opensslBin) {
+        Get-ChildItem -Path $opensslBin -Filter '*.dll' | ForEach-Object {
+            Copy-Item -LiteralPath $_.FullName -Destination $tamperedPath -Force
+        }
+    }
     $bytes = [IO.File]::ReadAllBytes($tamperedExe)
     if ($bytes.Length -eq 0) {
         throw 'Built executable is empty; cannot perform the tamper check.'

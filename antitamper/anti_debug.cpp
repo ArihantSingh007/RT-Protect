@@ -14,7 +14,9 @@
 
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstdint>
+#include <cstdlib>
 #include <mutex>
 #include <thread>
 #include <windows.h>
@@ -30,6 +32,28 @@ std::atomic<bool> g_hw_bp_detected{false};
 std::atomic<bool> g_watchdog_running{false};
 std::thread g_watchdog_thread;
 std::mutex g_watchdog_mu;
+std::condition_variable g_watchdog_cv;
+
+void StopWatchdogInternal() {
+  {
+    std::lock_guard<std::mutex> lock(g_watchdog_mu);
+    if (!g_watchdog_running.load()) return;
+    g_watchdog_running.store(false);
+  }
+  g_watchdog_cv.notify_all();
+  if (g_watchdog_thread.joinable()) {
+    if (std::this_thread::get_id() != g_watchdog_thread.get_id()) {
+      g_watchdog_thread.join();
+    }
+  }
+}
+
+struct WatchdogLifetimeGuard {
+  ~WatchdogLifetimeGuard() {
+    StopWatchdogInternal();
+  }
+};
+static WatchdogLifetimeGuard s_watchdog_lifetime_guard;
 
 // Direct unhookable PEB inspection
 bool CheckDirectPebDebugFlags() {
@@ -115,15 +139,16 @@ static bool ScanProcessThreadsForHardwareBreakpoints() {
       if (te.th32OwnerProcessID == pid && te.th32ThreadID != self_tid) {
         HANDLE th = ::OpenThread(THREAD_GET_CONTEXT | THREAD_SUSPEND_RESUME, FALSE, te.th32ThreadID);
         if (th) {
-          ::SuspendThread(th);
-          CONTEXT ctx{};
-          ctx.ContextFlags = CONTEXT_DEBUG_REGISTERS;
-          if (::GetThreadContext(th, &ctx)) {
-            if (ctx.Dr0 != 0 || ctx.Dr1 != 0 || ctx.Dr2 != 0 || ctx.Dr3 != 0) {
-              found = true;
+          if (::SuspendThread(th) != static_cast<DWORD>(-1)) {
+            alignas(16) CONTEXT ctx{};
+            ctx.ContextFlags = CONTEXT_DEBUG_REGISTERS;
+            if (::GetThreadContext(th, &ctx)) {
+              if (ctx.Dr0 != 0 || ctx.Dr1 != 0 || ctx.Dr2 != 0 || ctx.Dr3 != 0) {
+                found = true;
+              }
             }
+            ::ResumeThread(th);
           }
-          ::ResumeThread(th);
           ::CloseHandle(th);
           if (found) break;
         }
@@ -204,21 +229,22 @@ bool CheckHardwareBreakpoints() {
 
   HANDLE helper = ::CreateThread(nullptr, 0, [](LPVOID p) -> DWORD {
     auto* hp = static_cast<HelperParam*>(p);
-    ::SuspendThread(hp->target_thread);
-    CONTEXT ctx{};
+    alignas(16) CONTEXT ctx{};
     ctx.ContextFlags = CONTEXT_DEBUG_REGISTERS;
-    if (::GetThreadContext(hp->target_thread, &ctx)) {
-      if (ctx.Dr0 != 0 || ctx.Dr1 != 0 || ctx.Dr2 != 0 || ctx.Dr3 != 0) {
-        hp->found_bp = true;
+    if (::SuspendThread(hp->target_thread) != static_cast<DWORD>(-1)) {
+      if (::GetThreadContext(hp->target_thread, &ctx)) {
+        if (ctx.Dr0 != 0 || ctx.Dr1 != 0 || ctx.Dr2 != 0 || ctx.Dr3 != 0) {
+          hp->found_bp = true;
+        }
       }
+      ::ResumeThread(hp->target_thread);
     }
-    ::ResumeThread(hp->target_thread);
     return hp->found_bp ? 1 : 0;
   }, &param, 0, nullptr);
 
   bool found_bp = false;
   if (helper) {
-    ::WaitForSingleObject(helper, 100);
+    ::WaitForSingleObject(helper, INFINITE);
     DWORD exit_code = 0;
     if (::GetExitCodeThread(helper, &exit_code) && exit_code == 1) {
       found_bp = true;
@@ -237,24 +263,30 @@ void StartHardwareBreakpointWatchdog(std::uint32_t interval_ms) {
   std::lock_guard<std::mutex> lock(g_watchdog_mu);
   if (g_watchdog_running.load()) return;
   g_watchdog_running.store(true);
+
+  static std::once_flag s_atexit_once;
+  std::call_once(s_atexit_once, []() {
+    std::atexit([]() {
+      StopHardwareBreakpointWatchdog();
+    });
+  });
+
   g_watchdog_thread = std::thread([interval_ms]() {
     while (g_watchdog_running.load()) {
       if (ScanProcessThreadsForHardwareBreakpoints()) {
         g_hw_bp_detected.store(true, std::memory_order_relaxed);
         break;
       }
-      std::this_thread::sleep_for(std::chrono::milliseconds(interval_ms));
+      std::unique_lock<std::mutex> cv_lock(g_watchdog_mu);
+      g_watchdog_cv.wait_for(cv_lock, std::chrono::milliseconds(interval_ms), []() {
+        return !g_watchdog_running.load();
+      });
     }
   });
 }
 
 void StopHardwareBreakpointWatchdog() {
-  std::lock_guard<std::mutex> lock(g_watchdog_mu);
-  if (!g_watchdog_running.load()) return;
-  g_watchdog_running.store(false);
-  if (g_watchdog_thread.joinable()) {
-    g_watchdog_thread.join();
-  }
+  StopWatchdogInternal();
 }
 
 bool CheckExecutionTimingAnomaly() {

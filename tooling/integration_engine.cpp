@@ -1511,8 +1511,7 @@ IntegrationReport ExecuteIntegration(const IntegrationOptions& options) {
     ss << "        active_cm->enforce_memory_hooks,\n";
     ss << "        active_cm->enforce_anti_dump);\n";
     ss << "  }\n\n";
-    ss << "  // 1. Runtime environment risk assessment and launch watchdog\n";
-    ss << "  rtprotect::antitamper::StartHardwareBreakpointWatchdog(500);\n";
+    ss << "  // 1. Runtime environment risk assessment\n";
     ss << "  auto risk = rtprotect::antitamper::AssessEnvironmentRisk();\n";
     if (options.profile == ProtectionProfile::kMaximum) {
       ss << "  if (!rtprotect::antitamper::EnforceRiskPolicy(rtprotect::antitamper::RiskAction::kTerminate, risk)) return false;\n";
@@ -1814,7 +1813,18 @@ IntegrationReport ExecuteIntegration(const IntegrationOptions& options) {
     ss << "    $<$<PLATFORM_ID:Windows>:ws2_32>\n";
     ss << "    $<$<PLATFORM_ID:Windows>:winhttp>\n";
     ss << "    $<$<PLATFORM_ID:Windows>:crypt32>\n";
-    ss << ")\n";
+    ss << ")\n\n";
+
+    ss << "if(WIN32)\n";
+    ss << "  if(DEFINED OPENSSL_ROOT_DIR AND EXISTS \"${OPENSSL_ROOT_DIR}/bin\")\n";
+    ss << "    file(GLOB RTPROTECT_OPENSSL_DLLS \"${OPENSSL_ROOT_DIR}/bin/*.dll\")\n";
+    ss << "    if(RTPROTECT_OPENSSL_DLLS)\n";
+    ss << "      add_custom_command(TARGET " << target_name << " POST_BUILD\n";
+    ss << "        COMMAND ${CMAKE_COMMAND} -E copy_if_different ${RTPROTECT_OPENSSL_DLLS} $<TARGET_FILE_DIR:" << target_name << ">\n";
+    ss << "      )\n";
+    ss << "    endif()\n";
+    ss << "  endif()\n";
+    ss << "endif()\n";
 
     ss << "\n# Compiler & Linker Hardening Profile: " << ToString(options.profile) << "\n";
     if (options.profile == ProtectionProfile::kMaximum) {
@@ -2118,6 +2128,16 @@ IntegrationReport ExecuteIntegration(const IntegrationOptions& options) {
       }
       if (fs::exists(lic_path)) {
         fs::copy_file(lic_path, dest_dir / "client.license", fs::copy_options::overwrite_existing, ec);
+      }
+
+      // Deploy bundled OpenSSL runtime DLLs next to executable so target runs standalone
+      fs::path openssl_bin_dir = fs::path(root_str) / "third_party" / "openssl" / "bin";
+      if (fs::exists(openssl_bin_dir)) {
+        for (const auto& entry : fs::directory_iterator(openssl_bin_dir)) {
+          if (entry.path().extension() == ".dll") {
+            fs::copy_file(entry.path(), dest_dir / entry.path().filename(), fs::copy_options::overwrite_existing, ec);
+          }
+        }
       }
 
       // Validate protected build

@@ -76,12 +76,17 @@ if ($LASTEXITCODE -ne 0) { throw "CTest regression detected -- aborting release 
 
 # Helper to find built files across Ninja and MSVC directory layouts
 function Find-BuiltFile ($BaseDir, $SubPath, $FileName) {
-    $p1 = Join-Path $BaseDir "$SubPath\$FileName"
-    if (Test-Path $p1) { return $p1 }
     $p2 = Join-Path $BaseDir "$SubPath\Release\$FileName"
     if (Test-Path $p2) { return $p2 }
-    $matches = Get-ChildItem -Path (Join-Path $BaseDir $SubPath) -Recurse -Filter $FileName -ErrorAction SilentlyContinue
-    if ($matches) { return $matches[0].FullName }
+    $p1 = Join-Path $BaseDir "$SubPath\$FileName"
+    if (Test-Path $p1) { return $p1 }
+    $matches = Get-ChildItem -Path (Join-Path $BaseDir $SubPath) -Recurse -Filter $FileName -ErrorAction SilentlyContinue |
+        Where-Object { $_.FullName -notmatch "CMakeFiles" }
+    if ($matches) {
+        $rel = $matches | Where-Object { $_.DirectoryName -match "Release" }
+        if ($rel) { return $rel[0].FullName }
+        return $matches[0].FullName
+    }
     return $null
 }
 
@@ -207,7 +212,9 @@ foreach ($libName in $SdkLibNames) {
         ($_.FullName -notmatch "CMakeFiles|third_party|Testing")
     }
     if ($found) {
-        Copy-Item $found[0].FullName $SdkLib
+        $rel = $found | Where-Object { $_.DirectoryName -match "Release" }
+        $selected = if ($rel) { $rel[0] } else { $found[0] }
+        Copy-Item $selected.FullName $SdkLib
     } else {
         throw "Fatal: Static library for $libName not found in build directory $BuildDir"
     }
