@@ -5,6 +5,36 @@ This project adheres to Semantic Versioning and structured security reporting.
 
 ---
 
+## [2.7.0-hardened] - 2026-10-26
+
+### Anti-Tamper Hardening, MSVC Startup Hook Retention & Documentation Overhaul
+
+- **MSVC Pre-Main Startup Hook Retention:**
+  - Resolved silent linker elimination of `.CRT$XCU` static initializer pointer under MSVC Release Whole Program Optimization (`/GL /OPT:REF`).
+  - Marked `.CRT$XCU` function pointer with `extern "C"` and injected linker retention directive (`#pragma comment(linker, "/include:g_rtprotect_init_hook")`).
+  - Added standard C++ dynamic object initializer fallback (`g_rtprotect_startup_obj`) with idempotent execution flags, guaranteeing pre-`main()` verification across all MSVC generator configurations.
+
+- **Hardware Breakpoint Watchdog Stabilization and ABI Memory Alignment:**
+  - Applied `alignas(16)` to all stack-allocated `CONTEXT` structures in `anti_debug.cpp`, resolving x64 Windows ABI alignment violations in `GetThreadContext`.
+  - Replaced thread polling sleep loops with `std::condition_variable` synchronization, eliminating process termination delays and ensuring instantaneous shutdown when stopping the watchdog.
+  - Implemented `WatchdogLifetimeGuard` and registered an `std::atexit` hook, guaranteeing watchdog thread joins prior to CRT cleanup to eliminate `0xC0000409` (`STATUS_STACK_BUFFER_OVERRUN`) termination exceptions.
+  - Changed helper thread wait timeout from 100ms to `INFINITE` in `CheckHardwareBreakpoints`, preventing thread execution against deallocated stack frames.
+
+- **Automated OpenSSL Runtime DLL Deployment:**
+  - Injected CMake `POST_BUILD` custom commands into client CMake templates (`integration_engine.cpp`) and consumer sample projects, automating the deployment of `libcrypto-*.dll` and `libssl-*.dll` adjacent to target binaries.
+  - Updated integration deployment Step 10 to copy OpenSSL DLLs into target release directories, ensuring standalone execution without requiring manual `%PATH%` modification.
+
+- **Multi-Config Directory Discovery & Test Hardening:**
+  - Updated candidate search order in `integration_engine.cpp` and `test_sample_e2e.ps1` to prioritize active multi-config directories (`Release`, `Debug`, `config_name`) over root build directories, preventing stale binary shadowing.
+  - Enhanced E2E tamper assertions to accept rejection from either the pre-`main()` startup hook or programmatic security verifications.
+
+- **Comprehensive Technical Documentation Architecture:**
+  - Completely redesigned project documentation set conforming to formal technical writing standards without marketing phrases, conversational filler, or informal symbols.
+  - Created dedicated technical manuals: `docs/architecture.md`, `docs/installation.md`, `docs/configuration.md`, `docs/api.md`, `docs/database.md`, `docs/development.md`, `docs/deployment.md`, and `docs/security.md`.
+  - Added official RTProtect project logo to `docs/assets/logo.png` and embedded it within `README.md`.
+
+---
+
 ## [2.6.0-hardened] - 2026-10-23
 
 ### CI Resolution, Release Packaging Overhaul & Production Hardening

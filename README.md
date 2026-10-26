@@ -1,157 +1,244 @@
+<p align="center">
+  <img src="docs/assets/logo.png" alt="RTProtect Logo" width="180">
+</p>
+
 # RTProtect
 
-**Enterprise C++ Runtime Binary Protection, Anti-Tamper & Cryptographic Licensing Framework for Windows x64**
+Enterprise C++ Runtime Binary Protection, Anti-Tamper, and Cryptographic Licensing Framework for Windows x64.
 
-[![Platform](https://img.shields.io/badge/platform-Windows%20x64-blue.svg)](https://microsoft.com)
-[![Standard](https://img.shields.io/badge/C%2B%2B-20-blue.svg)](https://en.cppreference.com/w/cpp/20)
-[![Compiler](https://img.shields.io/badge/compiler-MSVC%202022%20%7C%20MinGW--w64-green.svg)](https://visualstudio.microsoft.com/)
-[![Cryptography](https://img.shields.io/badge/crypto-OpenSSL%203.4.0%20(AES--GCM%20%2F%20Ed25519)-purple.svg)](https://www.openssl.org/)
-[![Tests](https://img.shields.io/badge/tests-22%2F22%20passing-brightgreen.svg)]()
+[![Platform](https://img.shields.io/badge/platform-Windows%20x64-0078D6.svg)](https://microsoft.com)
+[![Standard](https://img.shields.io/badge/standard-C%2B%2B20-00599C.svg)](https://en.cppreference.com/w/cpp/20)
+[![Compiler](https://img.shields.io/badge/compilers-MSVC%202022%20%7C%20MinGW--w64%20GCC-green.svg)](https://visualstudio.microsoft.com/)
+[![Cryptography](https://img.shields.io/badge/crypto-OpenSSL%20(AES--256--GCM%20%2F%20Ed25519)-7A3E9D.svg)](https://www.openssl.org/)
+[![Tests](https://img.shields.io/badge/tests-26%2F26%20passed%20(100%25)-brightgreen.svg)]()
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
 ---
 
-## 1. Overview
+## 1. Project Overview
 
-RTProtect is a commercial-grade binary protection and cryptographic licensing framework designed specifically for native C and C++ applications on Windows x64. It raises the reverse-engineering barrier against static disassembly, interactive debugging, binary patching, and unauthorized distribution by combining **bytecode virtualization**, **Clang AST semantic instrumentation**, **active anti-debugging and anti-hooking watchdogs**, and a **hardware-bound node-locked licensing authority**.
+RTProtect is an engineering framework providing compile-time source transformation, bytecode virtualization, active anti-tamper defenses, and cryptographic license validation for native applications running on Windows x64. It is designed to harden proprietary software, game clients, and enterprise tools against static decompilation, dynamic debugger instrumentation, in-memory dumping, and unlicensed execution.
 
-RTProtect is engineered strictly with a **fail-closed, defense-in-depth architecture**:
-- **Offline Asymmetric Authority:** Authorization decisions rely on vendor-signed Ed25519 certificates. Distributed client binaries embed only public verification keys; private signing keys reside strictly offline or inside secure licensing servers.
-- **Tamper-Poisoned Key Derivation:** Centralized boolean gates (`if (tampered) exit()`) are eliminated in favor of HKDF-HMAC-SHA256 key poisoning (`DeriveTamperBoundKey`). Detected debuggers or memory hooks silently corrupt internal decryption keys, triggering cascaded cryptographic failures.
-- **Transactional Integration:** Automated project instrumenters support dry-run previews, automated timestamped backups, and byte-for-byte rollback.
-- **Native Windows Specialization:** Utilizes Windows Data Protection API (DPAPI), Structured Exception Handling (SEH), Hardware Breakpoint Debug Registers (`DR0`–`DR3`), PE dynamic API resolution, and Control Flow Guard (CFG).
-
----
-
-## 2. Core Protection Modules
-
-```
-                           +----------------------------------------+
-                           |           Target Application           |
-                           +-------------------+--------------------+
-                                               |
-                     +-------------------------+-------------------------+
-                     |                                                   |
-                     v                                                   v
-        +-------------------------+                         +-------------------------+
-        |   bytecode_vm / VM IR   |                         |  antitamper / Integrity |
-        |  - Stack & Threaded VMs |                         |  - Hardware Watchdog    |
-        |  - Randomized Opcodes   |                         |  - PE Import Resolution |
-        |  - Per-Call Verifier    |                         |  - Anti-Dump / Memory   |
-        +------------+------------+                         +------------+------------+
-                     |                                                   |
-                     +-------------------------+-------------------------+
-                                               |
-                                               v
-                           +----------------------------------------+
-                           |         licensing / Authority          |
-                           |  - Hardware ID (CPU, GUID, Disk)       |
-                           |  - DPAPI Token Secure Storage          |
-                           |  - Ephemeral AES-256 Transport         |
-                           |  - Anti-Replay Challenge Nonces        |
-                           +-------------------+--------------------+
-                                               |
-                                               v
-                           +----------------------------------------+
-                           |   crypto & integrity (OpenSSL 3.4.0)   |
-                           |  - AES-256-GCM Authenticated Encrypt   |
-                           |  - HKDF-SHA256 Key Derivation          |
-                           |  - Ed25519 Manifest & Token Signatures |
-                           +----------------------------------------+
-```
-
-### 2.1 Bytecode Virtualization (`bytecode_vm/`)
-- **Virtual Instruction Set:** Custom closed virtual machine supporting register-threaded and stack-based execution architectures.
-- **Static Bytecode Verifier:** Strict linear decode pass rejects malformed bytecode, out-of-bounds jumps, and instruction-boundary misalignments prior to execution.
-- **Randomized Opcode Permutation:** Instructions are mapped to per-build randomized seeds, neutralizing universal bytecode decompilers across builds.
-- **Execution Budget Safeguard:** Instruction counter backstop prevents algorithmic infinite-loop denial-of-service attacks.
-
-### 2.2 Clang AST Scanner & Code Transformer (`tooling/`)
-- **Compilation Database Parsing:** Consumes `compile_commands.json` to extract precise compiler flags, defines, and system include paths.
-- **Semantic AST Analysis:** Invokes Clang AST JSON dump (`-Xclang -ast-dump=json`) to validate function parameter types, return values, and eligibility.
-- **Type-Safe Function Wrappers:** Automatically transforms candidate C++ functions into encrypted bytecode blobs while preserving standard calling conventions and ABI boundaries.
-- **Subprocess Safety:** Non-blocking pipe capture via `PeekNamedPipe` with a 30-second execution deadline, 64 MB capture ceiling, and process tree termination (`TerminateProcess`).
-
-### 2.3 Anti-Tamper & Anti-Debugging (`antitamper/`)
-- **Hardware Breakpoint Watchdog:** Background thread scans thread debug registers (`DR0`–`DR3`) periodically for hardware breakpoints.
-- **Dynamic PE Import Resolution:** Critical Win32 APIs are resolved dynamically via hashed PE export table parsing, leaving zero static import entries in the PE header.
-- **Anti-Dump Protection:** Tightens memory page permissions, strips executable headers in memory, and detects process memory dumps.
-- **Timing Anomaly Detection:** Detects single-stepping and debugger trap latency via high-resolution performance counters.
-
-### 2.4 Cryptographic Licensing Authority (`licensing/`)
-- **Hardware-Bound Fingerprinting:** Derives 64-character composite machine fingerprints from CPU characteristics, motherboard GUID, and physical storage volume serials with configurable drift tolerance.
-- **Credential Storage (DPAPI):** Encrypts stored activation tokens via Windows Data Protection API (`CryptProtectData`), tying secrets to the user logon session.
-- **Standalone Activation Server (`rtprotect-activation-server`):** High-performance multithreaded HTTP/TLS server managing seat allocation, instant license revocation, anti-replay nonces, IP and license token-bucket rate limiting, and structured audit event telemetry.
+The framework enforces a **fail-closed, defense-in-depth architecture**:
+- **Offline Asymmetric Authority:** Authorization is verified against vendor-signed Ed25519 cryptographic structures. Client binaries embed only public verification keys; private signing keys are isolated to offline signing environments or secure activation servers.
+- **Fail-Closed Pre-Main Initialization:** CRT static constructor hooks (`.CRT$XCU` on MSVC, `__attribute__((constructor(101)))` on GCC/Clang) enforce signature, manifest, license, and environmental integrity before `main()` executes, terminating invalid binaries immediately.
+- **Tamper-Poisoned Key Derivation:** Direct boolean branching (`if (debugger_present) exit()`) is supplemented with HKDF-HMAC-SHA256 key poisoning (`DeriveTamperBoundKey`). Detected instrumentation poisons runtime cryptographic master keys, causing subsequent operations to fail cryptographically.
+- **Automated AST-Driven Integration:** Clang AST analysis (`-Xclang -ast-dump=json`) discovers, verifies, and transforms marked functions into virtualized bytecode with automated backup, validation, and rollback capability.
+- **Windows Subsystem Specialization:** Uses Windows Data Protection API (DPAPI) for credential isolation, Thread Debug Registers (`DR0`–`DR3`) for hardware breakpoint detection, Process Environment Block (PEB) inspection, and dynamic PE export resolution.
 
 ---
 
-## 3. Tooling and Binaries
+## 2. Core Components
 
-| Binary / Tool | Target | Description |
-|---|---|---|
-| `bin/rtprotect-tool.exe` | CLI | Automated integration engine: plans, instruments, builds, and verifies projects. |
-| `bin/rtprotect-gui.exe` | Win32 GUI | Graphical project inspector, security profiler, and integration wizard. |
-| `bin/rtprotect-activation-server.exe` | Service | Standalone licensing authority serving `/activate`, `/renew`, and `/events`. |
-| `bin/rtprotect-bench.exe` | Benchmark | Statistical benchmark suite measuring native vs. VM overhead and AEAD throughput. |
+```
++-----------------------------------------------------------------------------------+
+|                                Client Application                                 |
++-----------------------------------------------------------------------------------+
+       |                                       |                               |
+       v                                       v                               v
++-------------------------+         +-------------------------+     +--------------------+
+|  Pre-Main Startup Hook  |         |   Bytecode VM Engine    |     |   C / C++ SDK      |
+|  - Digital Signature    |         |  - Stack / Threaded VM  |     |  - Programmatic    |
+|  - Release Manifest     |         |  - Randomized Opcodes   |     |    Integrity API   |
+|  - Machine License      |         |  - Linear Bytecode      |     |  - C-ABI Runtime   |
+|  - Environment Risk     |         |    Verifier             |     |    DLL Export      |
++-------------------------+         +-------------------------+     +--------------------+
+       |                                       |                               |
+       +-------------------+-------------------+-------------------------------+
+                           |
+                           v
++-----------------------------------------------------------------------------------+
+|                              Protection Subsystems                                |
++-------------------------+-------------------------+-------------------------------+
+|  antitamper / Integrity |  licensing / Authority  |  crypto / Memory Security     |
+|  - PEB Flag Probing     |  - Hardware ID (CPU,    |  - AES-256-GCM Authenticated  |
+|  - DR0-DR3 HW BP Watch  |    Motherboard, Disk)   |    Encryption                 |
+|  - Timing Anomaly Check |  - DPAPI Secure Storage |  - HKDF-SHA256 Derivation     |
+|  - Anti-Dump Stripping  |  - Replay-Protected     |  - Ed25519 Asymmetric Sign    |
+|  - PE Import Hashing    |    HTTPS Activation     |  - SecureBuffer Zeroization   |
++-------------------------+-------------------------+-------------------------------+
+```
+
+### 2.1 Bytecode Virtual Machine (`bytecode_vm/`)
+Translates native instructions into a custom virtual instruction set. Includes both stack-based and register-threaded execution backends, dynamic execution fuel limits to prevent execution loops, randomized per-build opcode mappings, and an ahead-of-time linear bytecode verifier that validates jump offsets, instruction boundaries, and operand types before execution.
+
+### 2.2 Anti-Tamper & Anti-Debugging Engine (`antitamper/`)
+Provides multi-layered dynamic defenses against reverse-engineering tools:
+- Probes PEB debug flags (`BeingDebugged`, `NtGlobalFlag`) directly without calling hookable Win32 wrappers.
+- Hardware breakpoint detection inspecting processor debug registers (`DR0`–`DR3`).
+- Timing anomaly detection using high-resolution performance counters (`QueryPerformanceCounter`) to detect single-stepping latency.
+- Anti-dump defenses that strip PE header artifacts from memory and detect memory probing tools.
+- Dynamic PE export resolution via runtime symbol hashing, avoiding static IAT entries for sensitive system APIs.
+
+### 2.3 Licensing & Hardware Fingerprinting (`licensing/`)
+Implements node-locked, machine-bound entitlement verification:
+- Composite hardware fingerprint derived from CPU identity, motherboard firmware UUID, and physical storage drive serial numbers with weighted Hamming similarity matching.
+- Secure storage backed by Windows DPAPI (`CryptProtectData` / `CryptUnprotectData`).
+- Anti-clock-rollback engine maintaining monotonic timestamps with configurable grace periods.
+- Standalone multi-threaded HTTPS activation server (`rtprotect-activation-server`) managing seat reservations, instant revocation, anti-replay nonces, rate limiting, and administrative audit logging.
+
+### 2.4 Cryptographic Primitives (`crypto/`, `integrity/`)
+Powered by OpenSSL:
+- Authenticated symmetric encryption: AES-256-GCM.
+- Key derivation: HKDF-SHA256.
+- Digital signatures: Ed25519 (RFC 8032).
+- Integrity verification: Streaming SHA-256.
+- Secure memory: `SecureBuffer` with automated `SecureWipe` zeroization on deallocation.
 
 ---
 
-## 4. Quickstart Guide
+## 3. Technology Stack and Prerequisites
 
-### 4.1 Automated CLI Integration
+### Build Environment
+- **Operating System:** Windows 10 / 11 (x64) or Windows Server 2019+ (x64).
+- **Supported Compilers:**
+  - Microsoft Visual Studio 2022 (MSVC v143, Version 19.30 or newer).
+  - MinGW-w64 GCC (Version 11.2 or newer, GCC 15.2 verified).
+  - LLVM Clang 16+ (for libFuzzer with AddressSanitizer and UndefinedBehaviorSanitizer).
+- **Build System:** CMake 3.20 or newer, Ninja 1.10+ or MSBuild.
+- **Cryptography:** OpenSSL (bundled under `third_party/openssl/`).
 
-To protect an existing CMake or Unreal Engine project:
+---
 
-```cmd
-# 1. Preview changes and inspect candidate functions (dry run)
-bin\rtprotect-tool.exe integrate C:\Projects\MyGame --profile balanced --dry-run
+## 4. Building from Source
 
-# 2. Execute transactional integration with automated backup
-bin\rtprotect-tool.exe integrate C:\Projects\MyGame --profile balanced --product com.vendor.mygame --version 1.0.0
+Execute build commands from a PowerShell or Developer Command Prompt at the repository root.
 
-# 3. Validate compiled binaries against vendor-signed manifest
-bin\rtprotect-tool.exe validate-build C:\Projects\MyGame\build\bin\MyGame.exe release.manifest release.sig release.pub
+### Building with MinGW-w64 and Ninja
+```powershell
+cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DOPENSSL_ROOT_DIR="third_party/openssl" -DRTPROTECT_BUILD_TESTS=ON
+cmake --build build
+ctest --test-dir build -C Release --output-on-failure
 ```
 
-### 4.2 Graphical User Interface (`rtprotect-gui.exe`)
-Launch `bin/rtprotect-gui.exe` to inspect project source trees visually, select security profiles (Dev, Balanced, Maximum), configure vendor keys, review candidate functions, and execute protection workflows.
+### Building with Visual Studio 2022 (MSVC)
+```powershell
+cmake -B build-vs2022 -G "Visual Studio 17 2022" -A x64 -DOPENSSL_ROOT_DIR="${PWD}/third_party/openssl" -DRTPROTECT_BUILD_TESTS=ON
+cmake --build build-vs2022 --config Release
+ctest --test-dir build-vs2022 -C Release --output-on-failure
+```
 
-### 4.3 Running the Licensing Activation Server
-```cmd
-# Development / Local testing (insecure mode with ephemeral keys):
-bin\rtprotect-activation-server.exe --insecure-dev-only --port 8080 --host 127.0.0.1 --db activations.db
+### Automated Test Verification Matrix
+All 26 test suites execute under CTest:
 
-# Register a 5-seat commercial license with generated activation credential:
-bin\rtprotect-activation-server.exe --db activations.db --register-license "LIC-ENT-001" "com.vendor.mygame" 5 --generate-credential
+```text
+ 1/26 test_aead ........................ Passed
+ 2/26 test_kdf ......................... Passed
+ 3/26 test_vm .......................... Passed
+ 4/26 test_protected_checksum .......... Passed
+ 5/26 test_manifest .................... Passed
+ 6/26 test_signing ..................... Passed
+ 7/26 test_bound_key ................... Passed
+ 8/26 test_file_io ..................... Passed
+ 9/26 test_checked_arith_fallback ...... Passed
+10/26 test_secure_buffer ............... Passed
+11/26 test_obfuscated_string ........... Passed
+12/26 test_checksum_flattened .......... Passed
+13/26 test_license ..................... Passed
+14/26 test_activation .................. Passed
+15/26 test_activation_service .......... Passed
+16/26 test_secrets_manager ............. Passed
+17/26 test_trusted_time ................ Passed
+18/26 test_hardware_id ................. Passed
+19/26 test_update_manifest ............. Passed
+20/26 test_antitamper .................. Passed
+21/26 test_opcode_map .................. Passed
+22/26 test_integration_engine .......... Passed
+23/26 test_unreal_integration .......... Passed
+24/26 test_pe_protector ................ Passed
+25/26 test_c_api ....................... Passed
+26/26 test_sample_e2e .................. Passed
 
-# Provision signing key directly into Windows DPAPI vault (zero plaintext on disk):
-bin\rtprotect-activation-server.exe --provision-vault "prod-key-01" "pubkey.hex"
-
-# Production TLS deployment backed by DPAPI secret vault:
-bin\rtprotect-activation-server.exe --port 8443 --host 0.0.0.0 --tls-cert cert.pem --tls-key key.pem --vault-id "prod-key-01" --admin-token-file admin_key.txt
+100% tests passed, 0 tests failed out of 26
 ```
 
 ---
 
-## 5. C++ Developer SDK Integration
+## 5. Usage Workflows
 
-Add the RTProtect SDK to any CMake project:
+### 5.1 Command-Line Protection Tool (`rtprotect-tool`)
 
-### 5.1 CMakeLists.txt
+#### 1. Dry-Run Project Inspection
+Preview proposed changes and verify function eligibility without writing files:
+```powershell
+.\build\tooling\rtprotect-tool.exe integrate C:\Projects\MyProject --profile balanced --dry-run
+```
+
+#### 2. Project Integration with Development Keys
+Execute automated source instrumentation, CMake configuration injection, and validation build:
+```powershell
+.\build\tooling\rtprotect-tool.exe integrate C:\Projects\MyProject `
+    --profile balanced `
+    --dev-keys `
+    --product com.vendor.myproject `
+    --version 1.0.0
+```
+
+#### 3. Rollback Changes
+Restore the target project to its pre-integration state using the automated backup:
+```powershell
+.\build\tooling\rtprotect-tool.exe rollback C:\Projects\MyProject C:\Projects\MyProject_backup_timestamp
+```
+
+#### 4. Validating Protected Builds
+Verify the digital signature and resource digest of a compiled distribution binary:
+```powershell
+.\build\tooling\rtprotect-tool.exe validate-build `
+    C:\Projects\MyProject `
+    release.pub `
+    release.manifest `
+    release.sig
+```
+
+### 5.2 Standalone Activation Server (`rtprotect-activation-server`)
+
+The activation authority provides online seat management and hardware-bound activation token issuance over HTTPS.
+
+#### Development Execution (Local HTTP with In-Memory / Ephemeral Keys)
+```powershell
+.\build\tooling\rtprotect-activation-server.exe `
+    --insecure-dev-only `
+    --port 8080 `
+    --host 127.0.0.1 `
+    --db activations.db
+```
+
+#### Production Execution (TLS & Windows DPAPI Key Vault)
+```powershell
+# 1. Provision an Ed25519 signing key into the DPAPI vault
+.\build\tooling\rtprotect-activation-server.exe --provision-vault "prod-key-01" "activation_pub.hex"
+
+# 2. Provision an AES-256 database envelope key into the DPAPI vault
+.\build\tooling\rtprotect-activation-server.exe --provision-db-vault "db-key-01"
+
+# 3. Launch the production service
+.\build\tooling\rtprotect-activation-server.exe `
+    --port 8443 `
+    --host 0.0.0.0 `
+    --tls-cert cert.pem `
+    --tls-key key.pem `
+    --vault-id "prod-key-01" `
+    --db-vault-id "db-key-01" `
+    --admin-token-file admin_secret.txt
+```
+
+### 5.3 C++ SDK Integration
+
+To integrate RTProtect into an existing C++ project:
+
+#### `CMakeLists.txt`
 ```cmake
 cmake_minimum_required(VERSION 3.20)
-project(MyProtectedApp CXX)
+project(EnterpriseApp CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-# Find RTProtect package from SDK installation
 find_package(RTProtect CONFIG REQUIRED)
 
-add_executable(MyProtectedApp main.cpp)
+add_executable(EnterpriseApp main.cpp)
 
-# Link desired protection modules
-target_link_libraries(MyProtectedApp PRIVATE
+target_link_libraries(EnterpriseApp PRIVATE
     RTProtect::rtprotect_licensing
     RTProtect::rtprotect_antitamper
     RTProtect::rtprotect_vm
@@ -160,120 +247,124 @@ target_link_libraries(MyProtectedApp PRIVATE
 )
 ```
 
-### 5.2 Application Source Code (`main.cpp`)
+#### `main.cpp`
 ```cpp
 #include <iostream>
 #include <antitamper/anti_debug.h>
 #include <licensing/hardware_id.h>
 
 int main() {
-    // 1. Verify environment integrity (anti-debugging check)
-    if (rtprotect::antitamper::CheckDebuggerPresent()) {
-        std::cerr << "Debugger detected. Execution terminated.\n";
+  if (rtprotect::antitamper::CheckDebuggerPresent()) {
+    std::cerr << "Debugger detected. Halting execution.\n";
+    return 1;
+  }
+
+  std::string hwid = rtprotect::licensing::GetLocalHardwareId();
+  std::cout << "Machine Binding: " << hwid << "\n";
+  return 0;
+}
+```
+
+### 5.4 C-ABI Runtime Library (`rtprotect_runtime.dll`)
+
+Applications in C, C#, Python, or Rust can consume the C-ABI interface exposed by `runtime/c_api.h`:
+
+```c
+#include "c_api.h"
+#include <stdio.h>
+
+int main(void) {
+    char hwid[65] = {0};
+    if (rtprotect_get_hardware_id(hwid, sizeof(hwid)) > 0) {
+        printf("Hardware ID: %s\n", hwid);
+    }
+
+    double risk = rtprotect_assess_environment_risk();
+    if (risk > 0.5) {
+        fprintf(stderr, "Host environment risk exceeded threshold: %.2f\n", risk);
         return 1;
     }
 
-    // 2. Query hardware node-locked identifier
-    std::string hwid = rtprotect::licensing::GetLocalHardwareId();
-    std::cout << "Machine Fingerprint: " << hwid << "\n";
-    std::cout << "RTProtect initialized successfully.\n";
     return 0;
 }
 ```
 
 ---
 
-## 6. Building and Testing from Source
+## 6. Project Structure
 
-### Requirements
-- **Operating System:** Windows 10 / 11 (x64)
-- **Compiler:** Visual Studio 2022 (MSVC v143, Version 19.30+) or MinGW-W64 (GCC 15.2+)
-- **Build System:** CMake 3.20+ and Ninja
-- **Cryptography:** OpenSSL 3.4.0 (pre-bundled under `third_party/openssl/`)
-
-### Build with MinGW-W64 / Ninja:
-```powershell
-cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DOPENSSL_ROOT_DIR="third_party/openssl"
-cmake --build build --config Release
-ctest --test-dir build --output-on-failure
-```
-
-### Build with Visual Studio 2022 (from Developer PowerShell for VS 2022):
-```powershell
-cmake -B build -G "Visual Studio 17 2022" -A x64 -DOPENSSL_ROOT_DIR="${PWD}/third_party/openssl" -DRTPROTECT_BUILD_TESTS=ON
-cmake --build build --config Release
-ctest --test-dir build -C Release --output-on-failure
-```
-
-### Automated Verification Status:
-```
-Test project build/
- 1/22 Test  #1: test_aead ........................   Passed    0.04 sec
- 2/22 Test  #2: test_kdf .........................   Passed    0.03 sec
- 3/22 Test  #3: test_vm ..........................   Passed    0.02 sec
- 4/22 Test  #4: test_protected_checksum ..........   Passed    0.03 sec
- 5/22 Test  #5: test_manifest ....................   Passed    0.02 sec
- 6/22 Test  #6: test_signing .....................   Passed    0.03 sec
- 7/22 Test  #7: test_bound_key ...................   Passed    0.03 sec
- 8/22 Test  #8: test_file_io .....................   Passed    0.02 sec
- 9/22 Test  #9: test_checked_arith_fallback ......   Passed    0.15 sec
-10/22 Test #10: test_secure_buffer ...............   Passed    0.02 sec
-11/22 Test #11: test_obfuscated_string ...........   Passed    0.02 sec
-12/22 Test #12: test_checksum_flattened ..........   Passed    0.03 sec
-13/22 Test #13: test_license .....................   Passed    0.03 sec
-14/22 Test #14: test_activation ..................   Passed    0.12 sec
-15/22 Test #15: test_activation_service ..........   Passed    0.24 sec
-16/22 Test #16: test_trusted_time ................   Passed    0.14 sec
-17/22 Test #17: test_hardware_id .................   Passed    0.03 sec
-18/22 Test #18: test_update_manifest .............   Passed    0.04 sec
-19/22 Test #19: test_antitamper ..................   Passed    0.11 sec
-20/22 Test #20: test_opcode_map ..................   Passed    0.02 sec
-21/22 Test #21: test_integration_engine ..........   Passed   19.01 sec
-22/22 Test #22: test_unreal_integration ..........   Passed    0.05 sec
-
-100% tests passed, 0 tests failed out of 22
+```text
+rtprotect/
+|-- antitamper/            # PEB checking, hardware breakpoint watchdog, PE import hashing, anti-dump
+|-- bytecode_vm/           # Custom bytecode VM, instruction set, verification pass, opcode map
+|-- crypto/                # OpenSSL AES-256-GCM, HKDF-SHA256, SecureBuffer zeroization
+|-- integrity/             # Streaming SHA-256, Ed25519 signatures, release manifests, bound keys
+|-- licensing/             # Hardware ID, DPAPI storage, activation client/server, trusted time
+|-- obfuscation/           # Mixed Boolean-Arithmetic (MBA), opaque predicates, control-flow flattening
+|-- runtime/               # C-ABI export layer (c_api.h) producing rtprotect_runtime.dll
+|-- tooling/               # rtprotect-tool CLI, integration engine, GUI front-end, activation server
+|-- bench/                 # Benchmark harness measuring VM and AEAD throughput (rtprotect-bench)
+|-- examples/              # Consumer samples and integration reference targets
+|-- tests/                 # Unit, integration, E2E PowerShell, and regression test suites
+|-- fuzz/                  # LibFuzzer targets for parser, VM, and PE modules
+|-- docs/                  # Detailed architectural, API, and operational documentation
++-- third_party/           # Bundled OpenSSL headers and precompiled x64 Windows libraries
 ```
 
 ---
 
-## 7. Release Packaging & Verification
+## 7. Verified Benchmarks
 
-Packaging is executed via `tooling/package_release.ps1`, producing three distinct release archives and running an automated consumer sample smoke test against the newly built SDK:
+Benchmarks recorded on Windows x64 via `rtprotect-bench.exe` (1,000 discarded warm-up iterations, 15 independent trials, 20,000 iterations per trial):
+
+| Execution Model | Median Duration | Duration per Iteration | Overhead vs Baseline |
+|:---|:---:|:---:|:---:|
+| Native (unprotected baseline) | 2.380 ms | 119.0 ns | 1.00x |
+| Control-Flow Flattened (Phase 5) | 2.641 ms | 132.1 ns | 1.11x |
+| Bytecode VM (including per-call static verification) | 4.742 ms | 23,711.0 ns | ~199x |
+
+### AES-256-GCM Cryptographic Throughput
+- **1 KiB payload:** 433.2 MiB/s
+- **64 KiB payload:** 1,736.4 MiB/s
+- **1,024 KiB payload:** 1,471.5 MiB/s
+
+---
+
+## 8. Release Artifacts & Distribution
+
+Release packaging is automated via [`tooling/package_release.ps1`](tooling/package_release.ps1):
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File tooling\package_release.ps1 -BuildDir build
+powershell -ExecutionPolicy Bypass -File tooling/package_release.ps1 -BuildDir build -OpenSslDir third_party/openssl
 ```
 
-### Generated Artifacts (`dist/`):
-- **`rtprotect-windows-x64.zip`** — CLI tool, GUI profiler, benchmark runner, runtime OpenSSL DLLs, and documentation.
-- **`rtprotect-sdk-windows-x64.zip`** — Developer SDK: C++ headers, static libraries, `RTProtectConfig.cmake`, and consumer sample project.
-- **`rtprotect-activation-server-windows-x64.zip`** — Standalone activation authority server executable and dependencies.
-- **`SHA256SUMS.txt`** — Cryptographic checksum manifest.
-- **`SBOM.spdx.json`** — Software Bill of Materials (SPDX 2.3 standard).
-- **`BUILD_INFO.txt`** — Compilation environment and Git commit provenance.
+The script compiles all targets, validates CTest suites, smoke tests the consumer sample with the newly packaged SDK, and produces three standalone zip archives in `dist/`:
+
+1. **`rtprotect-windows-x64.zip`**: Command-line protection tool (`rtprotect-tool.exe`), GUI wizard (`rtprotect-gui.exe`), benchmark tool (`rtprotect-bench.exe`), and runtime DLLs.
+2. **`rtprotect-sdk-windows-x64.zip`**: Developer C++ SDK containing headers (`include/`), precompiled static libraries (`lib/`), CMake configuration modules, and example projects.
+3. **`rtprotect-activation-server-windows-x64.zip`**: Standalone activation server daemon (`rtprotect-activation-server.exe`) and runtime dependencies.
 
 ---
 
-## 8. Benchmark Results (Windows x64)
+## 9. Technical Documentation Directory
 
-Statistical benchmarks captured via `rtprotect-bench.exe` (1000 warm-up iterations discarded, 15 independent trials, 20,000 iterations per trial):
+For in-depth operational and engineering references, consult the dedicated documentation:
 
-| Implementation | Median Time | ns / iteration | Performance Relative to Native |
-|---|---|---|---|
-| Native (unprotected baseline) | 0.583 ms | 29.2 ns | 1.00x (Baseline) |
-| Flattened (control-flow obfuscation) | 0.586 ms | 29.3 ns | 1.01x (~0% overhead) |
-| Bytecode VM (with per-call static verification) | 1.106 ms | 5530.0 ns | ~190x |
-
-### AES-256-GCM Cryptographic Throughput:
-- **1 KiB payload:** 470.7 MiB/s
-- **64 KiB payload:** 1,409.7 MiB/s
-- **1024 KiB payload:** 1,151.3 MiB/s
+| Document | Focus Area |
+|:---|:---|
+| [`docs/architecture.md`](docs/architecture.md) | Architectural decomposition, execution models, and data flows |
+| [`docs/installation.md`](docs/installation.md) | Toolchain prerequisites, compiler configuration, and building from source |
+| [`docs/configuration.md`](docs/configuration.md) | Security profiles, compile-time macros, and server environment variables |
+| [`docs/api.md`](docs/api.md) | C++ SDK reference, C-ABI runtime API, CLI reference, and HTTP endpoints |
+| [`docs/database.md`](docs/database.md) | Activation database schema, AES envelope encryption, and DPAPI integration |
+| [`docs/security.md`](docs/security.md) | Cryptographic guarantees, anti-tamper mechanisms, and threat model |
+| [`docs/development.md`](docs/development.md) | Coding guidelines, testing strategy, fuzz testing, and debugging |
+| [`docs/deployment.md`](docs/deployment.md) | Production server deployment, TLS configuration, and client distribution |
+| [`CONTRIBUTING.md`](CONTRIBUTING.md) | Contribution standards, code style, and pull request procedures |
+| [`CHANGELOG.md`](CHANGELOG.md) | Version history, security remediations, and architectural milestones |
 
 ---
 
-## 9. Security & Compliance Notices
+## 10. License
 
-- **Threat Model:** Refer to [`docs/THREAT_MODEL.md`](docs/THREAT_MODEL.md) for the formal security boundaries and assumptions.
-- **Security Audit:** Comprehensive audit findings and remediations are tracked in [`SECURITY_AUDIT.md`](SECURITY_AUDIT.md).
-- **Third-Party Licenses:** OpenSSL 3.4.0 license terms are detailed in [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md).
-- **Project License:** Licensed under the [MIT License](LICENSE).
+This project is licensed under the [MIT License](LICENSE). Third-party library notices and license texts for OpenSSL are documented in [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md).
