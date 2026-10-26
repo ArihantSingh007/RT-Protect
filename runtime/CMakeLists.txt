@@ -1,28 +1,38 @@
-# This whole directory is only ever reached when
-# RTPROTECT_ENABLE_EXPERIMENTAL_RUNTIME_RECONSTRUCTION is explicitly turned
-# ON (see top-level CMakeLists.txt) -- implementing the brief's instruction
-# that this technique be "an isolated, opt-in research experiment" at the
-# strongest level available: it is not even compiled into a default build.
-
-add_library(rtprotect_runtime STATIC
-    executable_memory.cpp
+add_library(rtprotect_runtime SHARED
+    c_api.cpp
 )
-target_include_directories(rtprotect_runtime PUBLIC ${CMAKE_SOURCE_DIR})
-target_link_libraries(rtprotect_runtime PUBLIC rtprotect_crypto)
 
-if(MSVC)
-  # Control Flow Guard (/guard:cf, enabled process-wide for Release builds
-  # by the top-level CMakeLists.txt) will fail-fast-crash an indirect call
-  # into memory that was made executable at runtime, unless that region's
-  # entry point is registered as a valid CFG call target via
-  # SetProcessValidCallTargetsForMappedView -- which this experimental
-  # module does not implement (see docs/RUNTIME_RECONSTRUCTION.md's CFG
-  # section). Rather than ship a target that would silently crash under
-  # CFG enforcement, CFG is explicitly disabled for this target and
-  # anything linking it. This is itself a real, documented security
-  # trade-off (losing CFG's protection to gain this questionable
-  # capability) -- exactly the kind of cost this phase's documentation is
-  # supposed to surface, not hide.
-  target_compile_options(rtprotect_runtime PUBLIC $<$<CONFIG:Release>:/guard:cf->)
-  target_link_options(rtprotect_runtime PUBLIC $<$<CONFIG:Release>:/guard:cf->)
+target_compile_definitions(rtprotect_runtime PRIVATE RTPROTECT_RUNTIME_EXPORTS)
+target_include_directories(rtprotect_runtime PUBLIC
+    $<BUILD_INTERFACE:${CMAKE_SOURCE_DIR}>
+    $<INSTALL_INTERFACE:include>
+)
+
+target_link_libraries(rtprotect_runtime PRIVATE
+    rtprotect_licensing
+    rtprotect_integrity
+    rtprotect_antitamper
+    rtprotect_crypto
+    rtprotect_tooling
+    OpenSSL::Crypto
+    OpenSSL::SSL
+    $<$<PLATFORM_ID:Windows>:iphlpapi>
+    $<$<PLATFORM_ID:Windows>:ws2_32>
+    $<$<PLATFORM_ID:Windows>:winhttp>
+    $<$<PLATFORM_ID:Windows>:crypt32>
+)
+
+rtprotect_strip_in_release(rtprotect_runtime)
+
+# Optional experimental runtime reconstruction target
+if(RTPROTECT_ENABLE_EXPERIMENTAL_RUNTIME_RECONSTRUCTION)
+  add_library(rtprotect_runtime_reconstruction STATIC
+      executable_memory.cpp
+  )
+  target_include_directories(rtprotect_runtime_reconstruction PUBLIC ${CMAKE_SOURCE_DIR})
+  target_link_libraries(rtprotect_runtime_reconstruction PUBLIC rtprotect_crypto)
+  if(MSVC)
+    target_compile_options(rtprotect_runtime_reconstruction PUBLIC $<$<CONFIG:Release>:/guard:cf->)
+    target_link_options(rtprotect_runtime_reconstruction PUBLIC $<$<CONFIG:Release>:/guard:cf->)
+  endif()
 endif()

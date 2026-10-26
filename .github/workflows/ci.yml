@@ -105,7 +105,7 @@ jobs:
   windows-clang-fuzzing:
     name: Windows Clang libFuzzer + ASan/UBSan
     runs-on: windows-2022
-    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    if: github.event_name == 'push' || github.event_name == 'pull_request' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4

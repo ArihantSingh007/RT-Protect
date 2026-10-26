@@ -92,8 +92,8 @@ else()
   add_compile_options(-Wall -Wextra -Wpedantic -fstack-protector-strong)
   if(MINGW)
     # Position-independent executable on MinGW
-    add_compile_options(-fPIE)
-    add_link_options(-pie)
+    add_compile_options($<$<STREQUAL:$<TARGET_PROPERTY:TYPE>,EXECUTABLE>:-fPIE>)
+    add_link_options($<$<STREQUAL:$<TARGET_PROPERTY:TYPE>,EXECUTABLE>:-pie>)
   endif()
   if(RTPROTECT_HARDEN_RELEASE)
     # -fvisibility=hidden / -fvisibility-inlines-hidden: don't export symbols
@@ -133,9 +133,7 @@ add_subdirectory(licensing)
 add_subdirectory(antitamper)
 add_subdirectory(obfuscation)
 
-if(RTPROTECT_ENABLE_EXPERIMENTAL_RUNTIME_RECONSTRUCTION)
-  add_subdirectory(runtime)
-endif()
+add_subdirectory(runtime)
 
 add_subdirectory(tooling)
 add_subdirectory(bench)

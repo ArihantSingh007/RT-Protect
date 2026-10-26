@@ -143,6 +143,16 @@ target_link_libraries(test_pe_protector PRIVATE rtprotect_tooling rtprotect_anti
 target_include_directories(test_pe_protector PRIVATE ${CMAKE_SOURCE_DIR})
 add_test(NAME test_pe_protector COMMAND test_pe_protector)
 
+add_executable(test_c_api test_c_api.cpp)
+target_link_libraries(test_c_api PRIVATE rtprotect_runtime)
+target_include_directories(test_c_api PRIVATE ${CMAKE_SOURCE_DIR})
+add_custom_command(TARGET test_c_api POST_BUILD
+  COMMAND ${CMAKE_COMMAND} -E copy_if_different
+  $<TARGET_FILE:rtprotect_runtime>
+  $<TARGET_FILE_DIR:test_c_api>
+)
+add_test(NAME test_c_api COMMAND test_c_api)
+
 # Exercise the shipped consumer sample through the actual integration CLI,
 # generated VM wrapper, runtime authorization path, and tamper rejection.
 find_program(RTPROTECT_POWERSHELL_EXECUTABLE NAMES pwsh powershell)

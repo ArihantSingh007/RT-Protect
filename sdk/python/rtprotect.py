@@ -20,11 +20,29 @@ class RTProtectClient:
 
     def __init__(self, lib_path: str = None):
         self._lib = None
-        if lib_path and os.path.exists(lib_path):
-            try:
-                self._lib = ctypes.CDLL(lib_path)
-            except OSError:
-                self._lib = None
+        candidates = []
+        if lib_path:
+            candidates.append(lib_path)
+        else:
+            here = os.path.dirname(os.path.abspath(__file__))
+            candidates.extend([
+                os.path.join(here, "rtprotect_runtime.dll"),
+                os.path.join(here, "..", "..", "dist", "rtprotect-windows-x64", "bin", "rtprotect_runtime.dll"),
+                os.path.join(here, "..", "..", "build", "runtime", "rtprotect_runtime.dll"),
+                os.path.join(here, "..", "..", "build-vs2022", "runtime", "Release", "rtprotect_runtime.dll"),
+                "rtprotect_runtime.dll",
+                "rtprotect_runtime"
+            ])
+
+        for path in candidates:
+            if os.path.exists(path) or ("." not in path and not os.path.isabs(path)):
+                try:
+                    loaded = ctypes.CDLL(path)
+                    if hasattr(loaded, "rtprotect_get_hardware_id"):
+                        self._lib = loaded
+                        break
+                except OSError:
+                    continue
 
     def get_hardware_fingerprint(self) -> str:
         """

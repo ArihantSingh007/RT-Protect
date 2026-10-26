@@ -1,1 +1,23 @@
-* text eol=lf
+# Auto-detect text files and normalize line endings to LF on checkin
+* text=auto eol=lf
+
+# Explicit binary files - do NOT perform CRLF/LF line-ending translations
+*.dll binary
+*.lib binary
+*.exe binary
+*.a binary
+*.so binary
+*.dylib binary
+*.pdb binary
+*.zip binary
+*.tar.gz binary
+*.tgz binary
+*.dat binary
+*.bin binary
+*.sig binary
+*.pub binary
+*.license binary
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.ico binary

@@ -170,6 +170,9 @@ if ($GuiExe) { Copy-Item $GuiExe $ToolsBin } else { throw "Fatal: rtprotect-gui.
 $BenchExe = Find-BuiltFile $BuildDir "bench" "rtprotect-bench.exe"
 if ($BenchExe) { Copy-Item $BenchExe $ToolsBin }
 
+$RuntimeDll = Find-BuiltFile $BuildDir "runtime" "rtprotect_runtime.dll"
+if ($RuntimeDll) { Copy-Item $RuntimeDll $ToolsBin }
+
 Copy-OpenSslDlls $ToolsBin
 
 if (Test-Path (Join-Path $RepoRoot "docs")) {
@@ -188,7 +191,7 @@ New-Item -ItemType Directory -Force -Path $SdkLib | Out-Null
 New-Item -ItemType Directory -Force -Path $SdkCmake | Out-Null
 
 # Copy public headers
-$SdkModules = @("crypto", "integrity", "licensing", "antitamper", "bytecode_vm", "obfuscation", "tooling")
+$SdkModules = @("crypto", "integrity", "licensing", "antitamper", "bytecode_vm", "obfuscation", "tooling", "runtime")
 foreach ($m in $SdkModules) {
     $targetInc = Join-Path $SdkInc $m
     New-Item -ItemType Directory -Force -Path $targetInc | Out-Null
@@ -217,6 +220,13 @@ Copy-Item (Join-Path $RepoRoot "cmake\RTProtectConfig.cmake") $SdkCmake
 $SampleDest = Join-Path $SdkPkgDir "examples\consumer_sample"
 New-Item -ItemType Directory -Force -Path $SampleDest | Out-Null
 Copy-Item (Join-Path $RepoRoot "examples\consumer_sample\*") $SampleDest
+
+# Copy Python and .NET SDK bindings
+$BindingsDest = Join-Path $SdkPkgDir "bindings"
+New-Item -ItemType Directory -Force -Path $BindingsDest | Out-Null
+if (Test-Path (Join-Path $RepoRoot "sdk")) {
+    Copy-Item -Recurse (Join-Path $RepoRoot "sdk\*") $BindingsDest
+}
 
 # Include bundled OpenSSL in SDK for consumer link resolution
 if ($OpenSslDir -and (Test-Path $OpenSslDir)) {
