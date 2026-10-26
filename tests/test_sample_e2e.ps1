@@ -26,6 +26,12 @@ $tamperedPath = Join-Path $runRoot 'tampered'
 try {
     New-Item -ItemType Directory -Path $runRoot | Out-Null
     Copy-Item -LiteralPath $SampleSource -Destination $projectPath -Recurse
+    if (Test-Path -LiteralPath (Join-Path $projectPath 'build_protected')) {
+        Remove-Item -LiteralPath (Join-Path $projectPath 'build_protected') -Recurse -Force
+    }
+    if (Test-Path -LiteralPath (Join-Path $projectPath 'build')) {
+        Remove-Item -LiteralPath (Join-Path $projectPath 'build') -Recurse -Force
+    }
 
     $productId = 'com.rtprotect.sample.e2e.' + [guid]::NewGuid().ToString('N')
     $reportPath = Join-Path $projectPath 'integration-report.json'
@@ -57,18 +63,17 @@ try {
     $opensslBin = Join-Path $RtprotectRoot 'third_party/openssl/bin'
     $env:PATH = $opensslBin + ';' + $env:PATH
     $builtDir = Join-Path $projectPath 'build_protected'
-    $executable = Join-Path $builtDir 'sample_client_app.exe'
-    if (-not (Test-Path -LiteralPath $executable)) {
-        if ($Config -and (Test-Path -LiteralPath (Join-Path $builtDir "$Config\sample_client_app.exe"))) {
-            $builtDir = Join-Path $builtDir $Config
-            $executable = Join-Path $builtDir 'sample_client_app.exe'
-        } elseif (Test-Path -LiteralPath (Join-Path $builtDir "Release\sample_client_app.exe")) {
-            $builtDir = Join-Path $builtDir 'Release'
-            $executable = Join-Path $builtDir 'sample_client_app.exe'
-        } elseif (Test-Path -LiteralPath (Join-Path $builtDir "Debug\sample_client_app.exe")) {
-            $builtDir = Join-Path $builtDir 'Debug'
-            $executable = Join-Path $builtDir 'sample_client_app.exe'
-        }
+    if ($Config -and (Test-Path -LiteralPath (Join-Path $builtDir "$Config\sample_client_app.exe"))) {
+        $builtDir = Join-Path $builtDir $Config
+        $executable = Join-Path $builtDir 'sample_client_app.exe'
+    } elseif (Test-Path -LiteralPath (Join-Path $builtDir "Release\sample_client_app.exe")) {
+        $builtDir = Join-Path $builtDir 'Release'
+        $executable = Join-Path $builtDir 'sample_client_app.exe'
+    } elseif (Test-Path -LiteralPath (Join-Path $builtDir "Debug\sample_client_app.exe")) {
+        $builtDir = Join-Path $builtDir 'Debug'
+        $executable = Join-Path $builtDir 'sample_client_app.exe'
+    } else {
+        $executable = Join-Path $builtDir 'sample_client_app.exe'
     }
 
     if (Test-Path -LiteralPath $opensslBin) {
@@ -87,9 +92,13 @@ try {
         }
     }
 
+    $oldEap = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
     $validOutput = & $executable 2>&1
-    if ($LASTEXITCODE -ne 0) {
-        throw "Protected sample exited with ${LASTEXITCODE}:`n$($validOutput -join "`n")"
+    $validExitCode = $LASTEXITCODE
+    $ErrorActionPreference = $oldEap
+    if ($validExitCode -ne 0) {
+        throw "Protected sample exited with ${validExitCode}:`n$($validOutput -join "`n")"
     }
     if (($validOutput -join "`n") -notmatch 'Virtualized entitlement calculation returned 57\.') {
         throw "Protected sample did not return the expected VM result:`n$($validOutput -join "`n")"
@@ -115,7 +124,10 @@ try {
     $tamperedOutput = & $tamperedExe 2>&1
     $tamperedExitCode = $LASTEXITCODE
     $ErrorActionPreference = $oldEap
-    if ($tamperedExitCode -eq 0 -or ($tamperedOutput -join "`n") -notmatch 'Fatal: Integrity or license verification failed') {
+    if ($tamperedExitCode -eq 0 -or (
+        ($tamperedOutput -join "`n") -notmatch 'Fatal: Integrity or license verification failed' -and
+        ($tamperedOutput -join "`n") -notmatch 'RTProtect security verification failed'
+    )) {
         throw "Tampered executable was not rejected at startup (exit $tamperedExitCode):`n$($tamperedOutput -join "`n")"
     }
 

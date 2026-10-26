@@ -1623,24 +1623,37 @@ IntegrationReport ExecuteIntegration(const IntegrationOptions& options) {
     ss << "}  // namespace rtprotect_client\n\n";
 
     // Automatic pre-main() startup constructor hook (STRICT FAIL-CLOSED)
-    ss << "#if defined(_MSC_VER)\n";
     ss << "static int InitializeRtProtectStartupHook() {\n";
+    ss << "  static bool s_executed = false;\n";
+    ss << "  if (s_executed) return 0;\n";
+    ss << "  s_executed = true;\n";
     ss << "  const char* env_cred = std::getenv(\"RTPROTECT_ACTIVATION_CREDENTIAL\");\n";
     ss << "  if (!rtprotect_client::VerifyClientIntegrityAndLicense(env_cred)) {\n";
     ss << "    std::fprintf(stderr, \"[RTProtect] Fatal: Integrity or license verification failed. Terminating.\\n\");\n";
     ss << "    std::exit(1);\n";
     ss << "  }\n";
     ss << "  return 0;\n";
-    ss << "}\n";
+    ss << "}\n\n";
+
+    ss << "#if defined(_MSC_VER)\n";
     ss << "#pragma section(\".CRT$XCU\", read)\n";
-    ss << "__declspec(allocate(\".CRT$XCU\")) static int (*p_init_rtprotect)() = InitializeRtProtectStartupHook;\n";
+    ss << "extern \"C\" __declspec(allocate(\".CRT$XCU\")) int (*g_rtprotect_init_hook)() = InitializeRtProtectStartupHook;\n";
+    ss << "#if defined(_WIN64)\n";
+    ss << "#pragma comment(linker, \"/include:g_rtprotect_init_hook\")\n";
     ss << "#else\n";
-    ss << "__attribute__((constructor(101))) static void InitializeRtProtectStartupHook() {\n";
-    ss << "  const char* env_cred = std::getenv(\"RTPROTECT_ACTIVATION_CREDENTIAL\");\n";
-    ss << "  if (!rtprotect_client::VerifyClientIntegrityAndLicense(env_cred)) {\n";
-    ss << "    std::fprintf(stderr, \"[RTProtect] Fatal: Integrity or license verification failed. Terminating.\\n\");\n";
-    ss << "    std::exit(1);\n";
+    ss << "#pragma comment(linker, \"/include:_g_rtprotect_init_hook\")\n";
+    ss << "#endif\n\n";
+    ss << "namespace {\n";
+    ss << "struct RtProtectStartupInitializer {\n";
+    ss << "  RtProtectStartupInitializer() {\n";
+    ss << "    InitializeRtProtectStartupHook();\n";
     ss << "  }\n";
+    ss << "};\n";
+    ss << "static const RtProtectStartupInitializer g_rtprotect_startup_obj;\n";
+    ss << "}  // namespace\n";
+    ss << "#else\n";
+    ss << "__attribute__((constructor(101))) static void InitializeRtProtectStartupHookAttribute() {\n";
+    ss << "  InitializeRtProtectStartupHook();\n";
     ss << "}\n";
     ss << "#endif\n";
 
@@ -2050,11 +2063,11 @@ IntegrationReport ExecuteIntegration(const IntegrationOptions& options) {
 
     fs::path built_exe;
     std::vector<fs::path> candidate_dirs = {
-      build_dir,
       build_dir / config_name,
       build_dir / "Release",
       build_dir / "Debug",
-      build_dir / "RelWithDebInfo"
+      build_dir / "RelWithDebInfo",
+      build_dir
     };
     for (const auto& cd : candidate_dirs) {
       if (fs::exists(cd / exe_filename)) {
