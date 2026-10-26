@@ -9,22 +9,21 @@ This document defines the governance, security monitoring, reproducible Windows 
 RTProtect vendors pre-built OpenSSL binaries and headers under `third_party/openssl/` to ensure a deterministic, reproducible build environment for client applications across Windows development environments (MSVC and MinGW-w64) without requiring external package managers (such as vcpkg or chocolatey).
 
 ### Upstream Baseline
-- **Series:** OpenSSL 3.4.x
-- **Active Version:** OpenSSL 3.4.0 (Windows x64 Native)
+- **Series:** OpenSSL 4.1.x
+- **Active Version:** OpenSSL 4.1.0 (Windows x64 Native)
 - **Vendored Artifacts:**
   - Headers: `third_party/openssl/include/openssl/`
   - Import / Static Libraries: `third_party/openssl/lib/` (`libcrypto.lib`, `libssl.lib`)
-  - Runtime DLLs: `third_party/openssl/bin/` (`libcrypto-3-x64.dll`, `libssl-3-x64.dll`)
+  - Runtime DLLs: `third_party/openssl/bin/` (`libcrypto-4-x64.dll`, `libssl-4-x64.dll`)
 
-### Upstream Release Lifecycle & 3.5.x LTS Transition Roadmap
+### Upstream Release Lifecycle & Version Roadmap
 Under OpenSSL's official release lifecycle policy:
-- **Active Release:** OpenSSL 3.4.x (Standard Release). Initial GA October 2024; upstream End-of-Life (EOL) scheduled for October 2025 (1-year standard lifecycle).
-- **Previous LTS Release:** OpenSSL 3.0.x LTS. Supported through **September 7, 2026** (5-year lifecycle from September 2021).
-- **Target Long-Term Baseline:** OpenSSL 3.5.x is designated as the next official Long Term Support (LTS) series (targeted GA Q2 2025, supported for 5 years through **2030**).
+- **Active Release:** OpenSSL 4.1.x. Initial GA October 2026.
+- **Legacy LTS Releases:** OpenSSL 3.0.x LTS (supported through September 7, 2026) and OpenSSL 3.5.x LTS.
 - **Transition Architecture & Compatibility:**
-  - RTProtect uses exclusively standard OpenSSL 3.x EVP and KDF interfaces (`EVP_PKEY_ED25519`, `EVP_aes_256_gcm`, `EVP_KDF_HKDF`, `RAND_bytes`).
+  - RTProtect uses exclusively standard OpenSSL EVP and KDF interfaces (`EVP_PKEY_ED25519`, `EVP_aes_256_gcm`, `EVP_KDF_HKDF`, `RAND_bytes`).
   - No deprecated OpenSSL 1.1.1 or legacy internal struct accesses exist in the codebase.
-  - Forward ABI and API compatibility is guaranteed across all OpenSSL 3.x minor releases.
+  - Forward ABI and API compatibility is preserved across OpenSSL 3.x and 4.x EVP interfaces.
 - **Migration Protocol for OpenSSL 3.5.x LTS:**
   1. **Continuous Point Release Tracking:** Apply upstream patch updates (3.4.1+) during the active 3.4.x branch lifecycle.
   2. **Pre-GA Validation:** Monitor upstream 3.5-alpha/beta tags; perform test builds against the RTProtect cryptographic test suite in CI.

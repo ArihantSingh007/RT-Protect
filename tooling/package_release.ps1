@@ -143,10 +143,12 @@ $BuildInfo | Out-File -FilePath (Join-Path $ServerPkgDir "BUILD_INFO.txt") -Enco
 # Helper to copy OpenSSL runtime dependencies
 function Copy-OpenSslDlls ($TargetBinDir) {
     if ($OpenSslDir) {
-        $cryptoDll = Join-Path $OpenSslDir "bin\libcrypto-3-x64.dll"
-        $sslDll    = Join-Path $OpenSslDir "bin\libssl-3-x64.dll"
-        if (Test-Path $cryptoDll) { Copy-Item $cryptoDll $TargetBinDir }
-        if (Test-Path $sslDll)    { Copy-Item $sslDll $TargetBinDir }
+        $binDir = Join-Path $OpenSslDir "bin"
+        if (Test-Path $binDir) {
+            Get-ChildItem -Path $binDir -Filter "*.dll" | ForEach-Object {
+                Copy-Item -LiteralPath $_.FullName -Destination $TargetBinDir -Force
+            }
+        }
     }
 }
 

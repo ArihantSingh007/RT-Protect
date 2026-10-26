@@ -71,9 +71,10 @@ try {
         }
     }
 
-    $opensslDll = Join-Path $opensslBin 'libcrypto-3-x64.dll'
-    if ((Test-Path -LiteralPath $opensslDll) -and (-not (Test-Path -LiteralPath (Join-Path $builtDir 'libcrypto-3-x64.dll')))) {
-        Copy-Item -LiteralPath $opensslDll -Destination $builtDir -Force
+    if (Test-Path -LiteralPath $opensslBin) {
+        Get-ChildItem -Path $opensslBin -Filter '*.dll' | ForEach-Object {
+            Copy-Item -LiteralPath $_.FullName -Destination $builtDir -Force
+        }
     }
 
     $validOutput = & $executable 2>&1

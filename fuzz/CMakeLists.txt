@@ -19,10 +19,9 @@ endif()
 
 if(WIN32)
   set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
-  if(EXISTS "${CMAKE_SOURCE_DIR}/third_party/openssl/bin/libcrypto-3-x64.dll")
-    file(COPY "${CMAKE_SOURCE_DIR}/third_party/openssl/bin/libcrypto-3-x64.dll"
-              "${CMAKE_SOURCE_DIR}/third_party/openssl/bin/libssl-3-x64.dll"
-         DESTINATION "${CMAKE_CURRENT_BINARY_DIR}")
+  file(GLOB OPENSSL_DLLS "${CMAKE_SOURCE_DIR}/third_party/openssl/bin/*.dll")
+  if(OPENSSL_DLLS)
+    file(COPY ${OPENSSL_DLLS} DESTINATION "${CMAKE_CURRENT_BINARY_DIR}")
   endif()
   file(GLOB_RECURSE CLANG_ASAN_DLLS "C:/Program Files/LLVM/lib/clang/*/lib/windows/clang_rt.asan_dynamic-x86_64.dll")
   if(CLANG_ASAN_DLLS)

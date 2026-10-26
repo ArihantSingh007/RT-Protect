@@ -397,7 +397,8 @@ std::optional<std::string> HttpPostTls(const ParsedUrl& url, const std::string& 
     if (error_out) *error_out = "Failed to configure TLS SNI host name: " + url.host;
     return std::nullopt;
   }
-  if (SSL_set1_host(ssl, url.host.c_str()) != 1) {
+  X509_VERIFY_PARAM* vpm = SSL_get0_param(ssl);
+  if (!vpm || X509_VERIFY_PARAM_set1_host(vpm, url.host.c_str(), url.host.length()) != 1) {
     SSL_free(ssl);
     SSL_CTX_free(ctx);
     closesocket(s);
