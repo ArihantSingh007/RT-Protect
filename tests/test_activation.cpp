@@ -320,6 +320,7 @@ MT_TEST(ActivationToken_ExpiryCheck) {
   MT_CHECK(expired_time > tok.expires_at);
 }
 
+#if defined(RTPROTECT_DEV_BUILD) || !defined(NDEBUG)
 MT_TEST(ActivationToken_LoadOrCreateDevToken_PersistsAndEncrypts) {
   std::string test_prod = "test_product_dev_token_isolation";
   std::string test_lic = "lic-dev-isolated-001";
@@ -375,6 +376,7 @@ MT_TEST(ActivationToken_RejectsDevLicenseForProductionLicense) {
 
   std::filesystem::remove(token_path, ec);
 }
+#endif
 
 MT_TEST(ActivationServer_ActivateAndRenew_Stubs) {
   auto token = ActivateDevice("lic-key-prod-1", "hw-fingerprint-prod", "prod-1");
@@ -750,6 +752,47 @@ MT_TEST(CountermeasureConfig_ValidationAndProductBinding) {
   auto loaded_correct = LoadCountermeasureConfig("product_alpha");
   MT_CHECK(loaded_correct.has_value());
   MT_CHECK(loaded_correct->product_id == "product_alpha");
+}
+
+MT_TEST(OfflineToken_SecureStorage_OfflineExecution_And_Expiration) {
+  auto kp = MakeKeyPair();
+  std::string prod_id = "com.vendor.offline_storage_test";
+
+  // Clean any previous token
+  DeleteActivationToken(prod_id);
+
+  ActivationToken token;
+  token.schema_version = kActivationSchemaVersion;
+  token.license_id = "lic-offline-store-1";
+  token.device_fingerprint_hash = GetLocalHardwareId();
+  token.issued_at = 1700000000;
+  token.expires_at = 1700000000 + (14 * 86400); // 14 days
+  token.grace_expires_at = token.expires_at + (3 * 86400);
+  token.vm_root.fill(0x77);
+  token.sequence_number = 1;
+  token.server_nonce.fill(0x55);
+  MT_CHECK(SignActivationToken(token, kp.private_key));
+
+  // 1. Save token into secure storage (DPAPI/libsecret/Keychain)
+  MT_CHECK(SaveActivationToken(prod_id, token));
+
+  // 2. Load token offline
+  auto loaded_opt = LoadActivationToken(prod_id);
+  MT_CHECK(loaded_opt.has_value());
+  MT_CHECK(loaded_opt->license_id == "lic-offline-store-1");
+  MT_CHECK(loaded_opt->vm_root == token.vm_root);
+  MT_CHECK(VerifyActivationTokenSignature(*loaded_opt, kp.public_key));
+
+  // 3. Verify valid during 14-day window without server contact
+  std::uint64_t valid_offline_time = 1700000000 + (7 * 86400);
+  MT_CHECK(valid_offline_time <= loaded_opt->expires_at);
+
+  // 4. Verify expired past offline window
+  std::uint64_t expired_offline_time = 1700000000 + (15 * 86400);
+  MT_CHECK(expired_offline_time > loaded_opt->expires_at);
+
+  // Clean up
+  DeleteActivationToken(prod_id);
 }
 
 MT_MAIN()

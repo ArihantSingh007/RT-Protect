@@ -26,6 +26,13 @@ option(RTPROTECT_BUILD_FUZZERS
 option(RTPROTECT_ENABLE_EXPERIMENTAL_RUNTIME_RECONSTRUCTION
        "Build Phase 6's experimental native-code-reconstruction module (runtime/). OFF by default per the brief's explicit instruction that this technique be an isolated, opt-in research experiment -- see docs/RUNTIME_RECONSTRUCTION.md before turning this on."
        OFF)
+option(RTPROTECT_DEV_BUILD
+       "Enable development-only local token fallback (LoadOrCreateDevToken). Must be OFF for production customer builds."
+       ON)
+
+if(RTPROTECT_DEV_BUILD)
+  add_compile_definitions(RTPROTECT_DEV_BUILD=1)
+endif()
 
 if(RTPROTECT_BUILD_FUZZERS AND WIN32)
   # LLVM on Windows ships libFuzzer static libraries linked against MT runtime

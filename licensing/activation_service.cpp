@@ -303,6 +303,197 @@ ActivateResponse ActivationService::ProcessActivate(const ActivateRequest& req, 
   return resp;
 }
 
+ActivateResponse ActivationService::ProcessOfflineGrant(const ActivateRequest& req, std::uint32_t offline_days, std::uint64_t current_time, bool check_rate_limit) {
+  ActivateResponse resp;
+  if (current_time == 0) current_time = GetCurrentTimestamp();
+
+  if (req.license_key.empty() || req.device_fingerprint.empty() || req.product_id.empty()) {
+    resp.status = ActivationStatus::kMalformed;
+    resp.error_message = "Missing required parameters (license_key, device_fingerprint, or product_id)";
+    return resp;
+  }
+
+  // Bound offline grant duration: default 14 days, minimum 1 day, maximum 30 days
+  if (offline_days == 0) offline_days = 14;
+  if (offline_days > 30) offline_days = 30;
+
+  std::string anon_key = AnonymizeLicenseKey(req.license_key);
+
+  if (check_rate_limit) {
+    int retry_after = 0;
+    if (!license_rate_limiter_.Allow(anon_key, 1.0, &retry_after)) {
+      resp.status = ActivationStatus::kConcurrencyLimitExceeded;
+      resp.error_message = "Rate limit exceeded for license (retry after " + std::to_string(retry_after) + "s)";
+      db_.RecordEvent({current_time, ActivationEventType::kRateLimited, anon_key, req.device_fingerprint, req.client_ip, resp.error_message});
+      return resp;
+    }
+  }
+
+  // 1. Look up license in database
+  auto lic_opt = db_.GetLicense(req.license_key);
+  if (!lic_opt.has_value()) {
+    resp.status = ActivationStatus::kLicenseMismatch;
+    resp.error_message = "License key not found";
+    db_.RecordEvent({current_time, ActivationEventType::kActivationFailed, anon_key, req.device_fingerprint, req.client_ip, resp.error_message});
+    return resp;
+  }
+
+  const auto& lic = *lic_opt;
+  std::string safe_license_id = lic.license_id;
+
+  if (lic.product_id != req.product_id) {
+    resp.status = ActivationStatus::kLicenseMismatch;
+    resp.error_message = "License is not valid for product " + req.product_id;
+    db_.RecordEvent({current_time, ActivationEventType::kActivationFailed, safe_license_id, req.device_fingerprint, req.client_ip, resp.error_message});
+    return resp;
+  }
+
+  if (lic.status != LicenseRecordStatus::kActive) {
+    resp.status = ActivationStatus::kRevoked;
+    resp.error_message = "License has been " + std::string(ToString(lic.status));
+    db_.RecordEvent({current_time, ActivationEventType::kActivationFailed, safe_license_id, req.device_fingerprint, req.client_ip, resp.error_message});
+    return resp;
+  }
+
+  // Validate activation credential secret if configured
+  if (lic.activation_credential_hash.empty()) {
+    if (require_activation_credentials_) {
+      resp.status = ActivationStatus::kMalformed;
+      resp.error_message = "License record lacks mandatory activation credential verifier in production mode";
+      db_.RecordEvent({current_time, ActivationEventType::kActivationFailed, safe_license_id, req.device_fingerprint, req.client_ip, resp.error_message});
+      return resp;
+    }
+  } else {
+    if (req.activation_credential.empty()) {
+      resp.status = ActivationStatus::kMalformed;
+      resp.error_message = "Activation credential is required for this license";
+      db_.RecordEvent({current_time, ActivationEventType::kActivationFailed, safe_license_id, req.device_fingerprint, req.client_ip, resp.error_message});
+      return resp;
+    }
+    auto cred_hash = integrity::Sha256(
+        reinterpret_cast<const std::uint8_t*>(req.activation_credential.data()),
+        req.activation_credential.size());
+    if (!cred_hash.has_value()) {
+      resp.status = ActivationStatus::kMalformed;
+      resp.error_message = "Hash computation failure";
+      return resp;
+    }
+    std::string cred_hash_hex = BytesToHex(cred_hash->data(), cred_hash->size());
+    if (!ConstantTimeStringEquals(cred_hash_hex, lic.activation_credential_hash)) {
+      resp.status = ActivationStatus::kLicenseMismatch;
+      resp.error_message = "Invalid activation credential";
+      db_.RecordEvent({current_time, ActivationEventType::kActivationFailed, safe_license_id, req.device_fingerprint, req.client_ip, resp.error_message});
+      return resp;
+    }
+  }
+
+  // 2. Anti-replay and validity check on client challenge nonce
+  bool nonce_is_all_zero = true;
+  for (std::uint8_t b : req.client_nonce) {
+    if (b != 0) {
+      nonce_is_all_zero = false;
+      break;
+    }
+  }
+  if (nonce_is_all_zero) {
+    resp.status = ActivationStatus::kMalformed;
+    resp.error_message = "Client challenge nonce cannot be missing or all-zero";
+    db_.RecordEvent({current_time, ActivationEventType::kActivationFailed, safe_license_id, req.device_fingerprint, req.client_ip, resp.error_message});
+    return resp;
+  }
+
+  if (req.client_timestamp > 0) {
+    std::int64_t drift = std::abs(static_cast<std::int64_t>(current_time) - static_cast<std::int64_t>(req.client_timestamp));
+    if (drift > 900) {
+      resp.status = ActivationStatus::kMalformed;
+      resp.error_message = "Client timestamp clock drift exceeds allowed 900s window";
+      db_.RecordEvent({current_time, ActivationEventType::kActivationFailed, safe_license_id, req.device_fingerprint, req.client_ip, resp.error_message});
+      return resp;
+    }
+  }
+
+  std::string client_nonce_hex = BytesToHex(req.client_nonce.data(), req.client_nonce.size());
+  if (db_.IsNonceUsed(client_nonce_hex)) {
+    resp.status = ActivationStatus::kNonceMismatch;
+    resp.error_message = "Client challenge nonce has already been used (replay detected)";
+    db_.RecordEvent({current_time, ActivationEventType::kReplayBlocked, safe_license_id, req.device_fingerprint, req.client_ip, resp.error_message});
+    return resp;
+  }
+
+  // 3. Atomic seat limit enforcement and reservation
+  auto seat_res = db_.ReserveSeatAtomic(safe_license_id, req.device_fingerprint, lic.max_seats, current_time);
+  if (!seat_res.success) {
+    resp.status = ActivationStatus::kConcurrencyLimitExceeded;
+    resp.error_message = seat_res.error;
+    db_.RecordEvent({current_time, ActivationEventType::kSeatLimitExceeded, safe_license_id, req.device_fingerprint, req.client_ip, resp.error_message});
+    return resp;
+  }
+
+  // 4. Mint signed activation token with requested offline grant duration
+  ActivationToken token;
+  token.schema_version = kActivationSchemaVersion;
+  token.license_id = safe_license_id;
+  token.device_fingerprint_hash = req.device_fingerprint;
+  token.issued_at = current_time;
+  token.expires_at = current_time + (static_cast<std::uint64_t>(offline_days) * 86400);
+  token.grace_expires_at = token.expires_at + (3 * 86400);
+  token.vm_root = lic.vm_root;
+  token.sequence_number = seat_res.sequence_number;
+
+  if (RAND_bytes(resp.server_nonce.data(), static_cast<int>(resp.server_nonce.size())) != 1) {
+    db_.RollbackSeatAtomic(safe_license_id, req.device_fingerprint, seat_res);
+    resp.status = ActivationStatus::kMalformed;
+    resp.error_message = "Cryptographic RNG failure generating server nonce";
+    return resp;
+  }
+  token.server_nonce = resp.server_nonce;
+
+  if (!SignActivationToken(token, signing_key_)) {
+    db_.RollbackSeatAtomic(safe_license_id, req.device_fingerprint, seat_res);
+    resp.status = ActivationStatus::kMalformed;
+    resp.error_message = "Internal signing failure";
+    return resp;
+  }
+
+  // 5. Encrypt token under ephemeral session key
+  auto session_key = DeriveTransportKey(!req.activation_credential.empty() ? req.activation_credential : req.license_key,
+                                        req.client_nonce, resp.server_nonce);
+  if (!session_key.has_value()) {
+    db_.RollbackSeatAtomic(safe_license_id, req.device_fingerprint, seat_res);
+    resp.status = ActivationStatus::kMalformed;
+    resp.error_message = "Failed to derive transport key";
+    return resp;
+  }
+
+  auto raw_token_bytes = SerializeActivationToken(token);
+  auto encrypted = crypto::Encrypt(*session_key, raw_token_bytes.data(), raw_token_bytes.size());
+  if (!encrypted.has_value()) {
+    db_.RollbackSeatAtomic(safe_license_id, req.device_fingerprint, seat_res);
+    resp.status = ActivationStatus::kMalformed;
+    resp.error_message = "Failed to encrypt activation token";
+    return resp;
+  }
+
+  // 6. Transactional commit: consume nonce
+  if (!db_.ConsumeNonceIfUnused(client_nonce_hex, current_time + (static_cast<std::uint64_t>(offline_days) * 86400), current_time)) {
+    db_.RollbackSeatAtomic(safe_license_id, req.device_fingerprint, seat_res);
+    resp.status = ActivationStatus::kNonceMismatch;
+    resp.error_message = "Nonce consumption collision during activation commit";
+    return resp;
+  }
+
+  auto wire_bytes = encrypted->Serialize();
+  resp.encrypted_token_hex = BytesToHex(wire_bytes.data(), wire_bytes.size());
+  resp.token = token;
+  if (countermeasure_config_.has_value()) {
+    auto cm_bytes = SerializeCountermeasureConfig(*countermeasure_config_);
+    resp.countermeasure_config_hex = BytesToHex(cm_bytes.data(), cm_bytes.size());
+  }
+  resp.status = ActivationStatus::kValid;
+  db_.RecordEvent({current_time, ActivationEventType::kActivationSuccess, safe_license_id, req.device_fingerprint, req.client_ip, "Pre-authorized offline grant issued for " + std::to_string(offline_days) + " days (seq=" + std::to_string(seat_res.sequence_number) + ")"});
+  return resp;
+}
+
 RenewResponse ActivationService::ProcessRenew(const RenewRequest& req, std::uint64_t current_time, bool check_rate_limit) {
   RenewResponse resp;
   if (current_time == 0) current_time = GetCurrentTimestamp();
@@ -596,6 +787,82 @@ std::string ActivationService::HandleActivateJson(const std::string& json_body, 
   }
 
   auto resp = ProcessActivate(req, current_time, /*check_rate_limit=*/false);
+
+  std::ostringstream ss;
+  ss << "{\n";
+  ss << "  \"status\": \"" << ToString(resp.status) << "\",\n";
+  if (!resp.error_message.empty()) {
+    ss << "  \"error\": \"" << EscapeJsonString(resp.error_message) << "\",\n";
+  }
+  ss << "  \"server_nonce\": \"" << BytesToHex(resp.server_nonce.data(), resp.server_nonce.size()) << "\",\n";
+  ss << "  \"encrypted_token\": \"" << resp.encrypted_token_hex << "\"";
+  if (!resp.countermeasure_config_hex.empty()) {
+    ss << ",\n  \"countermeasure_config\": \"" << resp.countermeasure_config_hex << "\"";
+  }
+  ss << "\n}\n";
+  return ss.str();
+}
+
+std::string ActivationService::HandleOfflineGrantJson(const std::string& json_body, std::uint64_t current_time, const std::string& client_ip) {
+  if (current_time == 0) current_time = GetCurrentTimestamp();
+
+  // Enforce IP rate limiting
+  int retry_after = 0;
+  if (!client_ip.empty() && !ip_rate_limiter_.Allow(client_ip, 1.0, &retry_after)) {
+    db_.RecordEvent({current_time, ActivationEventType::kRateLimited, "", "", client_ip, "IP rate limit exceeded"});
+    std::ostringstream ss;
+    ss << "{\n"
+       << "  \"status\": \"rate_limited\",\n"
+       << "  \"error\": \"Rate limit exceeded for IP address (retry after " << retry_after << "s)\",\n"
+       << "  \"retry_after\": " << retry_after << "\n"
+       << "}\n";
+    return ss.str();
+  }
+
+  auto root = tooling::JsonValue::Parse(json_body);
+  if (!root.has_value() || !root->is_object()) {
+    return "{\n  \"status\": \"malformed\",\n  \"error\": \"Malformed or invalid JSON body\"\n}\n";
+  }
+
+  const auto& obj = *root;
+  ActivateRequest req;
+  req.client_ip = client_ip;
+  req.license_key = obj["license_key"].as_string();
+  req.device_fingerprint = obj["device_fingerprint"].as_string();
+  req.product_id = obj["product_id"].as_string();
+  req.client_version = obj.contains("client_version") ? obj["client_version"].as_string() : "1.0.0";
+  req.activation_credential = obj["activation_credential"].as_string();
+  if (req.activation_credential.empty() && obj.contains("activation_secret")) {
+    req.activation_credential = obj["activation_secret"].as_string();
+  }
+  if (obj.contains("client_timestamp")) {
+    req.client_timestamp = static_cast<std::uint64_t>(obj["client_timestamp"].as_int());
+  }
+
+  std::uint32_t offline_days = 14;
+  if (obj.contains("offline_days")) {
+    offline_days = static_cast<std::uint32_t>(obj["offline_days"].as_int());
+  }
+
+  std::string nonce = obj["client_nonce"].as_string();
+  if (nonce.size() != 64 || !HexToBytes(nonce, req.client_nonce.data(), req.client_nonce.size())) {
+    return "{\n  \"status\": \"malformed\",\n  \"error\": \"Missing or invalid 32-byte hexadecimal client_nonce\"\n}\n";
+  }
+
+  // Enforce license rate limiting
+  std::string anon_key = AnonymizeLicenseKey(req.license_key);
+  if (!req.license_key.empty() && !license_rate_limiter_.Allow(anon_key, 1.0, &retry_after)) {
+    db_.RecordEvent({current_time, ActivationEventType::kRateLimited, anon_key, req.device_fingerprint, client_ip, "License rate limit exceeded"});
+    std::ostringstream ss;
+    ss << "{\n"
+       << "  \"status\": \"rate_limited\",\n"
+       << "  \"error\": \"Rate limit exceeded for license key (retry after " << retry_after << "s)\",\n"
+       << "  \"retry_after\": " << retry_after << "\n"
+       << "}\n";
+    return ss.str();
+  }
+
+  auto resp = ProcessOfflineGrant(req, offline_days, current_time, /*check_rate_limit=*/false);
 
   std::ostringstream ss;
   ss << "{\n";

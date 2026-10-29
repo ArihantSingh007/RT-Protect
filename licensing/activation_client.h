@@ -37,6 +37,21 @@ std::optional<ActivationToken> RequestOnlineActivation(
     std::uint64_t client_timestamp = 0,
     const integrity::Ed25519PublicKey* cm_pubkey = nullptr);
 
+// Requests a pre-authorized time-boxed offline token grant from the vendor authority server while online.
+// offline_days is bounded between 1 and 30 days (default 14 days).
+// The returned token is verified with vendor_pubkey, saved locally via SaveActivationToken,
+// and permits offline runtime authorization until expires_at without network connectivity.
+std::optional<ActivationToken> RequestOfflineGrant(
+    const std::string& server_url,
+    const std::string& license_key,
+    const std::string& product_id,
+    const integrity::Ed25519PublicKey& vendor_pubkey,
+    std::uint32_t offline_days = 14,
+    std::string* error_out = nullptr,
+    const std::string& activation_credential = "",
+    std::uint64_t client_timestamp = 0,
+    const integrity::Ed25519PublicKey* cm_pubkey = nullptr);
+
 // Requests online token lease renewal from the vendor authority server.
 // Returns renewed token with bumped expiration and identical vm_root.
 std::optional<ActivationToken> RequestOnlineRenewal(

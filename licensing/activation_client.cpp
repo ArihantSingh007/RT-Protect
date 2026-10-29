@@ -692,6 +692,147 @@ std::optional<ActivationToken> RequestOnlineActivation(
   return token;
 }
 
+std::optional<ActivationToken> RequestOfflineGrant(
+    const std::string& server_url,
+    const std::string& license_key,
+    const std::string& product_id,
+    const integrity::Ed25519PublicKey& vendor_pubkey,
+    std::uint32_t offline_days,
+    std::string* error_out,
+    const std::string& activation_credential,
+    std::uint64_t client_timestamp,
+    const integrity::Ed25519PublicKey* cm_pubkey) {
+  if (offline_days == 0) offline_days = 14;
+  if (offline_days > 30) offline_days = 30;
+
+  std::string hwid = GetLocalHardwareId();
+
+  if (client_timestamp == 0) {
+    client_timestamp = static_cast<std::uint64_t>(std::time(nullptr));
+  }
+
+  std::array<std::uint8_t, 32> client_nonce{};
+  if (RAND_bytes(client_nonce.data(), static_cast<int>(client_nonce.size())) != 1) {
+    if (error_out) *error_out = "RNG failure generating challenge nonce";
+    return std::nullopt;
+  }
+
+  std::ostringstream json_req;
+  json_req << "{\n";
+  json_req << "  \"license_key\": \"" << EscapeJsonString(license_key) << "\",\n";
+  json_req << "  \"device_fingerprint\": \"" << EscapeJsonString(hwid) << "\",\n";
+  json_req << "  \"product_id\": \"" << EscapeJsonString(product_id) << "\",\n";
+  json_req << "  \"client_version\": \"2.0.0\",\n";
+  json_req << "  \"client_timestamp\": " << client_timestamp << ",\n";
+  json_req << "  \"offline_days\": " << offline_days << ",\n";
+  if (!activation_credential.empty()) {
+    json_req << "  \"activation_credential\": \"" << EscapeJsonString(activation_credential) << "\",\n";
+  }
+  json_req << "  \"client_nonce\": \"" << BytesToHex(client_nonce.data(), client_nonce.size()) << "\"\n";
+  json_req << "}\n";
+
+  auto resp_body = DispatchHttpPost(server_url, "/offline-grant", json_req.str(), error_out);
+  if (!resp_body.has_value()) return std::nullopt;
+
+  auto root = tooling::JsonValue::Parse(*resp_body);
+  if (!root.has_value() || !root->is_object()) {
+    if (error_out) *error_out = "Malformed JSON response from activation authority";
+    return std::nullopt;
+  }
+
+  const auto& obj = *root;
+  std::string status = obj["status"].as_string();
+  if (status != "Valid" && status != "valid") {
+    std::string err = obj.contains("error") ? obj["error"].as_string() : "Offline grant rejected by server with status: " + status;
+    if (error_out) *error_out = err;
+    return std::nullopt;
+  }
+
+  std::string s_nonce_hex = obj["server_nonce"].as_string();
+  std::string enc_token_hex = obj["encrypted_token"].as_string();
+  if (s_nonce_hex.empty() || enc_token_hex.empty()) {
+    if (error_out) *error_out = "Server response missing server_nonce or encrypted_token";
+    return std::nullopt;
+  }
+
+  std::array<std::uint8_t, 32> server_nonce{};
+  if (!HexToBytes(s_nonce_hex, server_nonce.data(), server_nonce.size())) {
+    if (error_out) *error_out = "Malformed server_nonce in response";
+    return std::nullopt;
+  }
+
+  auto session_key = DeriveTransportKey(!activation_credential.empty() ? activation_credential : license_key,
+                                        client_nonce, server_nonce);
+  if (!session_key.has_value()) {
+    if (error_out) *error_out = "Failed to derive transport decryption key";
+    return std::nullopt;
+  }
+
+  std::vector<std::uint8_t> wire_enc(enc_token_hex.size() / 2);
+  if (!HexToBytes(enc_token_hex, wire_enc.data(), wire_enc.size())) {
+    if (error_out) *error_out = "Malformed encrypted_token hex";
+    return std::nullopt;
+  }
+
+  auto enc_msg = crypto::EncryptedMessage::Deserialize(wire_enc.data(), wire_enc.size());
+  if (!enc_msg.has_value()) {
+    if (error_out) *error_out = "Failed to deserialize encrypted message payload";
+    return std::nullopt;
+  }
+
+  crypto::AeadError err = crypto::AeadError::kNone;
+  auto plaintext = crypto::Decrypt(*session_key, *enc_msg, nullptr, 0, &err);
+  if (!plaintext.has_value()) {
+    if (error_out) *error_out = "Failed to decrypt activation token (tampered transport or incorrect key)";
+    return std::nullopt;
+  }
+
+  auto token_opt = DeserializeActivationToken(plaintext->data(), plaintext->size());
+  if (!token_opt.has_value()) {
+    if (error_out) *error_out = "Failed to deserialize decrypted activation token";
+    return std::nullopt;
+  }
+
+  const auto& token = *token_opt;
+  if (!VerifyActivationTokenSignature(token, vendor_pubkey)) {
+    if (error_out) *error_out = "Vendor Ed25519 signature on offline grant token failed verification";
+    return std::nullopt;
+  }
+
+  // Anchor verified server timestamp for monotonic trusted time enforcement
+  TrustedTime::AnchorServerTime(product_id, token.issued_at);
+
+  // Dynamic Countermeasure Updates (Continuous Response Channel)
+  if (obj.contains("countermeasure_config")) {
+    std::string cm_hex = obj["countermeasure_config"].as_string();
+    if (!cm_hex.empty() && cm_hex.size() % 2 == 0) {
+      std::vector<std::uint8_t> cm_raw(cm_hex.size() / 2);
+      if (HexToBytes(cm_hex, cm_raw.data(), cm_raw.size())) {
+        auto cm_cfg = DeserializeCountermeasureConfig(cm_raw.data(), cm_raw.size());
+        const auto& effective_cm_key = cm_pubkey ? *cm_pubkey : vendor_pubkey;
+        if (cm_cfg.has_value() && VerifyCountermeasureConfigSignature(*cm_cfg, effective_cm_key)) {
+          if (cm_cfg->product_id.empty() || cm_cfg->product_id == product_id) {
+            std::uint64_t current_time = client_timestamp != 0 ? client_timestamp : static_cast<std::uint64_t>(std::time(nullptr));
+            if (!cm_cfg->IsExpired(current_time)) {
+              auto cur_cfg = LoadCountermeasureConfig(product_id);
+              if (!cur_cfg.has_value() || cm_cfg->sequence_number > cur_cfg->sequence_number) {
+                if (SaveCountermeasureConfig(product_id, *cm_cfg)) {
+                  NotifyCountermeasureUpdate(*cm_cfg);
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+
+  // Persist into secure storage for offline use
+  SaveActivationToken(product_id, token);
+
+  return token;
+}
+
 std::optional<ActivationToken> RequestOnlineRenewal(
     const std::string& server_url,
     const ActivationToken& current_token,

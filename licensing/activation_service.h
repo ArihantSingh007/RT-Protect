@@ -84,6 +84,7 @@ class ActivationService {
 
   // In-process business logic
   ActivateResponse ProcessActivate(const ActivateRequest& req, std::uint64_t current_time = 0, bool check_rate_limit = true);
+  ActivateResponse ProcessOfflineGrant(const ActivateRequest& req, std::uint32_t offline_days = 14, std::uint64_t current_time = 0, bool check_rate_limit = true);
   RenewResponse ProcessRenew(const RenewRequest& req, std::uint64_t current_time = 0, bool check_rate_limit = true);
   DeactivateResponse ProcessDeactivate(const DeactivateRequest& req, std::uint64_t current_time = 0);
 
@@ -91,6 +92,9 @@ class ActivationService {
   std::string HandleActivateJson(const std::string& json_body,
                                  std::uint64_t current_time = 0,
                                  const std::string& client_ip = "127.0.0.1");
+  std::string HandleOfflineGrantJson(const std::string& json_body,
+                                     std::uint64_t current_time = 0,
+                                     const std::string& client_ip = "127.0.0.1");
   std::string HandleRenewJson(const std::string& json_body,
                               std::uint64_t current_time = 0,
                               const std::string& client_ip = "127.0.0.1");

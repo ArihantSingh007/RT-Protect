@@ -26,6 +26,7 @@
 #include "licensing/license_signer.h"
 #include "licensing/license_verifier.h"
 #include "licensing/activation.h"
+#include "licensing/activation_client.h"
 #include "licensing/activation_server.h"
 #include "tooling/file_io.h"
 #include "tooling/integration_engine.h"
@@ -231,6 +232,15 @@ void PrintUsage() {
       "      --unrevoke-ticket <id>            Remove ticket ID from revocation list\n"
       "      --reason <string>                 Reason for revocation\n"
       "      --list                            Display current revocation database entries\n"
+      "\n"
+      "    rtprotect-tool offline-grant [options]\n"
+      "      --server <url>                    Online Activation Authority URL (required)\n"
+      "      --license <key>                   Vendor license key string (required)\n"
+      "      --product <id>                    Product identifier (required)\n"
+      "      --pub-key <file>                  Vendor Ed25519 public key file (required)\n"
+      "      --days <1-30>                     Offline grant duration in days (default: 14)\n"
+      "      --credential <secret>             Optional activation secret credential\n"
+      "      --out <file>                      Optional output file to save serialized token\n"
       "\n"
       "  Cryptographic & Integrity Primitives:\n"
       "    rtprotect-tool genkey-ed25519 <priv-out> <pub-out>\n"
@@ -1171,6 +1181,68 @@ int CmdActivateRevoke(int argc, char** argv) {
   return 0;
 }
 
+int CmdOfflineGrant(int argc, char** argv) {
+  std::string server_url;
+  std::string license_key;
+  std::string product_id;
+  std::string pub_key_file;
+  std::string credential;
+  std::string out_file;
+  std::uint32_t offline_days = 14;
+
+  for (int i = 2; i < argc; ++i) {
+    std::string arg = argv[i];
+    if (arg == "--server" && i + 1 < argc) server_url = argv[++i];
+    else if (arg == "--license" && i + 1 < argc) license_key = argv[++i];
+    else if (arg == "--product" && i + 1 < argc) product_id = argv[++i];
+    else if (arg == "--pub-key" && i + 1 < argc) pub_key_file = argv[++i];
+    else if (arg == "--credential" && i + 1 < argc) credential = argv[++i];
+    else if (arg == "--days" && i + 1 < argc) offline_days = std::stoul(argv[++i]);
+    else if (arg == "--out" && i + 1 < argc) out_file = argv[++i];
+    else {
+      std::fprintf(stderr, "error: unknown argument '%s'\n", arg.c_str());
+      return 2;
+    }
+  }
+
+  if (server_url.empty() || license_key.empty() || product_id.empty() || pub_key_file.empty()) {
+    std::fprintf(stderr, "error: --server, --license, --product, and --pub-key are required for offline-grant\n");
+    return 2;
+  }
+
+  auto pub_bytes = ReadFile(pub_key_file);
+  if (!pub_bytes.has_value() || pub_bytes->size() != integrity::kEd25519PublicKeyLen) {
+    std::fprintf(stderr, "error: invalid public key file: %s\n", pub_key_file.c_str());
+    return 1;
+  }
+  integrity::Ed25519PublicKey pub_key;
+  std::memcpy(pub_key.data(), pub_bytes->data(), 32);
+
+  std::string err;
+  auto token = licensing::RequestOfflineGrant(server_url, license_key, product_id, pub_key, offline_days, &err, credential);
+  if (!token.has_value()) {
+    std::fprintf(stderr, "error: offline grant request failed: %s\n", err.c_str());
+    return 1;
+  }
+
+  if (!out_file.empty()) {
+    auto bin = licensing::SerializeActivationToken(*token);
+    if (!WriteFile(out_file, bin.data(), bin.size())) {
+      std::fprintf(stderr, "warning: failed to write token output file: %s\n", out_file.c_str());
+    }
+  }
+
+  std::printf("Successfully obtained pre-authorized offline token grant:\n");
+  std::printf("  License ID:      %s\n", token->license_id.c_str());
+  std::printf("  Product ID:      %s\n", product_id.c_str());
+  std::printf("  Hardware Hash:   %s\n", token->device_fingerprint_hash.c_str());
+  std::printf("  Issued At:       %llu\n", static_cast<unsigned long long>(token->issued_at));
+  std::printf("  Expires At:      %llu (valid for %u days offline)\n", static_cast<unsigned long long>(token->expires_at), offline_days);
+  std::printf("  Grace Expires:   %llu\n", static_cast<unsigned long long>(token->grace_expires_at));
+  std::printf("  Secure Storage:  Saved to OS-backed credential store\n");
+  return 0;
+}
+
 int CmdProtectBinary(int argc, char** argv) {
   std::fprintf(stderr,
       "[WARNING] 'experimental-protect-binary' is an EXPERIMENTAL research prototype and NOT production-ready.\n"
@@ -1259,6 +1331,7 @@ int main(int argc, char** argv) {
   if (cmd == "activate-issue") return CmdActivateIssue(argc, argv);
   if (cmd == "activate-verify") return CmdActivateVerify(argc, argv);
   if (cmd == "activate-revoke") return CmdActivateRevoke(argc, argv);
+  if (cmd == "offline-grant") return CmdOfflineGrant(argc, argv);
 
   // Cryptographic Primitives
   if (cmd == "genkey-ed25519") return CmdGenkeyEd25519(argc, argv);

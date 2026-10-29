@@ -558,6 +558,8 @@ void ActivationServerHttp::HandleClient(uintptr_t client_sock_fd, const std::str
 
     if (path == "/activate" && method == "POST") {
       resp_body = service_.HandleActivateJson(body, 0, client_ip);
+    } else if (path == "/offline-grant" && method == "POST") {
+      resp_body = service_.HandleOfflineGrantJson(body, 0, client_ip);
     } else if (path == "/renew" && method == "POST") {
       resp_body = service_.HandleRenewJson(body, 0, client_ip);
     } else if (path == "/deactivate" && method == "POST") {

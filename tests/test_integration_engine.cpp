@@ -14,6 +14,7 @@
 #include <filesystem>
 #include <fstream>
 #include <string>
+#include <openssl/rand.h>
 
 #define RT_TEST_ASSERT(cond)                                                    \
   do {                                                                          \
@@ -829,10 +830,8 @@ void TestFunctionVirtualizationExecutionRoundTrip() {
 
   // 5. Derive build master key from activation token vm_root and tamper-bound key
   std::string product_id = "com.vendor.virtapp";
-  rtprotect::licensing::ActivationToken dev_token;
-  bool token_loaded = rtprotect::licensing::LoadOrCreateDevToken(product_id, "lic-virt-roundtrip", &dev_token);
-  assert(token_loaded);
-  auto vm_root = dev_token.vm_root;
+  std::array<std::uint8_t, 32> vm_root{};
+  assert(RAND_bytes(vm_root.data(), static_cast<int>(vm_root.size())) == 1);
 
   rtprotect::integrity::Ed25519PublicKey manifest_pubkey{};
   manifest_pubkey.fill(0x42);

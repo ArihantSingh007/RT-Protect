@@ -498,7 +498,8 @@ bool DeleteActivationToken(const std::string& product_id) {
   }
   return SecureStorage::Delete("activation_" + sanitized_product);
 }
-
+ 
+#if defined(RTPROTECT_DEV_BUILD) || !defined(NDEBUG)
 bool LoadOrCreateDevToken(const std::string& product_id,
                           const std::string& license_id,
                           ActivationToken* out_token) {
@@ -506,16 +507,7 @@ bool LoadOrCreateDevToken(const std::string& product_id,
 
   auto existing = LoadActivationToken(product_id);
   if (existing.has_value()) {
-    bool lic_match = false;
-    if (license_id.empty() || existing->license_id == license_id) {
-      lic_match = true;
-    }
-#if defined(RTPROTECT_DEV_BUILD) || !defined(NDEBUG)
-    else if ((license_id == "dev-license" || license_id.rfind("lic-dev-", 0) == 0) &&
-             (existing->license_id == "dev-license" || existing->license_id.rfind("lic-dev-", 0) == 0)) {
-      lic_match = true;
-    }
-#endif
+    bool lic_match = (license_id.empty() || existing->license_id == license_id);
     if (lic_match) {
       *out_token = *existing;
       return true;
@@ -550,5 +542,6 @@ bool LoadOrCreateDevToken(const std::string& product_id,
   *out_token = dev_token;
   return true;
 }
+#endif
 
 }  // namespace rtprotect::licensing

@@ -1583,12 +1583,16 @@ IntegrationReport ExecuteIntegration(const IntegrationOptions& options) {
     ss << "      token_loaded = true;\n";
     ss << "    }\n";
     ss << "  }\n\n";
-    ss << "  // 4c. Development local token fallback (only active if --dev-keys was used at build time)\n";
-    ss << "  if (!token_loaded && kAllowDevTokenFallback) {\n";
-    ss << "    if (rtprotect::licensing::LoadOrCreateDevToken(kProductId, lic.license_id, &token)) {\n";
-    ss << "      token_loaded = true;\n";
-    ss << "    }\n";
-    ss << "  }\n\n";
+    if (options.use_dev_keys) {
+      ss << "  // 4c. Development local token fallback (only compiled in development builds with RTPROTECT_DEV_BUILD)\n";
+      ss << "#if defined(RTPROTECT_DEV_BUILD)\n";
+      ss << "  if (!token_loaded) {\n";
+      ss << "    if (rtprotect::licensing::LoadOrCreateDevToken(kProductId, lic.license_id, &token)) {\n";
+      ss << "      token_loaded = true;\n";
+      ss << "    }\n";
+      ss << "  }\n";
+      ss << "#endif\n\n";
+    }
     ss << "  if (!token_loaded) return false; // Activation required -> fail closed\n";
     ss << "  if (token.expires_at > 0 && ctx.current_time > token.expires_at) return false;\n";
     ss << "  SetRuntimeManifestRoot(token.vm_root.data(), 32);\n";
@@ -1811,6 +1815,9 @@ IntegrationReport ExecuteIntegration(const IntegrationOptions& options) {
     ss << "endif()\n";
 
     ss << "target_sources(" << target_name << " PRIVATE rtprotect_runtime_glue.cpp)\n";
+    if (options.use_dev_keys) {
+      ss << "target_compile_definitions(" << target_name << " PRIVATE RTPROTECT_DEV_BUILD=1)\n";
+    }
     ss << "target_link_libraries(" << target_name << " PRIVATE\n";
     ss << "    rtprotect_licensing\n";
     ss << "    rtprotect_integrity\n";

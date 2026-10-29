@@ -17,8 +17,10 @@ Write-Host "Repository: $RepoRoot"
 
 $Targets = @()
 
-# Find all build* and build_* directories
-$BuildDirs = Get-ChildItem -Path $RepoRoot -Directory | Where-Object { $_.Name -match '^build[-_]?' }
+# Find strictly matched build output directories (anchored to prevent accidental deletion)
+$BuildDirs = Get-ChildItem -Path $RepoRoot -Directory | Where-Object {
+    $_.Name -match '^build($|[-_](vs20\d{2}|ninja|msvc|clang|gcc|fuzz|reconst|exp|release-pkg|smoke).*$)'
+}
 foreach ($d in $BuildDirs) {
     $Targets += $d.FullName
 }
