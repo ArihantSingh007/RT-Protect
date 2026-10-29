@@ -151,7 +151,44 @@ add_custom_command(TARGET test_c_api POST_BUILD
   $<TARGET_FILE:rtprotect_runtime>
   $<TARGET_FILE_DIR:test_c_api>
 )
+if(WIN32)
+  add_custom_command(TARGET test_c_api POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+    $<TARGET_FILE:rtprotect_runtime>
+    $<TARGET_FILE_DIR:test_c_api>/rtprotect_runtime.dll
+  )
+endif()
 add_test(NAME test_c_api COMMAND test_c_api)
+
+find_package(Python3 COMPONENTS Interpreter QUIET)
+if(Python3_FOUND)
+  add_test(NAME test_python_sdk
+    COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/test_python_sdk.py"
+  )
+  set_tests_properties(test_python_sdk PROPERTIES
+    ENVIRONMENT "RTPROTECT_RUNTIME_DLL=$<TARGET_FILE:rtprotect_runtime>"
+  )
+endif()
+
+find_program(RTPROTECT_CSC_EXECUTABLE NAMES csc PATHS "C:/Windows/Microsoft.NET/Framework64/v4.0.30319" "C:/Windows/Microsoft.NET/Framework/v4.0.30319")
+if(RTPROTECT_CSC_EXECUTABLE)
+  file(TO_NATIVE_PATH "${CMAKE_SOURCE_DIR}/sdk/dotnet/RTProtect.cs" RTPROTECT_CS_NATIVE)
+  file(TO_NATIVE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/test_dotnet_sdk.cs" RTPROTECT_TEST_CS_NATIVE)
+  file(TO_NATIVE_PATH "${CMAKE_CURRENT_BINARY_DIR}/test_dotnet_sdk.exe" RTPROTECT_TEST_DOTNET_EXE_NATIVE)
+  add_custom_command(
+    OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/test_dotnet_sdk.exe"
+    COMMAND "${RTPROTECT_CSC_EXECUTABLE}" /nologo /target:exe
+            /out:"${RTPROTECT_TEST_DOTNET_EXE_NATIVE}"
+            "${RTPROTECT_CS_NATIVE}"
+            "${RTPROTECT_TEST_CS_NATIVE}"
+    DEPENDS "${CMAKE_SOURCE_DIR}/sdk/dotnet/RTProtect.cs" "${CMAKE_CURRENT_SOURCE_DIR}/test_dotnet_sdk.cs"
+  )
+  add_custom_target(build_test_dotnet_sdk ALL DEPENDS "${CMAKE_CURRENT_BINARY_DIR}/test_dotnet_sdk.exe")
+  add_test(NAME test_dotnet_sdk COMMAND "${CMAKE_CURRENT_BINARY_DIR}/test_dotnet_sdk.exe")
+  set_tests_properties(test_dotnet_sdk PROPERTIES
+    ENVIRONMENT "RTPROTECT_RUNTIME_DLL=$<TARGET_FILE:rtprotect_runtime>"
+  )
+endif()
 
 # Exercise the shipped consumer sample through the actual integration CLI,
 # generated VM wrapper, runtime authorization path, and tamper rejection.

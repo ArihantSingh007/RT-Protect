@@ -176,7 +176,15 @@ $BenchExe = Find-BuiltFile $BuildDir "bench" "rtprotect-bench.exe"
 if ($BenchExe) { Copy-Item $BenchExe $ToolsBin }
 
 $RuntimeDll = Find-BuiltFile $BuildDir "runtime" "rtprotect_runtime.dll"
-if ($RuntimeDll) { Copy-Item $RuntimeDll $ToolsBin }
+if (-not $RuntimeDll) {
+    $RuntimeDll = Find-BuiltFile $BuildDir "runtime" "librtprotect_runtime.dll"
+}
+if ($RuntimeDll) {
+    Copy-Item $RuntimeDll $ToolsBin
+    if ((Split-Path -Leaf $RuntimeDll) -eq "librtprotect_runtime.dll") {
+        Copy-Item $RuntimeDll (Join-Path $ToolsBin "rtprotect_runtime.dll")
+    }
+}
 
 Copy-OpenSslDlls $ToolsBin
 
@@ -234,6 +242,17 @@ New-Item -ItemType Directory -Force -Path $BindingsDest | Out-Null
 if (Test-Path (Join-Path $RepoRoot "sdk")) {
     Copy-Item -Recurse (Join-Path $RepoRoot "sdk\*") $BindingsDest
 }
+
+# Copy runtime DLL into SDK bin directory for managed SDK bindings
+$SdkBin = Join-Path $SdkPkgDir "bin"
+New-Item -ItemType Directory -Force -Path $SdkBin | Out-Null
+if ($RuntimeDll) {
+    Copy-Item $RuntimeDll $SdkBin
+    if ((Split-Path -Leaf $RuntimeDll) -eq "librtprotect_runtime.dll") {
+        Copy-Item $RuntimeDll (Join-Path $SdkBin "rtprotect_runtime.dll")
+    }
+}
+Copy-OpenSslDlls $SdkBin
 
 # Include bundled OpenSSL in SDK for consumer link resolution
 if ($OpenSslDir -and (Test-Path $OpenSslDir)) {
@@ -301,6 +320,41 @@ Write-Host "Running consumer sample executable: $SmokeExe"
 & $SmokeExe
 if ($LASTEXITCODE -ne 0) { throw "Consumer sample execution failed" }
 Write-Host "[OK] Consumer sample verified successfully!"
+
+# Smoke test Python SDK against packaged SDK
+$PyExe = Get-Command python -ErrorAction SilentlyContinue
+if ($PyExe) {
+    Write-Host "Running Python SDK smoke test against packaged SDK..."
+    $pyTestScript = @"
+import os, sys
+sys.path.insert(0, r'$SdkPkgDir\bindings\python')
+from rtprotect import RTProtectClient
+client = RTProtectClient()
+hwid = client.get_hardware_fingerprint()
+print('[OK] Packaged Python SDK hwid:', hwid)
+assert len(hwid) >= 32
+assert 0.0 <= client.assess_environment_risk() <= 1.0
+"@
+    $pyTestScript | & $PyExe.Source -
+    if ($LASTEXITCODE -ne 0) { throw "Packaged Python SDK smoke test failed" }
+    Write-Host "[OK] Packaged Python SDK verified successfully!"
+}
+
+# Smoke test .NET SDK against packaged SDK
+$CscExe = "C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe"
+if (Test-Path $CscExe) {
+    Write-Host "Running .NET SDK smoke test against packaged SDK..."
+    $csTestDir = Join-Path $DistDir "dotnet_smoke_tmp"
+    if (Test-Path $csTestDir) { Remove-Item -Recurse -Force $csTestDir }
+    New-Item -ItemType Directory -Force -Path $csTestDir | Out-Null
+    Copy-Item "$SdkPkgDir\bin\*.dll" $csTestDir -Force -ErrorAction SilentlyContinue
+    & $CscExe /nologo /target:exe /out:"$csTestDir\test.exe" "$SdkPkgDir\bindings\dotnet\RTProtect.cs" "$RepoRoot\tests\test_dotnet_sdk.cs"
+    if ($LASTEXITCODE -ne 0) { throw "Packaged .NET SDK compilation failed" }
+    & "$csTestDir\test.exe"
+    if ($LASTEXITCODE -ne 0) { throw "Packaged .NET SDK execution failed" }
+    Remove-Item -Recurse -Force $csTestDir
+    Write-Host "[OK] Packaged .NET SDK verified successfully!"
+}
 
 # ---------------------------------------------------------
 # Create Zip Archives & SHA256SUMS.txt
