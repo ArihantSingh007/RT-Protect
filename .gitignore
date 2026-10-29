@@ -1,16 +1,42 @@
+# Build directories
 build/
-build-*/
-build_exp/
+build*/
+build_*/
+
+# Distribution and packaging
 dist/
+dist_export/
+*.zip
+*.tar.gz
+*.7z
+
+# Visual Studio and IDE caches
+.vs/
+.vscode/
+*.suo
+*.user
+*.vcxproj.user
+
+# Compiler and Linker transients
 *.obj
 *.exe
 *.a
 *.dll.a
+*.pdb
+*.ilk
+*.idb
+*.exp
 *.tmp
+*.log
+
+# Python bytecode and caches
 __pycache__/
 *.pyc
+
+# Fuzzing artifacts and crashes
 fuzz_artifacts/
 crash-*
 leak-*
 timeout-*
 oom-*
+Testing/

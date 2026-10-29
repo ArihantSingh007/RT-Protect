@@ -383,6 +383,14 @@ foreach ($z in @($Zip1, $Zip2, $Zip3)) {
 $ChecksumFile = Join-Path $DistDir "SHA256SUMS.txt"
 $Checksums | Out-File -FilePath $ChecksumFile -Encoding ascii
 
+# Clean up uncompressed packaging staging directories and temporary smoke build folder
+Write-Host "Cleaning up uncompressed staging directories..."
+foreach ($staging in @($ToolsPkgDir, $SdkPkgDir, $ServerPkgDir, $SmokeBuildDir)) {
+    if (Test-Path $staging) {
+        Remove-Item -Recurse -Force $staging -ErrorAction SilentlyContinue
+    }
+}
+
 Write-Host "`n=========================================================="
 Write-Host "Package Generation Complete!"
 Write-Host "Artifacts produced in ${DistDir}:"
