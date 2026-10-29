@@ -27,7 +27,9 @@ enum class TimeValidationResult {
 struct TrustedTimeState {
   std::uint64_t last_known_server_time = 0;
   std::uint64_t last_known_wall_time = 0;
-  std::uint64_t last_anchor_steady_seconds = 0;
+  std::uint64_t accumulated_monotonic_seconds = 0;
+  std::uint64_t last_boot_id = 0;
+  std::uint64_t last_session_uptime_seconds = 0;
   bool tamper_detected = false;
 };
 
@@ -35,6 +37,16 @@ class TrustedTime {
  public:
   // Allowed forward/backward clock drift tolerance (5 minutes for NTP sync differences)
   static constexpr std::uint64_t kAllowedSkewSeconds = 300;
+
+  // Test time providers to allow deterministic testing of reboots, steady clock, and wall clock
+  using WallTimeProvider = std::uint64_t (*)();
+  using UptimeProvider = std::uint64_t (*)();
+  using BootIdProvider = std::uint64_t (*)();
+
+  static void SetTimeProvidersForTesting(WallTimeProvider wall_fn,
+                                        UptimeProvider uptime_fn,
+                                        BootIdProvider boot_id_fn);
+  static void ResetTimeProvidersForTesting();
 
   // Anchors verified server timestamp from online token issuance/renewal
   static bool AnchorServerTime(const std::string& product_id, std::uint64_t server_timestamp);

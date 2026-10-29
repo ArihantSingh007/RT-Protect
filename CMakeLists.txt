@@ -28,7 +28,7 @@ option(RTPROTECT_ENABLE_EXPERIMENTAL_RUNTIME_RECONSTRUCTION
        OFF)
 option(RTPROTECT_DEV_BUILD
        "Enable development-only local token fallback (LoadOrCreateDevToken). Must be OFF for production customer builds."
-       ON)
+       OFF)
 
 if(RTPROTECT_DEV_BUILD)
   add_compile_definitions(RTPROTECT_DEV_BUILD=1)

@@ -8,21 +8,79 @@
 #include <ctime>
 #include <algorithm>
 
+#if defined(_WIN32)
+#include <windows.h>
+#include <openssl/rand.h>
+#endif
+
 #include "licensing/secure_storage.h"
 
 namespace rtprotect::licensing {
 
 namespace {
 
+TrustedTime::WallTimeProvider s_test_wall_fn = nullptr;
+TrustedTime::UptimeProvider s_test_uptime_fn = nullptr;
+TrustedTime::BootIdProvider s_test_boot_id_fn = nullptr;
+
+std::uint64_t DefaultWallSeconds() {
+  auto wall_now = std::chrono::system_clock::now().time_since_epoch();
+  return static_cast<std::uint64_t>(
+      std::chrono::duration_cast<std::chrono::seconds>(wall_now).count());
+}
+
+#if defined(_WIN32)
+std::uint64_t DefaultSystemUptimeSeconds() {
+  return static_cast<std::uint64_t>(GetTickCount64() / 1000);
+}
+
+std::uint64_t DefaultBootId() {
+  static std::uint64_t s_boot_id = 0;
+  if (s_boot_id != 0) return s_boot_id;
+
+  HANDLE hMap = CreateFileMappingA(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE, 0,
+                                   sizeof(std::uint64_t), "Local\\RTProtect_BootSessionId");
+  if (hMap != nullptr) {
+    bool is_first = (GetLastError() != ERROR_ALREADY_EXISTS);
+    void* view = MapViewOfFile(hMap, FILE_MAP_ALL_ACCESS, 0, 0, sizeof(std::uint64_t));
+    if (view != nullptr) {
+      auto* p_id = static_cast<std::uint64_t*>(view);
+      if (is_first || *p_id == 0) {
+        std::uint64_t rand_id = 0;
+        if (RAND_bytes(reinterpret_cast<unsigned char*>(&rand_id), sizeof(rand_id)) == 1 && rand_id != 0) {
+          *p_id = rand_id;
+        } else {
+          *p_id = static_cast<std::uint64_t>(GetTickCount64() ^ 0x5555555555555555ULL);
+        }
+      }
+      s_boot_id = *p_id;
+      UnmapViewOfFile(view);
+    }
+  }
+  if (s_boot_id == 0) {
+    s_boot_id = 0xA1B2C3D4E5F60718ULL ^ static_cast<std::uint64_t>(GetTickCount64());
+  }
+  return s_boot_id;
+}
+#else
+std::uint64_t DefaultSystemUptimeSeconds() {
+  auto steady_now = std::chrono::steady_clock::now().time_since_epoch();
+  return static_cast<std::uint64_t>(
+      std::chrono::duration_cast<std::chrono::seconds>(steady_now).count());
+}
+
+std::uint64_t DefaultBootId() {
+  static const std::uint64_t s_id = 0x1234567890ABCDEFULL;
+  return s_id;
+}
+#endif
+
 struct InProcessTimeBaseline {
   std::uint64_t start_wall_seconds;
   std::uint64_t start_steady_seconds;
 
   InProcessTimeBaseline() {
-    auto wall_now = std::chrono::system_clock::now().time_since_epoch();
-    start_wall_seconds = static_cast<std::uint64_t>(
-        std::chrono::duration_cast<std::chrono::seconds>(wall_now).count());
-
+    start_wall_seconds = DefaultWallSeconds();
     auto steady_now = std::chrono::steady_clock::now().time_since_epoch();
     start_steady_seconds = static_cast<std::uint64_t>(
         std::chrono::duration_cast<std::chrono::seconds>(steady_now).count());
@@ -46,7 +104,7 @@ std::string MakeTimeStateKey(const std::string& product_id) {
 
 std::vector<std::uint8_t> SerializeTimeState(const TrustedTimeState& state) {
   std::vector<std::uint8_t> buf;
-  buf.reserve(25);
+  buf.reserve(41);
 
   auto write_u64 = [&buf](std::uint64_t v) {
     for (int i = 0; i < 8; ++i) {
@@ -56,7 +114,9 @@ std::vector<std::uint8_t> SerializeTimeState(const TrustedTimeState& state) {
 
   write_u64(state.last_known_server_time);
   write_u64(state.last_known_wall_time);
-  write_u64(state.last_anchor_steady_seconds);
+  write_u64(state.accumulated_monotonic_seconds);
+  write_u64(state.last_boot_id);
+  write_u64(state.last_session_uptime_seconds);
   buf.push_back(state.tamper_detected ? 1 : 0);
   return buf;
 }
@@ -75,12 +135,36 @@ std::optional<TrustedTimeState> DeserializeTimeState(const std::vector<std::uint
   TrustedTimeState state;
   state.last_known_server_time = read_u64(0);
   state.last_known_wall_time = read_u64(8);
-  state.last_anchor_steady_seconds = read_u64(16);
-  state.tamper_detected = (buf[24] != 0);
+  state.accumulated_monotonic_seconds = read_u64(16);
+
+  if (buf.size() >= 41) {
+    state.last_boot_id = read_u64(24);
+    state.last_session_uptime_seconds = read_u64(32);
+    state.tamper_detected = (buf[40] != 0);
+  } else {
+    // Legacy 25-byte format: byte 24 is tamper flag
+    state.last_boot_id = 0;
+    state.last_session_uptime_seconds = 0;
+    state.tamper_detected = (buf[24] != 0);
+  }
   return state;
 }
 
 }  // namespace
+
+void TrustedTime::SetTimeProvidersForTesting(WallTimeProvider wall_fn,
+                                             UptimeProvider uptime_fn,
+                                             BootIdProvider boot_id_fn) {
+  s_test_wall_fn = wall_fn;
+  s_test_uptime_fn = uptime_fn;
+  s_test_boot_id_fn = boot_id_fn;
+}
+
+void TrustedTime::ResetTimeProvidersForTesting() {
+  s_test_wall_fn = nullptr;
+  s_test_uptime_fn = nullptr;
+  s_test_boot_id_fn = nullptr;
+}
 
 bool TrustedTime::AnchorServerTime(const std::string& product_id, std::uint64_t server_timestamp) {
   if (server_timestamp == 0) return false;
@@ -96,17 +180,16 @@ bool TrustedTime::AnchorServerTime(const std::string& product_id, std::uint64_t 
     }
   }
 
+  std::uint64_t now_wall = s_test_wall_fn ? s_test_wall_fn() : DefaultWallSeconds();
+  std::uint64_t now_uptime = s_test_uptime_fn ? s_test_uptime_fn() : DefaultSystemUptimeSeconds();
+  std::uint64_t current_boot_id = s_test_boot_id_fn ? s_test_boot_id_fn() : DefaultBootId();
+
   // Anchor server time strictly forward
   state.last_known_server_time = (std::max)(state.last_known_server_time, server_timestamp);
-
-  auto wall_now = std::chrono::system_clock::now().time_since_epoch();
-  std::uint64_t now_wall = static_cast<std::uint64_t>(
-      std::chrono::duration_cast<std::chrono::seconds>(wall_now).count());
   state.last_known_wall_time = (std::max)(state.last_known_wall_time, now_wall);
-
-  auto steady_now = std::chrono::steady_clock::now().time_since_epoch();
-  state.last_anchor_steady_seconds = static_cast<std::uint64_t>(
-      std::chrono::duration_cast<std::chrono::seconds>(steady_now).count());
+  state.accumulated_monotonic_seconds = 0; // Reset monotonic counter relative to fresh anchor
+  state.last_boot_id = current_boot_id;
+  state.last_session_uptime_seconds = now_uptime;
 
   // Successful server verification resets local tamper flags
   state.tamper_detected = false;
@@ -116,20 +199,29 @@ bool TrustedTime::AnchorServerTime(const std::string& product_id, std::uint64_t 
 }
 
 std::optional<std::uint64_t> TrustedTime::GetTrustedTime(const std::string& product_id) {
-  auto wall_now = std::chrono::system_clock::now().time_since_epoch();
-  std::uint64_t now_wall = static_cast<std::uint64_t>(
-      std::chrono::duration_cast<std::chrono::seconds>(wall_now).count());
-
-  auto steady_now = std::chrono::steady_clock::now().time_since_epoch();
-  std::uint64_t now_steady = static_cast<std::uint64_t>(
-      std::chrono::duration_cast<std::chrono::seconds>(steady_now).count());
+  std::uint64_t now_wall = s_test_wall_fn ? s_test_wall_fn() : DefaultWallSeconds();
+  std::uint64_t now_uptime = s_test_uptime_fn ? s_test_uptime_fn() : DefaultSystemUptimeSeconds();
+  std::uint64_t current_boot_id = s_test_boot_id_fn ? s_test_boot_id_fn() : DefaultBootId();
 
   const auto& baseline = GetProcessBaseline();
 
   // 1. In-process check: did wall clock jump backward since process startup?
-  if (now_wall + kAllowedSkewSeconds < baseline.start_wall_seconds) {
+  if (s_test_wall_fn == nullptr && now_wall + kAllowedSkewSeconds < baseline.start_wall_seconds) {
     // Clock moved backward during active runtime!
     return std::nullopt;
+  }
+
+  // In-process check: has wall clock frozen while process steady time advanced?
+  if (s_test_uptime_fn == nullptr) {
+    auto steady_now = std::chrono::steady_clock::now().time_since_epoch();
+    std::uint64_t proc_steady_now = static_cast<std::uint64_t>(
+        std::chrono::duration_cast<std::chrono::seconds>(steady_now).count());
+    if (proc_steady_now >= baseline.start_steady_seconds + kAllowedSkewSeconds) {
+      std::uint64_t elapsed_steady = proc_steady_now - baseline.start_steady_seconds;
+      if (now_wall + kAllowedSkewSeconds < baseline.start_wall_seconds + elapsed_steady) {
+        return std::nullopt; // Wall clock frozen while process was actively running
+      }
+    }
   }
 
   std::string key = MakeTimeStateKey(product_id);
@@ -159,19 +251,7 @@ std::optional<std::uint64_t> TrustedTime::GetTrustedTime(const std::string& prod
     return std::nullopt;
   }
 
-  // 4. Monotonic progression check against last anchor
-  if (state.last_known_server_time > 0 && state.last_anchor_steady_seconds > 0 &&
-      now_steady >= state.last_anchor_steady_seconds) {
-    std::uint64_t elapsed_steady = now_steady - state.last_anchor_steady_seconds;
-    std::uint64_t monotonic_projected = state.last_known_server_time + elapsed_steady;
-    if (now_wall + kAllowedSkewSeconds < monotonic_projected) {
-      state.tamper_detected = true;
-      SecureStorage::Store(key, SerializeTimeState(state), "rtprotect_time_state");
-      return std::nullopt;
-    }
-  }
-
-  // 5. Wall clock behind last-known wall clock across executions
+  // 4. Wall clock behind last-known wall clock across executions
   if (state.last_known_wall_time > 0 &&
       now_wall + kAllowedSkewSeconds < state.last_known_wall_time) {
     state.tamper_detected = true;
@@ -179,11 +259,57 @@ std::optional<std::uint64_t> TrustedTime::GetTrustedTime(const std::string& prod
     return std::nullopt;
   }
 
-  // Update last-known wall time
-  state.last_known_wall_time = (std::max)(state.last_known_wall_time, now_wall);
-  SecureStorage::Store(key, SerializeTimeState(state), "rtprotect_time_state");
+  // 5. Update monotonic progression across sessions and reboots
+  if (state.last_boot_id == 0 || state.last_boot_id != current_boot_id) {
+    // A reboot occurred (or first observation of boot_id)
+    state.last_boot_id = current_boot_id;
+    state.last_session_uptime_seconds = now_uptime;
+    state.accumulated_monotonic_seconds += now_uptime;
+  } else {
+    // Same boot session: accumulate uptime progression
+    if (now_uptime > state.last_session_uptime_seconds) {
+      std::uint64_t delta = now_uptime - state.last_session_uptime_seconds;
+      state.accumulated_monotonic_seconds += delta;
+      state.last_session_uptime_seconds = now_uptime;
+    }
+  }
 
-  return (std::max)(now_wall, state.last_known_server_time);
+  // 6. Monotonic anti-clock-freeze verification against server anchor
+  // If the server anchored at T0, and the machine has monotonically accumulated M seconds of active runtime,
+  // then wall time MUST be at least T0 + M - kAllowedSkewSeconds!
+  if (state.last_known_server_time > 0) {
+    std::uint64_t min_projected_time = state.last_known_server_time + state.accumulated_monotonic_seconds;
+    if (now_wall + kAllowedSkewSeconds < min_projected_time) {
+      state.tamper_detected = true;
+      SecureStorage::Store(key, SerializeTimeState(state), "rtprotect_time_state");
+      return std::nullopt;
+    }
+  }
+
+  // 7. Update high-water mark and throttle writes to SecureStorage (avoid write amplification)
+  bool need_persist = false;
+  if (now_wall > state.last_known_wall_time) {
+    if (now_wall - state.last_known_wall_time >= 60) {
+      need_persist = true;
+    }
+    state.last_known_wall_time = now_wall;
+  }
+  static std::uint64_t s_last_persisted_monotonic = 0;
+  if (state.accumulated_monotonic_seconds > s_last_persisted_monotonic &&
+      state.accumulated_monotonic_seconds - s_last_persisted_monotonic >= 60) {
+    need_persist = true;
+    s_last_persisted_monotonic = state.accumulated_monotonic_seconds;
+  }
+
+  if (need_persist) {
+    SecureStorage::Store(key, SerializeTimeState(state), "rtprotect_time_state");
+  }
+
+  std::uint64_t trusted = (std::max)(now_wall, state.last_known_wall_time);
+  if (state.last_known_server_time > 0) {
+    trusted = (std::max)(trusted, state.last_known_server_time + state.accumulated_monotonic_seconds);
+  }
+  return trusted;
 }
 
 TimeValidationResult TrustedTime::ValidateToken(const std::string& product_id,
@@ -271,6 +397,7 @@ std::optional<std::uint64_t> TrustedTime::ParseHttpDate(const std::string& http_
 }
 
 void TrustedTime::ResetTimeStateForTesting(const std::string& product_id) {
+  ResetTimeProvidersForTesting();
   SecureStorage::Delete(MakeTimeStateKey(product_id));
 }
 

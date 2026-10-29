@@ -32,6 +32,7 @@
 #include "integrity/verifier.h"
 #include "licensing/activation.h"
 #include "licensing/activation_client.h"
+#include "licensing/activation_server.h"
 #include "licensing/secure_storage.h"
 #include "licensing/hardware_id.h"
 #include "licensing/license.h"
@@ -1255,23 +1256,46 @@ IntegrationReport ExecuteIntegration(const IntegrationOptions& options) {
     }
   }
 
-  // 4. In development or staging mode: local dev token fallback (stored in OS secure storage & external dev_keys_dir)
-  if (!vm_root_set && (options.use_dev_keys || options.staging_only)) {
-    rtprotect::licensing::ActivationToken dev_token;
-    if (rtprotect::licensing::LoadOrCreateDevToken(options.product_id, dev_lic_id, &dev_token)) {
-      vm_root = dev_token.vm_root;
-      vm_root_set = true;
-    } else {
-      if (RAND_bytes(dev_token.vm_root.data(), static_cast<int>(dev_token.vm_root.size())) != 1) {
+  // 4. In development mode with dev keys: mint a signed development ActivationToken and save it locally
+  if (!vm_root_set && options.use_dev_keys) {
+    if (has_activation_privkey && activation_privkey.has_value()) {
+      rtprotect::licensing::ActivationToken dev_token;
+      dev_token.schema_version = rtprotect::licensing::kActivationSchemaVersion;
+      dev_token.license_id = dev_lic_id;
+      dev_token.device_fingerprint_hash = rtprotect::licensing::GetLocalHardwareId();
+      auto now_sec = static_cast<std::uint64_t>(std::time(nullptr));
+      dev_token.issued_at = now_sec;
+      dev_token.expires_at = now_sec + (14 * 86400); // 14-day dev token
+      dev_token.grace_expires_at = dev_token.expires_at + (3 * 86400); // 3-day grace
+      dev_token.sequence_number = 1;
+      if (RAND_bytes(dev_token.server_nonce.data(), static_cast<int>(dev_token.server_nonce.size())) != 1 ||
+          RAND_bytes(dev_token.vm_root.data(), static_cast<int>(dev_token.vm_root.size())) != 1) {
         report.success = false;
         report.state = IntegrationState::kFailed;
-        report.error_message = "Cryptographic RNG failure (RAND_bytes) while generating dev vm_root";
+        report.error_message = "Cryptographic RNG failure (RAND_bytes) while generating dev token keys";
+        return report;
+      }
+      if (!rtprotect::licensing::SignActivationToken(dev_token, *activation_privkey)) {
+        report.success = false;
+        report.state = IntegrationState::kFailed;
+        report.error_message = "Failed to sign dev activation token";
         return report;
       }
       vm_root = dev_token.vm_root;
       vm_root_set = true;
       rtprotect::licensing::SaveActivationToken(options.product_id, dev_token);
     }
+  } else if (!vm_root_set && options.staging_only) {
+    rtprotect::licensing::ActivationToken staged_token;
+    if (RAND_bytes(staged_token.vm_root.data(), static_cast<int>(staged_token.vm_root.size())) != 1) {
+      report.success = false;
+      report.state = IntegrationState::kFailed;
+      report.error_message = "Cryptographic RNG failure (RAND_bytes) while generating staged vm_root";
+      return report;
+    }
+    vm_root = staged_token.vm_root;
+    vm_root_set = true;
+    rtprotect::licensing::SaveActivationToken(options.product_id, staged_token);
   }
 
   // 5. In production mode: enforce cryptographic key separation
@@ -1553,12 +1577,14 @@ IntegrationReport ExecuteIntegration(const IntegrationOptions& options) {
     ss << "  if (cached_tok.has_value() && !cached_tok->license_id.empty() && cached_tok->license_id == lic.license_id) {\n";
     ss << "    bool sig_ok = rtprotect::licensing::VerifyActivationTokenSignature(*cached_tok, kActivationPublicKey);\n";
     ss << "    bool hw_ok = rtprotect::licensing::VerifyHardwareMatch(cached_tok->device_fingerprint_hash, ctx.current_hardware_id, 0.75);\n";
-    ss << "    auto time_res = rtprotect::licensing::TrustedTime::ValidateToken(kProductId, *cached_tok);\n";
+    ss << "    auto time_res = rtprotect::licensing::TrustedTime::ValidateToken(kProductId, *cached_tok, /*allow_grace=*/true);\n";
     ss << "    bool time_ok = (time_res == rtprotect::licensing::TimeValidationResult::kValid || time_res == rtprotect::licensing::TimeValidationResult::kInGracePeriod);\n";
-    ss << "    bool exp_ok = (cached_tok->expires_at > 0 && ctx.current_time <= cached_tok->expires_at);\n";
-    ss << "    if (sig_ok && hw_ok && time_ok && exp_ok) {\n";
+    ss << "    if (sig_ok && hw_ok && time_ok) {\n";
     ss << "      token = *cached_tok;\n";
     ss << "      token_loaded = true;\n";
+    ss << "      if (time_res == rtprotect::licensing::TimeValidationResult::kInGracePeriod) {\n";
+    ss << "        std::fprintf(stderr, \"[RTProtect] Notice: License activation is currently in grace period.\\n\");\n";
+    ss << "      }\n";
     ss << "    }\n";
     ss << "  }\n\n";
     ss << "  // 4b. Online Activation against server if uncached or expired\n";
@@ -1583,18 +1609,11 @@ IntegrationReport ExecuteIntegration(const IntegrationOptions& options) {
     ss << "      token_loaded = true;\n";
     ss << "    }\n";
     ss << "  }\n\n";
-    if (options.use_dev_keys) {
-      ss << "  // 4c. Development local token fallback (only compiled in development builds with RTPROTECT_DEV_BUILD)\n";
-      ss << "#if defined(RTPROTECT_DEV_BUILD)\n";
-      ss << "  if (!token_loaded) {\n";
-      ss << "    if (rtprotect::licensing::LoadOrCreateDevToken(kProductId, lic.license_id, &token)) {\n";
-      ss << "      token_loaded = true;\n";
-      ss << "    }\n";
-      ss << "  }\n";
-      ss << "#endif\n\n";
-    }
     ss << "  if (!token_loaded) return false; // Activation required -> fail closed\n";
-    ss << "  if (token.expires_at > 0 && ctx.current_time > token.expires_at) return false;\n";
+    ss << "  auto final_time = rtprotect::licensing::TrustedTime::ValidateToken(kProductId, token, /*allow_grace=*/true);\n";
+    ss << "  if (final_time != rtprotect::licensing::TimeValidationResult::kValid && final_time != rtprotect::licensing::TimeValidationResult::kInGracePeriod) {\n";
+    ss << "    return false;\n";
+    ss << "  }\n";
     ss << "  SetRuntimeManifestRoot(token.vm_root.data(), 32);\n";
 
     ss << "\n  // 5. Executable integrity verification (FAIL CLOSED)\n";
@@ -1815,9 +1834,6 @@ IntegrationReport ExecuteIntegration(const IntegrationOptions& options) {
     ss << "endif()\n";
 
     ss << "target_sources(" << target_name << " PRIVATE rtprotect_runtime_glue.cpp)\n";
-    if (options.use_dev_keys) {
-      ss << "target_compile_definitions(" << target_name << " PRIVATE RTPROTECT_DEV_BUILD=1)\n";
-    }
     ss << "target_link_libraries(" << target_name << " PRIVATE\n";
     ss << "    rtprotect_licensing\n";
     ss << "    rtprotect_integrity\n";

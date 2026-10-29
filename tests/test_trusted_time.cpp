@@ -120,4 +120,105 @@ MT_TEST(TrustedTime_HandlesGracePeriod_And_Expiration) {
   TrustedTime::ResetTimeStateForTesting(prod);
 }
 
+static std::uint64_t s_mock_wall = 1700000000;
+static std::uint64_t s_mock_uptime = 100;
+static std::uint64_t s_mock_boot_id = 1;
+
+static std::uint64_t MockWall() { return s_mock_wall; }
+static std::uint64_t MockUptime() { return s_mock_uptime; }
+static std::uint64_t MockBootId() { return s_mock_boot_id; }
+
+MT_TEST(TrustedTime_FreezeAndReboot_Detected) {
+  std::string prod = "test_time_prod_freeze";
+  TrustedTime::ResetTimeStateForTesting(prod);
+
+  s_mock_wall = 1700000000;
+  s_mock_uptime = 10;
+  s_mock_boot_id = 101;
+  TrustedTime::SetTimeProvidersForTesting(MockWall, MockUptime, MockBootId);
+
+  // Initial anchor at server time 1700000000
+  MT_CHECK(TrustedTime::AnchorServerTime(prod, 1700000000));
+
+  // Boot 1: Machine runs for 200s, but wall clock is frozen at 1700000000
+  s_mock_uptime = 210;
+  auto t1 = TrustedTime::GetTrustedTime(prod);
+  MT_CHECK(t1.has_value()); // Within 300s skew tolerance
+
+  // Boot 2: Attacker reboots the machine! (new boot_id, uptime resets to 10s)
+  s_mock_boot_id = 102;
+  s_mock_uptime = 10;
+  auto t2 = TrustedTime::GetTrustedTime(prod);
+  MT_CHECK(t2.has_value());
+
+  // Boot 2 runs for another 200s (total active monotonic time = 200 + 200 = 400s > 300s skew)
+  // But wall clock is STILL frozen at 1700000000!
+  s_mock_uptime = 210;
+  auto t3 = TrustedTime::GetTrustedTime(prod);
+  // Must catch clock freeze across reboots!
+  MT_CHECK(!t3.has_value());
+
+  ActivationToken tok;
+  tok.license_id = "lic-freeze";
+  tok.issued_at = 1700000000;
+  tok.expires_at = 1700086400;
+  tok.grace_expires_at = tok.expires_at + 86400;
+
+  auto res = TrustedTime::ValidateToken(prod, tok);
+  MT_CHECK(res == TimeValidationResult::kClockTampered);
+
+  TrustedTime::ResetTimeStateForTesting(prod);
+}
+
+MT_TEST(TrustedTime_WriteThrottling_AvoidsAmplification) {
+  std::string prod = "test_time_prod_throttle";
+  TrustedTime::ResetTimeStateForTesting(prod);
+
+  s_mock_wall = 1700000000;
+  s_mock_uptime = 10;
+  s_mock_boot_id = 201;
+  TrustedTime::SetTimeProvidersForTesting(MockWall, MockUptime, MockBootId);
+
+  MT_CHECK(TrustedTime::AnchorServerTime(prod, 1700000000));
+
+  // Multiple rapid queries within 10 seconds
+  for (int i = 0; i < 50; ++i) {
+    s_mock_wall += 1;
+    s_mock_uptime += 1;
+    auto t = TrustedTime::GetTrustedTime(prod);
+    MT_CHECK(t.has_value());
+  }
+
+  TrustedTime::ResetTimeStateForTesting(prod);
+}
+
+MT_TEST(TrustedTime_OfflineExpiry_WithClockSkew) {
+  std::string prod = "test_time_prod_offline_skew";
+  TrustedTime::ResetTimeStateForTesting(prod);
+
+  s_mock_wall = 1700000000;
+  s_mock_uptime = 10;
+  s_mock_boot_id = 301;
+  TrustedTime::SetTimeProvidersForTesting(MockWall, MockUptime, MockBootId);
+
+  MT_CHECK(TrustedTime::AnchorServerTime(prod, 1700000000));
+
+  ActivationToken tok;
+  tok.license_id = "lic-offline-skew";
+  tok.issued_at = 1700000000;
+  tok.expires_at = 1700001000; // Valid for 1000 seconds
+  tok.grace_expires_at = 1700001000; // No grace
+
+  // Attacker advances wall clock by only 50s (clock set to 1700000050)
+  // But monotonic uptime advanced by 1200s (system was on for 1200s)!
+  // Real active progression = 1700000000 + 1200 = 1700001200 > expires_at (1700001000).
+  // Therefore, token must expire!
+  s_mock_wall = 1700001050; // wall clock kept near expiry
+  s_mock_uptime = 1250;     // uptime past expiry
+  auto res = TrustedTime::ValidateToken(prod, tok);
+  MT_CHECK(res == TimeValidationResult::kExpired);
+
+  TrustedTime::ResetTimeStateForTesting(prod);
+}
+
 MT_MAIN()

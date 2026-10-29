@@ -235,11 +235,11 @@ void PrintUsage() {
       "\n"
       "    rtprotect-tool offline-grant [options]\n"
       "      --server <url>                    Online Activation Authority URL (required)\n"
-      "      --license <key>                   Vendor license key string (required)\n"
       "      --product <id>                    Product identifier (required)\n"
       "      --pub-key <file>                  Vendor Ed25519 public key file (required)\n"
+      "      --license <key>                   Vendor license key string (or --license-env/file/stdin)\n"
       "      --days <1-30>                     Offline grant duration in days (default: 14)\n"
-      "      --credential <secret>             Optional activation secret credential\n"
+      "      --credential <secret>             Optional activation secret (or --credential-env/file/stdin)\n"
       "      --out <file>                      Optional output file to save serialized token\n"
       "\n"
       "  Cryptographic & Integrity Primitives:\n"
@@ -1181,23 +1181,110 @@ int CmdActivateRevoke(int argc, char** argv) {
   return 0;
 }
 
+bool ResolveSecretInput(const std::string& val_literal,
+                        const std::string& env_var,
+                        const std::string& file_path,
+                        bool from_stdin,
+                        const std::string& param_name,
+                        std::string* out_secret) {
+  if (!out_secret) return false;
+  out_secret->clear();
+
+  int sources = 0;
+  if (!val_literal.empty()) sources++;
+  if (!env_var.empty()) sources++;
+  if (!file_path.empty()) sources++;
+  if (from_stdin) sources++;
+
+  if (sources > 1) {
+    std::fprintf(stderr, "error: multiple input sources provided for %s. Choose only one of --%s, --%s-env, --%s-file, or --%s-stdin.\n",
+                 param_name.c_str(), param_name.c_str(), param_name.c_str(), param_name.c_str(), param_name.c_str());
+    return false;
+  }
+
+  if (!env_var.empty()) {
+    const char* env_val = std::getenv(env_var.c_str());
+    if (!env_val || env_val[0] == '\0') {
+      std::fprintf(stderr, "error: environment variable '%s' for %s is empty or not set.\n", env_var.c_str(), param_name.c_str());
+      return false;
+    }
+    *out_secret = env_val;
+    return true;
+  }
+
+  if (!file_path.empty()) {
+    auto file_text = ReadTextFile(file_path);
+    if (!file_text.has_value()) {
+      std::fprintf(stderr, "error: failed to read %s from file: %s\n", param_name.c_str(), file_path.c_str());
+      return false;
+    }
+    std::string s = *file_text;
+    while (!s.empty() && (s.back() == '\r' || s.back() == '\n' || s.back() == ' ' || s.back() == '\t')) s.pop_back();
+    *out_secret = s;
+    return true;
+  }
+
+  if (from_stdin) {
+    std::string line;
+    if (!std::getline(std::cin, line)) {
+      std::fprintf(stderr, "error: failed to read %s from stdin.\n", param_name.c_str());
+      return false;
+    }
+    while (!line.empty() && (line.back() == '\r' || line.back() == '\n')) line.pop_back();
+    *out_secret = line;
+    return true;
+  }
+
+  if (!val_literal.empty()) {
+    std::fprintf(stderr, "warning: specifying --%s directly on the command line exposes it in process tables and shell history. Consider using --%s-env, --%s-file, or --%s-stdin.\n",
+                 param_name.c_str(), param_name.c_str(), param_name.c_str(), param_name.c_str());
+    *out_secret = val_literal;
+    return true;
+  }
+
+  return true;
+}
+
 int CmdOfflineGrant(int argc, char** argv) {
   std::string server_url;
-  std::string license_key;
   std::string product_id;
   std::string pub_key_file;
-  std::string credential;
   std::string out_file;
   std::uint32_t offline_days = 14;
+
+  std::string license_literal;
+  std::string license_env;
+  std::string license_file;
+  bool license_stdin = false;
+
+  std::string credential_literal;
+  std::string credential_env;
+  std::string credential_file;
+  bool credential_stdin = false;
 
   for (int i = 2; i < argc; ++i) {
     std::string arg = argv[i];
     if (arg == "--server" && i + 1 < argc) server_url = argv[++i];
-    else if (arg == "--license" && i + 1 < argc) license_key = argv[++i];
     else if (arg == "--product" && i + 1 < argc) product_id = argv[++i];
     else if (arg == "--pub-key" && i + 1 < argc) pub_key_file = argv[++i];
-    else if (arg == "--credential" && i + 1 < argc) credential = argv[++i];
-    else if (arg == "--days" && i + 1 < argc) offline_days = std::stoul(argv[++i]);
+    else if (arg == "--license" && i + 1 < argc) license_literal = argv[++i];
+    else if (arg == "--license-env" && i + 1 < argc) license_env = argv[++i];
+    else if (arg == "--license-file" && i + 1 < argc) license_file = argv[++i];
+    else if (arg == "--license-stdin") license_stdin = true;
+    else if (arg == "--credential" && i + 1 < argc) credential_literal = argv[++i];
+    else if (arg == "--credential-env" && i + 1 < argc) credential_env = argv[++i];
+    else if (arg == "--credential-file" && i + 1 < argc) credential_file = argv[++i];
+    else if (arg == "--credential-stdin") credential_stdin = true;
+    else if (arg == "--days" && i + 1 < argc) {
+      std::string val_str = argv[++i];
+      char* end = nullptr;
+      unsigned long d = std::strtoul(val_str.c_str(), &end, 10);
+      if (end == val_str.c_str() || *end != '\0' || d == 0 || d > 30) {
+        std::fprintf(stderr, "error: invalid value for --days: '%s'. Must be an integer between 1 and 30.\n", val_str.c_str());
+        return 2;
+      }
+      offline_days = static_cast<std::uint32_t>(d);
+    }
     else if (arg == "--out" && i + 1 < argc) out_file = argv[++i];
     else {
       std::fprintf(stderr, "error: unknown argument '%s'\n", arg.c_str());
@@ -1205,8 +1292,18 @@ int CmdOfflineGrant(int argc, char** argv) {
     }
   }
 
+  std::string license_key;
+  if (!ResolveSecretInput(license_literal, license_env, license_file, license_stdin, "license", &license_key)) {
+    return 2;
+  }
+
+  std::string credential;
+  if (!ResolveSecretInput(credential_literal, credential_env, credential_file, credential_stdin, "credential", &credential)) {
+    return 2;
+  }
+
   if (server_url.empty() || license_key.empty() || product_id.empty() || pub_key_file.empty()) {
-    std::fprintf(stderr, "error: --server, --license, --product, and --pub-key are required for offline-grant\n");
+    std::fprintf(stderr, "error: --server, --license (or --license-env/file/stdin), --product, and --pub-key are required for offline-grant\n");
     return 2;
   }
 
@@ -1295,55 +1392,63 @@ int CmdProtectBinary(int argc, char** argv) {
 }  // namespace
 
 int main(int argc, char** argv) {
-  if (argc < 2) {
+  try {
+    if (argc < 2) {
+      PrintUsage();
+      return 2;
+    }
+    std::string cmd = argv[1];
+
+    if (cmd == "--help" || cmd == "-h" || cmd == "help") {
+      PrintUsage();
+      return 0;
+    }
+    if (cmd == "--version" || cmd == "-v" || cmd == "version") {
+      std::printf("RTProtect CLI v2.0.0-hardened\n"
+                  "  Ed25519 Asymmetric Integrity & Licensing\n"
+                  "  Hardware Fingerprinting & Anti-Tamper Engine\n"
+                  "  OpenSSL 3.4.0 EVP Backend\n");
+      return 0;
+    }
+
+    // Integration & Lifecycle commands
+    if (cmd == "integrate") return CmdIntegrate(argc, argv);
+    if (cmd == "unreal-integrate") return CmdIntegrate(argc, argv);
+    if (cmd == "sign-release") return CmdSignRelease(argc, argv);
+    if (cmd == "rollback") return CmdRollback(argc, argv);
+    if (cmd == "validate-build") return CmdValidateBuild(argc, argv);
+    if (cmd == "experimental-protect-binary" || cmd == "protect-binary") return CmdProtectBinary(argc, argv);
+
+    // Licensing & HWID commands
+    if (cmd == "license-generate") return CmdLicenseGenerate(argc, argv);
+    if (cmd == "license-verify") return CmdLicenseVerify(argc, argv);
+    if (cmd == "license-inspect") return CmdLicenseInspect(argc, argv);
+    if (cmd == "fingerprint") return CmdFingerprint(argc, argv);
+
+    // Online Activation & Revocation
+    if (cmd == "activate-issue") return CmdActivateIssue(argc, argv);
+    if (cmd == "activate-verify") return CmdActivateVerify(argc, argv);
+    if (cmd == "activate-revoke") return CmdActivateRevoke(argc, argv);
+    if (cmd == "offline-grant") return CmdOfflineGrant(argc, argv);
+
+    // Cryptographic Primitives
+    if (cmd == "genkey-ed25519") return CmdGenkeyEd25519(argc, argv);
+    if (cmd == "genkey-aes") return CmdGenkeyAes(argc, argv);
+    if (cmd == "hash") return CmdHash(argc, argv);
+    if (cmd == "encrypt") return CmdEncrypt(argc, argv);
+    if (cmd == "decrypt") return CmdDecrypt(argc, argv);
+    if (cmd == "manifest-build") return CmdManifestBuild(argc, argv);
+    if (cmd == "manifest-sign") return CmdManifestSign(argc, argv);
+    if (cmd == "manifest-verify") return CmdManifestVerify(argc, argv);
+
+    std::fprintf(stderr, "error: unknown command '%s'\n\n", cmd.c_str());
     PrintUsage();
     return 2;
+  } catch (const std::exception& e) {
+    std::fprintf(stderr, "fatal error: %s\n", e.what());
+    return 1;
+  } catch (...) {
+    std::fprintf(stderr, "fatal error: unhandled unexpected exception\n");
+    return 1;
   }
-  std::string cmd = argv[1];
-
-  if (cmd == "--help" || cmd == "-h" || cmd == "help") {
-    PrintUsage();
-    return 0;
-  }
-  if (cmd == "--version" || cmd == "-v" || cmd == "version") {
-    std::printf("RTProtect CLI v2.0.0-hardened\n"
-                "  Ed25519 Asymmetric Integrity & Licensing\n"
-                "  Hardware Fingerprinting & Anti-Tamper Engine\n"
-                "  OpenSSL 3.4.0 EVP Backend\n");
-    return 0;
-  }
-
-  // Integration & Lifecycle commands
-  if (cmd == "integrate") return CmdIntegrate(argc, argv);
-  if (cmd == "unreal-integrate") return CmdIntegrate(argc, argv);
-  if (cmd == "sign-release") return CmdSignRelease(argc, argv);
-  if (cmd == "rollback") return CmdRollback(argc, argv);
-  if (cmd == "validate-build") return CmdValidateBuild(argc, argv);
-  if (cmd == "experimental-protect-binary" || cmd == "protect-binary") return CmdProtectBinary(argc, argv);
-
-  // Licensing & HWID commands
-  if (cmd == "license-generate") return CmdLicenseGenerate(argc, argv);
-  if (cmd == "license-verify") return CmdLicenseVerify(argc, argv);
-  if (cmd == "license-inspect") return CmdLicenseInspect(argc, argv);
-  if (cmd == "fingerprint") return CmdFingerprint(argc, argv);
-
-  // Online Activation & Revocation
-  if (cmd == "activate-issue") return CmdActivateIssue(argc, argv);
-  if (cmd == "activate-verify") return CmdActivateVerify(argc, argv);
-  if (cmd == "activate-revoke") return CmdActivateRevoke(argc, argv);
-  if (cmd == "offline-grant") return CmdOfflineGrant(argc, argv);
-
-  // Cryptographic Primitives
-  if (cmd == "genkey-ed25519") return CmdGenkeyEd25519(argc, argv);
-  if (cmd == "genkey-aes") return CmdGenkeyAes(argc, argv);
-  if (cmd == "hash") return CmdHash(argc, argv);
-  if (cmd == "encrypt") return CmdEncrypt(argc, argv);
-  if (cmd == "decrypt") return CmdDecrypt(argc, argv);
-  if (cmd == "manifest-build") return CmdManifestBuild(argc, argv);
-  if (cmd == "manifest-sign") return CmdManifestSign(argc, argv);
-  if (cmd == "manifest-verify") return CmdManifestVerify(argc, argv);
-
-  std::fprintf(stderr, "error: unknown command '%s'\n\n", cmd.c_str());
-  PrintUsage();
-  return 2;
 }

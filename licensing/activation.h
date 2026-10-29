@@ -125,10 +125,10 @@ bool SaveActivationToken(const std::string& product_id, const ActivationToken& t
 std::optional<ActivationToken> LoadActivationToken(const std::string& product_id);
 bool DeleteActivationToken(const std::string& product_id);
 
-#if defined(RTPROTECT_DEV_BUILD) || !defined(NDEBUG)
+#if defined(RTPROTECT_DEV_BUILD)
 /**
  * @brief Development-only fallback: loads existing dev token or creates a local development token.
- * COMPILED OUT in production release builds (requires RTPROTECT_DEV_BUILD or !NDEBUG).
+ * COMPILED OUT in production release builds (requires RTPROTECT_DEV_BUILD).
  */
 bool LoadOrCreateDevToken(const std::string& product_id,
                           const std::string& license_id,

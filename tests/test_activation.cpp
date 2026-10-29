@@ -320,7 +320,7 @@ MT_TEST(ActivationToken_ExpiryCheck) {
   MT_CHECK(expired_time > tok.expires_at);
 }
 
-#if defined(RTPROTECT_DEV_BUILD) || !defined(NDEBUG)
+#if defined(RTPROTECT_DEV_BUILD)
 MT_TEST(ActivationToken_LoadOrCreateDevToken_PersistsAndEncrypts) {
   std::string test_prod = "test_product_dev_token_isolation";
   std::string test_lic = "lic-dev-isolated-001";
@@ -328,6 +328,10 @@ MT_TEST(ActivationToken_LoadOrCreateDevToken_PersistsAndEncrypts) {
 
   std::error_code ec;
   std::filesystem::remove(token_path, ec);
+
+  // Rejects empty license ID
+  ActivationToken empty_tok;
+  MT_CHECK(!LoadOrCreateDevToken(test_prod, "", &empty_tok));
 
   ActivationToken tok1;
   MT_CHECK(LoadOrCreateDevToken(test_prod, test_lic, &tok1));

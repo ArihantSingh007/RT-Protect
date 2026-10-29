@@ -499,15 +499,18 @@ bool DeleteActivationToken(const std::string& product_id) {
   return SecureStorage::Delete("activation_" + sanitized_product);
 }
  
-#if defined(RTPROTECT_DEV_BUILD) || !defined(NDEBUG)
+#if defined(RTPROTECT_DEV_BUILD)
 bool LoadOrCreateDevToken(const std::string& product_id,
                           const std::string& license_id,
                           ActivationToken* out_token) {
   if (!out_token) return false;
+  if (license_id.empty()) {
+    return false; // Reject empty license_id wildcard
+  }
 
   auto existing = LoadActivationToken(product_id);
   if (existing.has_value()) {
-    bool lic_match = (license_id.empty() || existing->license_id == license_id);
+    bool lic_match = (existing->license_id == license_id);
     if (lic_match) {
       *out_token = *existing;
       return true;
@@ -517,7 +520,7 @@ bool LoadOrCreateDevToken(const std::string& product_id,
   // Generate a fresh development activation token bound to hardware ID
   ActivationToken dev_token;
   dev_token.schema_version = kActivationSchemaVersion;
-  dev_token.license_id = license_id.empty() ? "dev-license" : license_id;
+  dev_token.license_id = license_id;
   dev_token.device_fingerprint_hash = GetLocalHardwareId();
 
   auto now = std::chrono::system_clock::now().time_since_epoch();

@@ -19,7 +19,7 @@ $Targets = @()
 
 # Find strictly matched build output directories (anchored to prevent accidental deletion)
 $BuildDirs = Get-ChildItem -Path $RepoRoot -Directory | Where-Object {
-    $_.Name -match '^build($|[-_](vs20\d{2}|ninja|msvc|clang|gcc|fuzz|reconst|exp|release-pkg|smoke).*$)'
+    $_.Name -match '^build($|[-_](vs20\d{2}|ninja|msvc|clang|gcc|mingw|fuzz|reconst|exp|release|debug|x64|pkg|smoke).*$)'
 }
 foreach ($d in $BuildDirs) {
     $Targets += $d.FullName
