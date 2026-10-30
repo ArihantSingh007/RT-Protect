@@ -1285,17 +1285,6 @@ IntegrationReport ExecuteIntegration(const IntegrationOptions& options) {
       vm_root_set = true;
       rtprotect::licensing::SaveActivationToken(options.product_id, dev_token);
     }
-  } else if (!vm_root_set && options.staging_only) {
-    rtprotect::licensing::ActivationToken staged_token;
-    if (RAND_bytes(staged_token.vm_root.data(), static_cast<int>(staged_token.vm_root.size())) != 1) {
-      report.success = false;
-      report.state = IntegrationState::kFailed;
-      report.error_message = "Cryptographic RNG failure (RAND_bytes) while generating staged vm_root";
-      return report;
-    }
-    vm_root = staged_token.vm_root;
-    vm_root_set = true;
-    rtprotect::licensing::SaveActivationToken(options.product_id, staged_token);
   }
 
   // 5. In production mode: enforce cryptographic key separation
@@ -1411,7 +1400,9 @@ IntegrationReport ExecuteIntegration(const IntegrationOptions& options) {
     ss << "#include <filesystem>\n";
     ss << "#include <fstream>\n";
     ss << "#include <string>\n";
-    ss << "#include <vector>\n\n";
+    ss << "#include <vector>\n";
+    ss << "#include <thread>\n";
+    ss << "#include <atomic>\n\n";
 
     ss << "#include <windows.h>\n\n";
 
@@ -1420,7 +1411,48 @@ IntegrationReport ExecuteIntegration(const IntegrationOptions& options) {
     ss << "static rtprotect::licensing::License s_validated_license{};\n";
     ss << "static std::array<std::uint8_t, 32> s_runtime_manifest_vm_root{};\n";
     ss << "static bool s_runtime_root_initialized = false;\n";
-    ss << "static std::string s_client_activation_credential;\n\n";
+    ss << "static std::string s_client_activation_credential;\n";
+    ss << "static rtprotect::licensing::ActivationToken s_active_activation_token{};\n";
+    ss << "static std::atomic<std::uint64_t> s_last_revalidation_time{0};\n";
+    ss << "static std::atomic<bool> s_stop_revalidation{false};\n\n";
+
+    ss << "static bool RevalidateLicenseAndTime() {\n";
+    ss << "  if (!s_license_validated || !s_runtime_root_initialized) return false;\n";
+    ss << "  auto trusted_time = rtprotect::licensing::TrustedTime::GetTrustedTime(kProductId);\n";
+    ss << "  if (!trusted_time.has_value()) {\n";
+    ss << "    s_runtime_root_initialized = false;\n";
+    ss << "    std::fill(s_runtime_manifest_vm_root.begin(), s_runtime_manifest_vm_root.end(), 0);\n";
+    ss << "    return false;\n";
+    ss << "  }\n";
+    ss << "  auto val_res = rtprotect::licensing::TrustedTime::ValidateToken(kProductId, s_active_activation_token, /*allow_grace=*/true);\n";
+    ss << "  if (val_res != rtprotect::licensing::TimeValidationResult::kValid &&\n";
+    ss << "      val_res != rtprotect::licensing::TimeValidationResult::kInGracePeriod) {\n";
+    ss << "    s_runtime_root_initialized = false;\n";
+    ss << "    std::fill(s_runtime_manifest_vm_root.begin(), s_runtime_manifest_vm_root.end(), 0);\n";
+    ss << "    return false;\n";
+    ss << "  }\n";
+    ss << "  return true;\n";
+    ss << "}\n\n";
+
+    ss << "static void StartPeriodicRevalidation() {\n";
+    ss << "  static std::atomic<bool> s_watchdog_started{false};\n";
+    ss << "  if (s_watchdog_started.exchange(true)) return;\n";
+    ss << "  try {\n";
+    ss << "    std::thread t([]() {\n";
+    ss << "      while (!s_stop_revalidation.load(std::memory_order_relaxed)) {\n";
+    ss << "        for (int i = 0; i < 30 && !s_stop_revalidation.load(std::memory_order_relaxed); ++i) {\n";
+    ss << "          std::this_thread::sleep_for(std::chrono::seconds(1));\n";
+    ss << "        }\n";
+    ss << "        if (s_stop_revalidation.load(std::memory_order_relaxed)) break;\n";
+    ss << "        if (!RevalidateLicenseAndTime()) {\n";
+    ss << "          std::fprintf(stderr, \"[RTProtect] Fatal: Runtime license or clock freeze violation detected during execution. Terminating.\\n\");\n";
+    ss << "          std::exit(1);\n";
+    ss << "        }\n";
+    ss << "      }\n";
+    ss << "    });\n";
+    ss << "    t.detach();\n";
+    ss << "  } catch (...) {}\n";
+    ss << "}\n\n";
 
     ss << "void SetClientActivationCredential(const char* credential) {\n";
     ss << "  if (credential) {\n";
@@ -1440,6 +1472,13 @@ IntegrationReport ExecuteIntegration(const IntegrationOptions& options) {
     ss << "std::optional<rtprotect::crypto::Aes256Key> GetFunctionMasterKey(const std::uint8_t* salt, std::size_t salt_len) {\n";
     ss << "  using namespace rtprotect::obfuscation;\n";
     ss << "  if (!s_runtime_root_initialized) return std::nullopt;\n";
+    ss << "  std::uint64_t now_check = static_cast<std::uint64_t>(std::time(nullptr));\n";
+    ss << "  std::uint64_t last_check = s_last_revalidation_time.load(std::memory_order_relaxed);\n";
+    ss << "  if (now_check >= last_check + 10) {\n";
+    ss << "    if (s_last_revalidation_time.compare_exchange_strong(last_check, now_check)) {\n";
+    ss << "      if (!RevalidateLicenseAndTime()) return std::nullopt;\n";
+    ss << "    }\n";
+    ss << "  }\n";
     ss << "  std::optional<rtprotect::crypto::Aes256Key> derived_key = std::nullopt;\n";
     ss << "  rtprotect::crypto::SecureBuffer raw_seed(32);\n";
     ss << "  std::vector<std::uint8_t> hkdf_salt;\n";
@@ -1615,6 +1654,7 @@ IntegrationReport ExecuteIntegration(const IntegrationOptions& options) {
     ss << "    return false;\n";
     ss << "  }\n";
     ss << "  SetRuntimeManifestRoot(token.vm_root.data(), 32);\n";
+    ss << "  s_active_activation_token = token;\n";
 
     ss << "\n  // 5. Executable integrity verification (FAIL CLOSED)\n";
     ss << "  std::string exe_path = GetCurrentExecutablePath();\n";
@@ -1630,6 +1670,7 @@ IntegrationReport ExecuteIntegration(const IntegrationOptions& options) {
 
     ss << "\n  s_validated_license = lic;\n";
     ss << "  s_license_validated = true;\n";
+    ss << "  StartPeriodicRevalidation();\n";
     ss << "  return true;\n";
     ss << "}\n\n";
 

@@ -47,6 +47,11 @@ class TrustedTime {
                                         UptimeProvider uptime_fn,
                                         BootIdProvider boot_id_fn);
   static void ResetTimeProvidersForTesting();
+  static void ResetProcessBaselineForTesting(std::uint64_t start_wall, std::uint64_t start_steady);
+
+  // Queries current boot identity and uptime (uses test providers if registered)
+  static std::uint64_t GetCurrentBootId();
+  static std::uint64_t GetCurrentSystemUptime();
 
   // Anchors verified server timestamp from online token issuance/renewal
   static bool AnchorServerTime(const std::string& product_id, std::uint64_t server_timestamp);

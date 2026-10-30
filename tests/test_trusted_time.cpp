@@ -221,4 +221,219 @@ MT_TEST(TrustedTime_OfflineExpiry_WithClockSkew) {
   TrustedTime::ResetTimeStateForTesting(prod);
 }
 
+MT_TEST(TrustedTime_ProductionProviders_RelaunchWithoutReboot) {
+  std::string prod = "test_time_prod_relaunch_real";
+  TrustedTime::ResetTimeStateForTesting(prod);
+
+  // Use pure production providers (NO mock overrides)
+  TrustedTime::ResetTimeProvidersForTesting();
+
+  auto real_boot_id = TrustedTime::GetCurrentBootId();
+  auto real_uptime = TrustedTime::GetCurrentSystemUptime();
+  MT_CHECK(real_boot_id > 0);
+  MT_CHECK(real_uptime > 0);
+
+  // Server anchors at current time
+  auto now_wall = static_cast<std::uint64_t>(
+      std::chrono::duration_cast<std::chrono::seconds>(
+          std::chrono::system_clock::now().time_since_epoch()).count());
+  MT_CHECK(TrustedTime::AnchorServerTime(prod, now_wall));
+
+  // First process run
+  auto t1 = TrustedTime::GetTrustedTime(prod);
+  MT_CHECK(t1.has_value());
+  MT_CHECK(*t1 >= now_wall);
+
+  // Simulate cold relaunch of application: reset in-process baseline
+  TrustedTime::ResetTimeProvidersForTesting();
+
+  // Second process run in same boot session: MUST SUCCEED AND NOT TRIGGER TAMPER (Finding 1 fix)
+  auto t2 = TrustedTime::GetTrustedTime(prod);
+  MT_CHECK(t2.has_value());
+  MT_CHECK(*t2 >= *t1);
+
+  ActivationToken tok;
+  tok.license_id = "lic-real-relaunch";
+  tok.issued_at = now_wall;
+  tok.expires_at = now_wall + 86400;
+  tok.grace_expires_at = tok.expires_at + 86400;
+
+  auto val_res = TrustedTime::ValidateToken(prod, tok, /*allow_grace=*/true);
+  MT_CHECK(val_res == TimeValidationResult::kValid);
+
+  TrustedTime::ResetTimeStateForTesting(prod);
+}
+
+MT_TEST(TrustedTime_30DayGrant_LifecycleWithRelaunches) {
+  std::string prod = "test_time_prod_30day_grant";
+  TrustedTime::ResetTimeStateForTesting(prod);
+
+  std::uint64_t t0 = 1700000000;
+  std::uint64_t boot_time = 1700000000 - 3600; // machine booted 1 hour before anchor
+  s_mock_wall = t0;
+  s_mock_uptime = 3600;
+  s_mock_boot_id = boot_time;
+  TrustedTime::SetTimeProvidersForTesting(MockWall, MockUptime, MockBootId);
+
+  MT_CHECK(TrustedTime::AnchorServerTime(prod, t0));
+
+  ActivationToken grant_tok;
+  grant_tok.license_id = "lic-30day-grant";
+  grant_tok.issued_at = t0;
+  grant_tok.expires_at = t0 + (30 * 86400); // 30 days
+  grant_tok.grace_expires_at = grant_tok.expires_at + (3 * 86400); // 3 days grace
+
+  // Day 1: launch after 2 hours
+  s_mock_wall = t0 + 7200;
+  s_mock_uptime = 3600 + 7200;
+  s_mock_boot_id = boot_time;
+  TrustedTime::ResetProcessBaselineForTesting(s_mock_wall, s_mock_uptime);
+  MT_CHECK(TrustedTime::ValidateToken(prod, grant_tok) == TimeValidationResult::kValid);
+
+  // Day 10: cold relaunch after machine rebooted on day 9
+  std::uint64_t day10_wall = t0 + (10 * 86400);
+  std::uint64_t day10_boot = day10_wall - 1800; // rebooted 30 mins ago
+  s_mock_wall = day10_wall;
+  s_mock_uptime = 1800;
+  s_mock_boot_id = day10_boot;
+  TrustedTime::ResetProcessBaselineForTesting(s_mock_wall, s_mock_uptime);
+  MT_CHECK(TrustedTime::ValidateToken(prod, grant_tok) == TimeValidationResult::kValid);
+
+  // Day 20: cold relaunch after multiple reboots and steady usage
+  std::uint64_t day20_wall = t0 + (20 * 86400);
+  std::uint64_t day20_boot = day20_wall - 7200;
+  s_mock_wall = day20_wall;
+  s_mock_uptime = 7200;
+  s_mock_boot_id = day20_boot;
+  TrustedTime::ResetProcessBaselineForTesting(s_mock_wall, s_mock_uptime);
+  MT_CHECK(TrustedTime::ValidateToken(prod, grant_tok) == TimeValidationResult::kValid);
+
+  // Day 30: 1 hour before expiration
+  std::uint64_t day30_wall = grant_tok.expires_at - 3600;
+  s_mock_wall = day30_wall;
+  s_mock_uptime = 3600 * 5;
+  s_mock_boot_id = day30_wall - s_mock_uptime;
+  TrustedTime::ResetProcessBaselineForTesting(s_mock_wall, s_mock_uptime);
+  MT_CHECK(TrustedTime::ValidateToken(prod, grant_tok) == TimeValidationResult::kValid);
+
+  // Day 31: 1 day past expiration -> IN GRACE PERIOD
+  std::uint64_t day31_wall = grant_tok.expires_at + 86400;
+  s_mock_wall = day31_wall;
+  s_mock_uptime = 3600 * 6;
+  s_mock_boot_id = day31_wall - s_mock_uptime;
+  TrustedTime::ResetProcessBaselineForTesting(s_mock_wall, s_mock_uptime);
+  MT_CHECK(TrustedTime::ValidateToken(prod, grant_tok, /*allow_grace=*/true) == TimeValidationResult::kInGracePeriod);
+  MT_CHECK(TrustedTime::ValidateToken(prod, grant_tok, /*allow_grace=*/false) == TimeValidationResult::kExpired);
+
+  // Day 34: after grace period expired
+  std::uint64_t day34_wall = grant_tok.grace_expires_at + 3600;
+  s_mock_wall = day34_wall;
+  s_mock_uptime = 3600 * 7;
+  s_mock_boot_id = day34_wall - s_mock_uptime;
+  TrustedTime::ResetProcessBaselineForTesting(s_mock_wall, s_mock_uptime);
+  MT_CHECK(TrustedTime::ValidateToken(prod, grant_tok, /*allow_grace=*/true) == TimeValidationResult::kExpired);
+
+  TrustedTime::ResetTimeStateForTesting(prod);
+}
+
+MT_TEST(TrustedTime_ClockFreezeAfterStartup_Detected) {
+  std::string prod = "test_time_prod_freeze_inproc";
+  TrustedTime::ResetTimeStateForTesting(prod);
+
+  std::uint64_t t0 = 1700000000;
+  s_mock_wall = t0;
+  s_mock_uptime = 100;
+  s_mock_boot_id = t0 - 100;
+  TrustedTime::SetTimeProvidersForTesting(MockWall, MockUptime, MockBootId);
+  TrustedTime::ResetProcessBaselineForTesting(t0, 100);
+
+  MT_CHECK(TrustedTime::AnchorServerTime(prod, t0));
+
+  // Process startup check
+  auto t_start = TrustedTime::GetTrustedTime(prod);
+  MT_CHECK(t_start.has_value());
+
+  // Attacker freezes wall clock at t0, while steady uptime advances by 500s (elapsed = 400s > 300s skew)
+  s_mock_uptime = 600;
+  s_mock_wall = t0; // FROZEN!
+
+  auto t_freeze = TrustedTime::GetTrustedTime(prod);
+  // In-process clock freeze check must detect the freeze!
+  MT_CHECK(!t_freeze.has_value());
+
+  ActivationToken tok;
+  tok.license_id = "lic-freeze-inproc";
+  tok.issued_at = t0;
+  tok.expires_at = t0 + 86400;
+  tok.grace_expires_at = tok.expires_at + 86400;
+
+  auto res = TrustedTime::ValidateToken(prod, tok);
+  MT_CHECK(res == TimeValidationResult::kClockTampered);
+
+  TrustedTime::ResetTimeStateForTesting(prod);
+}
+
+MT_TEST(TrustedTime_ClockRollback_Detected) {
+  std::string prod = "test_time_prod_rollback";
+  TrustedTime::ResetTimeStateForTesting(prod);
+
+  std::uint64_t t0 = 1700000000;
+  s_mock_wall = t0;
+  s_mock_uptime = 100;
+  s_mock_boot_id = t0 - 100;
+  TrustedTime::SetTimeProvidersForTesting(MockWall, MockUptime, MockBootId);
+  TrustedTime::ResetProcessBaselineForTesting(t0, 100);
+
+  MT_CHECK(TrustedTime::AnchorServerTime(prod, t0));
+
+  // Roll system wall clock backward by 10000 seconds
+  s_mock_wall = t0 - 10000;
+  s_mock_uptime = 200;
+
+  auto t_rb = TrustedTime::GetTrustedTime(prod);
+  MT_CHECK(!t_rb.has_value());
+
+  ActivationToken tok;
+  tok.license_id = "lic-rollback";
+  tok.issued_at = t0;
+  tok.expires_at = t0 + 86400;
+  tok.grace_expires_at = tok.expires_at + 86400;
+
+  auto res = TrustedTime::ValidateToken(prod, tok);
+  MT_CHECK(res == TimeValidationResult::kClockTampered);
+
+  TrustedTime::ResetTimeStateForTesting(prod);
+}
+
+MT_TEST(TrustedTime_MultiProductWriteThrottling_Independent) {
+  std::string prodA = "test_time_prod_A";
+  std::string prodB = "test_time_prod_B";
+  TrustedTime::ResetTimeStateForTesting(prodA);
+  TrustedTime::ResetTimeStateForTesting(prodB);
+
+  std::uint64_t t0 = 1700000000;
+  s_mock_wall = t0;
+  s_mock_uptime = 100;
+  s_mock_boot_id = t0 - 100;
+  TrustedTime::SetTimeProvidersForTesting(MockWall, MockUptime, MockBootId);
+
+  MT_CHECK(TrustedTime::AnchorServerTime(prodA, t0));
+  MT_CHECK(TrustedTime::AnchorServerTime(prodB, t0));
+
+  // Product A advances by 120 seconds (persists)
+  s_mock_wall = t0 + 120;
+  s_mock_uptime = 220;
+  auto tA = TrustedTime::GetTrustedTime(prodA);
+  MT_CHECK(tA.has_value());
+
+  // Product B advances by 70 seconds -> its persistence must NOT be suppressed by product A!
+  s_mock_wall = t0 + 70;
+  s_mock_uptime = 170;
+  auto tB = TrustedTime::GetTrustedTime(prodB);
+  MT_CHECK(tB.has_value());
+
+  TrustedTime::ResetTimeStateForTesting(prodA);
+  TrustedTime::ResetTimeStateForTesting(prodB);
+}
+
 MT_MAIN()

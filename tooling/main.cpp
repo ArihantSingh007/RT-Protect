@@ -237,9 +237,13 @@ void PrintUsage() {
       "      --server <url>                    Online Activation Authority URL (required)\n"
       "      --product <id>                    Product identifier (required)\n"
       "      --pub-key <file>                  Vendor Ed25519 public key file (required)\n"
-      "      --license <key>                   Vendor license key string (or --license-env/file/stdin)\n"
+      "      --license-env <var>               Read license key from environment variable (or -file/-stdin)\n"
+      "      --license-file <file>             Read license key from file\n"
+      "      --license-stdin                   Read license key from stdin\n"
       "      --days <1-30>                     Offline grant duration in days (default: 14)\n"
-      "      --credential <secret>             Optional activation secret (or --credential-env/file/stdin)\n"
+      "      --credential-env <var>            Read optional activation secret from environment variable\n"
+      "      --credential-file <file>          Read optional activation secret from file\n"
+      "      --credential-stdin                Read optional activation secret from stdin\n"
       "      --out <file>                      Optional output file to save serialized token\n"
       "\n"
       "  Cryptographic & Integrity Primitives:\n"
@@ -1181,8 +1185,7 @@ int CmdActivateRevoke(int argc, char** argv) {
   return 0;
 }
 
-bool ResolveSecretInput(const std::string& val_literal,
-                        const std::string& env_var,
+bool ResolveSecretInput(const std::string& env_var,
                         const std::string& file_path,
                         bool from_stdin,
                         const std::string& param_name,
@@ -1191,14 +1194,13 @@ bool ResolveSecretInput(const std::string& val_literal,
   out_secret->clear();
 
   int sources = 0;
-  if (!val_literal.empty()) sources++;
   if (!env_var.empty()) sources++;
   if (!file_path.empty()) sources++;
   if (from_stdin) sources++;
 
   if (sources > 1) {
-    std::fprintf(stderr, "error: multiple input sources provided for %s. Choose only one of --%s, --%s-env, --%s-file, or --%s-stdin.\n",
-                 param_name.c_str(), param_name.c_str(), param_name.c_str(), param_name.c_str(), param_name.c_str());
+    std::fprintf(stderr, "error: multiple input sources provided for %s. Choose only one of --%s-env, --%s-file, or --%s-stdin.\n",
+                 param_name.c_str(), param_name.c_str(), param_name.c_str(), param_name.c_str());
     return false;
   }
 
@@ -1235,13 +1237,6 @@ bool ResolveSecretInput(const std::string& val_literal,
     return true;
   }
 
-  if (!val_literal.empty()) {
-    std::fprintf(stderr, "warning: specifying --%s directly on the command line exposes it in process tables and shell history. Consider using --%s-env, --%s-file, or --%s-stdin.\n",
-                 param_name.c_str(), param_name.c_str(), param_name.c_str(), param_name.c_str());
-    *out_secret = val_literal;
-    return true;
-  }
-
   return true;
 }
 
@@ -1252,12 +1247,10 @@ int CmdOfflineGrant(int argc, char** argv) {
   std::string out_file;
   std::uint32_t offline_days = 14;
 
-  std::string license_literal;
   std::string license_env;
   std::string license_file;
   bool license_stdin = false;
 
-  std::string credential_literal;
   std::string credential_env;
   std::string credential_file;
   bool credential_stdin = false;
@@ -1267,11 +1260,17 @@ int CmdOfflineGrant(int argc, char** argv) {
     if (arg == "--server" && i + 1 < argc) server_url = argv[++i];
     else if (arg == "--product" && i + 1 < argc) product_id = argv[++i];
     else if (arg == "--pub-key" && i + 1 < argc) pub_key_file = argv[++i];
-    else if (arg == "--license" && i + 1 < argc) license_literal = argv[++i];
+    else if (arg == "--license") {
+      std::fprintf(stderr, "error: passing literal secrets via '--license <key>' is forbidden for security reasons (exposed in process listings and shell history). Use --license-env <VAR>, --license-file <PATH>, or --license-stdin.\n");
+      return 2;
+    }
     else if (arg == "--license-env" && i + 1 < argc) license_env = argv[++i];
     else if (arg == "--license-file" && i + 1 < argc) license_file = argv[++i];
     else if (arg == "--license-stdin") license_stdin = true;
-    else if (arg == "--credential" && i + 1 < argc) credential_literal = argv[++i];
+    else if (arg == "--credential") {
+      std::fprintf(stderr, "error: passing literal secrets via '--credential <secret>' is forbidden for security reasons (exposed in process listings and shell history). Use --credential-env <VAR>, --credential-file <PATH>, or --credential-stdin.\n");
+      return 2;
+    }
     else if (arg == "--credential-env" && i + 1 < argc) credential_env = argv[++i];
     else if (arg == "--credential-file" && i + 1 < argc) credential_file = argv[++i];
     else if (arg == "--credential-stdin") credential_stdin = true;
@@ -1293,17 +1292,17 @@ int CmdOfflineGrant(int argc, char** argv) {
   }
 
   std::string license_key;
-  if (!ResolveSecretInput(license_literal, license_env, license_file, license_stdin, "license", &license_key)) {
+  if (!ResolveSecretInput(license_env, license_file, license_stdin, "license", &license_key)) {
     return 2;
   }
 
   std::string credential;
-  if (!ResolveSecretInput(credential_literal, credential_env, credential_file, credential_stdin, "credential", &credential)) {
+  if (!ResolveSecretInput(credential_env, credential_file, credential_stdin, "credential", &credential)) {
     return 2;
   }
 
   if (server_url.empty() || license_key.empty() || product_id.empty() || pub_key_file.empty()) {
-    std::fprintf(stderr, "error: --server, --license (or --license-env/file/stdin), --product, and --pub-key are required for offline-grant\n");
+    std::fprintf(stderr, "error: --server, --product, --pub-key, and license (--license-env, --license-file, or --license-stdin) are required for offline-grant\n");
     return 2;
   }
 

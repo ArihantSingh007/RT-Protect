@@ -587,6 +587,13 @@ void TestProductionLicenseSigningWorkflow() {
   opts.staging_only = true;
   opts.run_build = false;
 
+  // Staging without distributable content key/vm_root must FAIL CLOSED (Finding 3 fix)
+  auto fail_report = ExecuteIntegration(opts);
+  assert(!fail_report.success);
+  assert(fail_report.error_message.find("dedicated content protection key separation") != std::string::npos);
+
+  // Staging with explicit distributable vm_root succeeds
+  opts.vm_root_hex = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
   auto report = ExecuteIntegration(opts);
   assert(report.success);
   assert(fs::exists(test_dir / "client.license"));

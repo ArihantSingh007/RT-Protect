@@ -111,10 +111,22 @@ For mission-critical enterprise software, licenses can specify a `grace_period_s
 RTProtect operates under a hybrid online/offline model:
 1. **14-Day Online Revalidation Leases:** Upon `/activate` or `/renew`, the vendor activation server issues an installation-bound `ActivationToken` containing the authorized `vm_root`, valid for 14 days (`expires_at = now + 14d`).
 2. **3-Day Offline Grace Window:** If an endpoint is offline (e.g. travelling, field work, network outage), the client continues running for up to 3 days after token expiration (`grace_expires_at = expires_at + 3d`) while warning the user to reconnect.
-3. **Monotonic Server Timestamp Anchoring:** When communicating with the activation authority, the client anchors its local clock state with the server's signed timestamp:
-   - If local system clock is modified to be earlier than the server-anchored timestamp ($$\text{current\_time} + 300\text{s} < \text{last\_known\_server\_time}$$), clock tampering is flagged immediately (`TimeValidationResult::kClockTampered`).
-   - If system wall clock jumps backwards relative to process monotonic runtime (`std::chrono::steady_clock`), tampering is detected.
-4. **Windows Secure Storage Vault:** Tokens and time state are persisted using Windows DPAPI (`CryptProtectData` / `CryptUnprotectData`), cryptographically binding credentials to the Windows user account master key and login session.
+3. **Offline Grants (Max 30 Days):** For air-gapped or restricted environments, `rtprotect-tool offline-grant` issues offline tokens capped at a strict maximum of 30 days (plus 3 days grace), requiring secrets to be provided via environment variables, files, or stdin.
+4. **Monotonic Cross-Boot Time & Boot Identity Tracking:**
+   - Boot identity is derived from estimated boot time ($\text{wall\_now} - \text{uptime\_now}$), maintaining stability across cold relaunches in the same boot while reliably detecting machine reboots.
+   - Monotonic system uptime is accumulated across reboots and tracked against the authoritative server anchor. If active system uptime advances by $M$ seconds, wall clock time must advance by at least $M - 300\text{s}$, preventing freezing system time across reboots.
+   - In-process steady clock tracking detects clock freezing while the application is running.
+5. **Continuous Periodic Re-Validation:**
+   - Both in-band (during virtualized function execution via `GetFunctionMasterKey`) and passive background watchdog threads continuously re-verify temporal validity and clock progression every 10–30 seconds.
+   - Any detected tamper or expiration immediately zeroes out the runtime virtualization root (`vm_root`) and terminates process execution.
+6. **Windows Secure Storage Vault:** Tokens and time state are persisted using Windows DPAPI (`CryptProtectData` / `CryptUnprotectData`), cryptographically binding credentials to the Windows user account master key and login session, with write throttling to prevent disk write amplification.
+
+### 4.5 Threat Model & Residual Risk Notice
+> [!NOTE]
+> **Client-Side Anti-Tamper & Offline Limitations:**
+> No client-side offline licensing scheme can mathematically prevent a determined adversary possessing full local administrator or hypervisor-level control from altering virtualized hardware clocks indefinitely.
+> 
+> However, RTProtect's multi-layered defense bounds any offline clock-freeze attack strictly to accumulated active machine uptime, continuously re-validates temporal integrity during active execution, rejects clock rollbacks, detects freeze attacks across reboots, and enforces an absolute 30-day ceiling before requiring server check-in.
 
 ---
 
