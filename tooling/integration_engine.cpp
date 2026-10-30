@@ -1402,21 +1402,23 @@ IntegrationReport ExecuteIntegration(const IntegrationOptions& options) {
     ss << "#include <string>\n";
     ss << "#include <vector>\n";
     ss << "#include <thread>\n";
-    ss << "#include <atomic>\n\n";
+    ss << "#include <atomic>\n";
+    ss << "#include <mutex>\n\n";
 
     ss << "#include <windows.h>\n\n";
 
     ss << "namespace rtprotect_client {\n\n";
+    ss << "static std::mutex s_client_mutex;\n";
     ss << "static bool s_license_validated = false;\n";
     ss << "static rtprotect::licensing::License s_validated_license{};\n";
     ss << "static std::array<std::uint8_t, 32> s_runtime_manifest_vm_root{};\n";
     ss << "static bool s_runtime_root_initialized = false;\n";
     ss << "static std::string s_client_activation_credential;\n";
     ss << "static rtprotect::licensing::ActivationToken s_active_activation_token{};\n";
-    ss << "static std::atomic<std::uint64_t> s_last_revalidation_time{0};\n";
     ss << "static std::atomic<bool> s_stop_revalidation{false};\n\n";
 
     ss << "static bool RevalidateLicenseAndTime() {\n";
+    ss << "  std::lock_guard<std::mutex> lock(s_client_mutex);\n";
     ss << "  if (!s_license_validated || !s_runtime_root_initialized) return false;\n";
     ss << "  auto trusted_time = rtprotect::licensing::TrustedTime::GetTrustedTime(kProductId);\n";
     ss << "  if (!trusted_time.has_value()) {\n";
@@ -1445,8 +1447,8 @@ IntegrationReport ExecuteIntegration(const IntegrationOptions& options) {
     ss << "        }\n";
     ss << "        if (s_stop_revalidation.load(std::memory_order_relaxed)) break;\n";
     ss << "        if (!RevalidateLicenseAndTime()) {\n";
-    ss << "          std::fprintf(stderr, \"[RTProtect] Fatal: Runtime license or clock freeze violation detected during execution. Terminating.\\n\");\n";
-    ss << "          std::exit(1);\n";
+    ss << "          std::fprintf(stderr, \"[RTProtect] Warning: Runtime license revalidation failed. Runtime credentials invalidated.\\n\");\n";
+    ss << "          break;\n";
     ss << "        }\n";
     ss << "      }\n";
     ss << "    });\n";
@@ -1455,6 +1457,7 @@ IntegrationReport ExecuteIntegration(const IntegrationOptions& options) {
     ss << "}\n\n";
 
     ss << "void SetClientActivationCredential(const char* credential) {\n";
+    ss << "  std::lock_guard<std::mutex> lock(s_client_mutex);\n";
     ss << "  if (credential) {\n";
     ss << "    s_client_activation_credential = credential;\n";
     ss << "  } else {\n";
@@ -1463,6 +1466,7 @@ IntegrationReport ExecuteIntegration(const IntegrationOptions& options) {
     ss << "}\n\n";
 
     ss << "void SetRuntimeManifestRoot(const std::uint8_t* root_hash, std::size_t len) {\n";
+    ss << "  std::lock_guard<std::mutex> lock(s_client_mutex);\n";
     ss << "  if (root_hash && len == 32) {\n";
     ss << "    std::memcpy(s_runtime_manifest_vm_root.data(), root_hash, 32);\n";
     ss << "    s_runtime_root_initialized = true;\n";
@@ -1471,16 +1475,13 @@ IntegrationReport ExecuteIntegration(const IntegrationOptions& options) {
 
     ss << "std::optional<rtprotect::crypto::Aes256Key> GetFunctionMasterKey(const std::uint8_t* salt, std::size_t salt_len) {\n";
     ss << "  using namespace rtprotect::obfuscation;\n";
-    ss << "  if (!s_runtime_root_initialized) return std::nullopt;\n";
-    ss << "  std::uint64_t now_check = static_cast<std::uint64_t>(std::time(nullptr));\n";
-    ss << "  std::uint64_t last_check = s_last_revalidation_time.load(std::memory_order_relaxed);\n";
-    ss << "  if (now_check >= last_check + 10) {\n";
-    ss << "    if (s_last_revalidation_time.compare_exchange_strong(last_check, now_check)) {\n";
-    ss << "      if (!RevalidateLicenseAndTime()) return std::nullopt;\n";
-    ss << "    }\n";
+    ss << "  rtprotect::crypto::SecureBuffer raw_seed(32);\n";
+    ss << "  {\n";
+    ss << "    std::lock_guard<std::mutex> lock(s_client_mutex);\n";
+    ss << "    if (!s_runtime_root_initialized) return std::nullopt;\n";
+    ss << "    std::memcpy(raw_seed.data(), s_runtime_manifest_vm_root.data(), 32);\n";
     ss << "  }\n";
     ss << "  std::optional<rtprotect::crypto::Aes256Key> derived_key = std::nullopt;\n";
-    ss << "  rtprotect::crypto::SecureBuffer raw_seed(32);\n";
     ss << "  std::vector<std::uint8_t> hkdf_salt;\n";
     ss << "  std::string info;\n\n";
     ss << "  RTPROTECT_FLATTEN_BEGIN(st, 0x10)\n";
@@ -1587,8 +1588,9 @@ IntegrationReport ExecuteIntegration(const IntegrationOptions& options) {
     ss << "\n  // 2. Client license verification\n";
     ss << "  auto lic_data = ReadAuxiliaryFile(\"client.license\");\n";
     ss << "  if (!lic_data.has_value()) return false;\n";
+    ss << "  auto trusted_time_opt = rtprotect::licensing::TrustedTime::GetTrustedTime(kProductId);\n";
     ss << "  rtprotect::licensing::LicenseVerificationContext ctx;\n";
-    ss << "  ctx.current_time = static_cast<std::uint64_t>(std::time(nullptr));\n";
+    ss << "  ctx.current_time = trusted_time_opt.value_or(static_cast<std::uint64_t>(std::time(nullptr)));\n";
     ss << "  ctx.expected_product_id = kProductId;\n";
     ss << "  ctx.current_hardware_id = rtprotect::licensing::GetLocalHardwareId();\n";
     ss << "  ctx.reject_degraded_hardware = true; // Reject degraded hardware state\n";

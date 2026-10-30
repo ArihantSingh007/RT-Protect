@@ -38,6 +38,12 @@ class TrustedTime {
   // Allowed forward/backward clock drift tolerance (5 minutes for NTP sync differences)
   static constexpr std::uint64_t kAllowedSkewSeconds = 300;
 
+  // Maximum allowed drift between wall clock and uptime within the same continuous boot session (15 seconds)
+  static constexpr std::uint64_t kAllowedDriftSeconds = 15;
+
+  // Large backward clock inconsistency threshold (1 hour) that triggers immediate tamper detection
+  static constexpr std::uint64_t kLargeInconsistencySeconds = 3600;
+
   // Test time providers to allow deterministic testing of reboots, steady clock, and wall clock
   using WallTimeProvider = std::uint64_t (*)();
   using UptimeProvider = std::uint64_t (*)();
@@ -48,6 +54,7 @@ class TrustedTime {
                                         BootIdProvider boot_id_fn);
   static void ResetTimeProvidersForTesting();
   static void ResetProcessBaselineForTesting(std::uint64_t start_wall, std::uint64_t start_steady);
+  static void InitializeProcessBaseline();
 
   // Queries current boot identity and uptime (uses test providers if registered)
   static std::uint64_t GetCurrentBootId();

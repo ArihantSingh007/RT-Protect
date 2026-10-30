@@ -6,6 +6,9 @@
 #include "tests/micro_test.h"
 
 #include <chrono>
+#include <thread>
+#include <vector>
+#include <atomic>
 
 using namespace rtprotect::licensing;
 
@@ -434,6 +437,182 @@ MT_TEST(TrustedTime_MultiProductWriteThrottling_Independent) {
 
   TrustedTime::ResetTimeStateForTesting(prodA);
   TrustedTime::ResetTimeStateForTesting(prodB);
+}
+
+MT_TEST(TrustedTime_ForwardClockExcursion_RecoversOnServerAnchor) {
+  std::string prod = "test_time_prod_forward_recovery";
+  TrustedTime::ResetTimeStateForTesting(prod);
+
+  std::uint64_t t0 = 1700000000;
+  // Clock is set 10 minutes (600 seconds) ahead due to bad CMOS/NTP
+  s_mock_wall = t0 + 600;
+  s_mock_uptime = 100;
+  s_mock_boot_id = (t0 + 600) - 100;
+  TrustedTime::SetTimeProvidersForTesting(MockWall, MockUptime, MockBootId);
+  TrustedTime::ResetProcessBaselineForTesting(t0 + 600, 100);
+
+  // App runs with forward clock; GetTrustedTime observes and records the forward time
+  auto t_fwd = TrustedTime::GetTrustedTime(prod);
+  MT_CHECK(t_fwd.has_value());
+
+  // System clock is now corrected back to true time t0 + 10
+  // Simulate cold relaunch of the app with corrected clock
+  s_mock_wall = t0 + 10;
+  s_mock_uptime = 110;
+  s_mock_boot_id = (t0 + 10) - 110;
+  TrustedTime::ResetProcessBaselineForTesting(t0 + 10, 110);
+
+  // Authoritative server anchor at true time t0 + 10 resets the high-water mark
+  MT_CHECK(TrustedTime::AnchorServerTime(prod, t0 + 10));
+
+  // After server anchor, GetTrustedTime MUST succeed and recover cleanly
+  auto t_recovered = TrustedTime::GetTrustedTime(prod);
+  MT_CHECK(t_recovered.has_value());
+  MT_CHECK(*t_recovered >= t0 + 10);
+
+  ActivationToken tok;
+  tok.license_id = "lic-fwd-recovery";
+  tok.issued_at = t0;
+  tok.expires_at = t0 + 86400;
+  tok.grace_expires_at = tok.expires_at + 86400;
+  MT_CHECK(TrustedTime::ValidateToken(prod, tok) == TimeValidationResult::kValid);
+
+  TrustedTime::ResetTimeStateForTesting(prod);
+}
+
+MT_TEST(TrustedTime_MidSessionBackwardStep_DoesNotTerminate) {
+  std::string prod = "test_time_prod_backward_step";
+  TrustedTime::ResetTimeStateForTesting(prod);
+
+  std::uint64_t t0 = 1700000000;
+  s_mock_wall = t0;
+  s_mock_uptime = 100;
+  s_mock_boot_id = t0 - 100;
+  TrustedTime::SetTimeProvidersForTesting(MockWall, MockUptime, MockBootId);
+  TrustedTime::ResetProcessBaselineForTesting(t0, 100);
+
+  // Initial server anchor at t0
+  MT_CHECK(TrustedTime::AnchorServerTime(prod, t0));
+
+  // Process runs normally for 60 seconds
+  s_mock_wall = t0 + 60;
+  s_mock_uptime = 160;
+  auto t1 = TrustedTime::GetTrustedTime(prod);
+  MT_CHECK(t1.has_value());
+  MT_CHECK(*t1 >= t0 + 60);
+
+  // Mid-session, NTP or user steps clock backward by 10 minutes (600 seconds)
+  // Wall clock is now t0 + 60 - 600 = t0 - 540.
+  // Monotonic uptime keeps advancing steadily: 160 -> 200 (40 seconds of execution).
+  s_mock_wall = t0 - 540;
+  s_mock_uptime = 200;
+
+  // TrustedTime must NOT fail or flag tamper! Steady clock continues to bridge true time.
+  auto t2 = TrustedTime::GetTrustedTime(prod);
+  MT_CHECK(t2.has_value());
+  MT_CHECK(*t2 >= t0 + 100);
+
+  // Verify that an active token still validates against the projected time
+  ActivationToken tok;
+  tok.license_id = "lic-backward-step";
+  tok.issued_at = t0;
+  tok.expires_at = t0 + 86400;
+  tok.grace_expires_at = tok.expires_at + 86400;
+  MT_CHECK(TrustedTime::ValidateToken(prod, tok) == TimeValidationResult::kValid);
+
+  // Now the application re-anchors with authoritative server time
+  std::uint64_t new_server_time = t0 + 100;
+  MT_CHECK(TrustedTime::AnchorServerTime(prod, new_server_time));
+
+  // Subsequent queries succeed cleanly
+  auto t3 = TrustedTime::GetTrustedTime(prod);
+  MT_CHECK(t3.has_value());
+  MT_CHECK(*t3 >= new_server_time);
+
+  TrustedTime::ResetTimeStateForTesting(prod);
+}
+
+MT_TEST(TrustedTime_RebootWithin300Seconds_Detected) {
+  std::string prod = "test_time_prod_reboot_300s";
+  TrustedTime::ResetTimeStateForTesting(prod);
+
+  std::uint64_t t0 = 1700000000;
+  // Boot 1: Machine runs for 20 seconds
+  s_mock_wall = t0;
+  s_mock_uptime = 20;
+  s_mock_boot_id = t0 - 20;
+  TrustedTime::SetTimeProvidersForTesting(MockWall, MockUptime, MockBootId);
+  TrustedTime::ResetProcessBaselineForTesting(t0, 20);
+
+  MT_CHECK(TrustedTime::AnchorServerTime(prod, t0));
+
+  auto t1 = TrustedTime::GetTrustedTime(prod);
+  MT_CHECK(t1.has_value());
+
+  // Boot 2: Machine reboots quickly within 100s (< 300s skew tolerance).
+  // Wall clock advances by 100s (to t0 + 100).
+  // New boot has uptime = 25 (which is >= Boot 1's uptime 20).
+  // boot_diff = |(t0 + 100 - 25) - (t0 - 20)| = |75 - (-20)| = 95s <= 300s.
+  // The drift check |Δwall - Δuptime| = |100 - (25 - 20)| = |100 - 5| = 95s > 60s
+  // correctly detects that a reboot occurred!
+  std::uint64_t t2_wall = t0 + 100;
+  std::uint64_t t2_uptime = 25;
+  std::uint64_t t2_boot_id = t2_wall - t2_uptime;
+  s_mock_wall = t2_wall;
+  s_mock_uptime = t2_uptime;
+  s_mock_boot_id = t2_boot_id;
+  TrustedTime::ResetProcessBaselineForTesting(t2_wall, t2_uptime);
+
+  auto t2 = TrustedTime::GetTrustedTime(prod);
+  MT_CHECK(t2.has_value());
+
+  // Verify that the reboot was detected: accumulated monotonic time in storage
+  // must have accumulated the new boot's uptime (25s) rather than only delta (5s)
+  auto state_bytes = SecureStorage::Load("time_state_" + prod);
+  MT_CHECK(state_bytes.has_value());
+  std::uint64_t accum = 0;
+  for (int i = 0; i < 8; ++i) {
+    accum |= (static_cast<std::uint64_t>((*state_bytes)[16 + i]) << (i * 8));
+  }
+  MT_CHECK(accum >= 25); // Correctly added new boot uptime!
+
+  TrustedTime::ResetTimeStateForTesting(prod);
+}
+
+MT_TEST(TrustedTime_ConcurrentAccess_ThreadSafe) {
+  std::string prod = "test_time_prod_concurrent";
+  TrustedTime::ResetTimeStateForTesting(prod);
+
+  std::uint64_t now = GetCurrentEpoch();
+  MT_CHECK(TrustedTime::AnchorServerTime(prod, now));
+
+  constexpr int kNumThreads = 8;
+  constexpr int kOpsPerThread = 200;
+  std::vector<std::thread> threads;
+  threads.reserve(kNumThreads);
+
+  std::atomic<int> success_count{0};
+
+  for (int i = 0; i < kNumThreads; ++i) {
+    threads.emplace_back([&, i]() {
+      for (int op = 0; op < kOpsPerThread; ++op) {
+        if (op % 20 == 0) {
+          TrustedTime::AnchorServerTime(prod, now + (op / 20));
+        }
+        auto t = TrustedTime::GetTrustedTime(prod);
+        if (t.has_value()) {
+          success_count.fetch_add(1, std::memory_order_relaxed);
+        }
+      }
+    });
+  }
+
+  for (auto& th : threads) {
+    th.join();
+  }
+
+  MT_CHECK(success_count.load() == kNumThreads * kOpsPerThread);
+  TrustedTime::ResetTimeStateForTesting(prod);
 }
 
 MT_MAIN()
