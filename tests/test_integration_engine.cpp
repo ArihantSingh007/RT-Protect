@@ -1301,7 +1301,11 @@ void TestClangAstScannerAndCompilationDatabase() {
   assert(has_inc);
 
   // 2. Verify ClangAstScanner availability and validation rules
-  assert(tooling::ClangAstScanner::IsAvailable());
+  if (!tooling::ClangAstScanner::IsAvailable()) {
+    std::printf("  SKIPPED: Clang compiler binary not found in PATH or known locations.\n");
+    CleanDir(test_dir);
+    return;
+  }
 
   tooling::ClangFunctionDecl valid_fn;
   valid_fn.name = "compute_hash";

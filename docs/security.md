@@ -18,7 +18,7 @@ The RTProtect security architecture assumes an adversary with complete local adm
 
 ## 2. Cryptographic Foundations
 
-All cryptographic operations wrap verified OpenSSL 3.4.0 primitives. RTProtect strictly implements established, misuse-resistant standards:
+All cryptographic operations wrap verified OpenSSL 4.1.0 primitives. RTProtect strictly implements established, misuse-resistant standards:
 
 | Primitive | Standard | Usage | Implementation |
 |:---|:---|:---|:---|

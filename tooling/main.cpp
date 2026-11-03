@@ -1406,7 +1406,8 @@ int main(int argc, char** argv) {
       std::printf("RTProtect CLI v2.0.0-hardened\n"
                   "  Ed25519 Asymmetric Integrity & Licensing\n"
                   "  Hardware Fingerprinting & Anti-Tamper Engine\n"
-                  "  OpenSSL 3.4.0 EVP Backend\n");
+                  "  %s EVP Backend\n",
+                  OpenSSL_version(OPENSSL_VERSION));
       return 0;
     }
 

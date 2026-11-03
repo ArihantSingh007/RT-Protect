@@ -1868,7 +1868,7 @@ MT_TEST(Service_OfflineGrant_Lifecycle_And_Storage) {
 
   ActivationService service(db, std::move(kp.private_key), kp.public_key);
 
-  // 1. ProcessOfflineGrant directly (14 days default)
+  // 1. ProcessOfflineGrant directly (7 days default/max)
   ActivateRequest req;
   req.license_key = "lic-ent-offline-001";
   req.device_fingerprint = "HWID-OFFLINE-DEV-1";
@@ -1876,13 +1876,13 @@ MT_TEST(Service_OfflineGrant_Lifecycle_And_Storage) {
   req.client_timestamp = 1700000000;
   req.client_nonce.fill(0x11);
 
-  auto resp_14d = service.ProcessOfflineGrant(req, 14, 1700000000);
-  MT_CHECK(resp_14d.status == ActivationStatus::kValid);
-  MT_CHECK(resp_14d.token.has_value());
-  MT_CHECK(resp_14d.token->expires_at == 1700000000 + 14 * 86400);
-  MT_CHECK(resp_14d.token->grace_expires_at == resp_14d.token->expires_at + 3 * 86400);
-  MT_CHECK(resp_14d.token->vm_root == lic.vm_root);
-  MT_CHECK(VerifyActivationTokenSignature(*resp_14d.token, kp.public_key));
+  auto resp_7d = service.ProcessOfflineGrant(req, 7, 1700000000);
+  MT_CHECK(resp_7d.status == ActivationStatus::kValid);
+  MT_CHECK(resp_7d.token.has_value());
+  MT_CHECK(resp_7d.token->expires_at == 1700000000 + 7 * 86400);
+  MT_CHECK(resp_7d.token->grace_expires_at == resp_7d.token->expires_at + 3 * 86400);
+  MT_CHECK(resp_7d.token->vm_root == lic.vm_root);
+  MT_CHECK(VerifyActivationTokenSignature(*resp_7d.token, kp.public_key));
 
   // 2. Concurrency limit enforced
   ActivateRequest req2;
@@ -1894,7 +1894,7 @@ MT_TEST(Service_OfflineGrant_Lifecycle_And_Storage) {
   auto resp_limit = service.ProcessOfflineGrant(req2, 7, 1700000000);
   MT_CHECK(resp_limit.status == ActivationStatus::kConcurrencyLimitExceeded);
 
-  // 3. Clamping of offline duration: 0 -> 14 days, > 30 -> 30 days
+  // 3. Clamping of offline duration: 0 -> 7 days, > 7 -> 7 days
   ActivateRequest req3;
   req3.license_key = "lic-ent-offline-001";
   req3.device_fingerprint = "HWID-OFFLINE-DEV-1"; // same device re-request
@@ -1902,18 +1902,18 @@ MT_TEST(Service_OfflineGrant_Lifecycle_And_Storage) {
   req3.client_timestamp = 1700000000;
   req3.client_nonce.fill(0x33);
 
-  // 0 days clamps to 14 days
+  // 0 days clamps to 7 days
   auto resp_clamp_0 = service.ProcessOfflineGrant(req3, 0, 1700000000);
   MT_CHECK(resp_clamp_0.status == ActivationStatus::kValid);
   MT_CHECK(resp_clamp_0.token.has_value());
-  MT_CHECK(resp_clamp_0.token->expires_at == 1700000000 + 14 * 86400);
+  MT_CHECK(resp_clamp_0.token->expires_at == 1700000000 + 7 * 86400);
 
-  // 90 days clamps to 30 days
+  // 90 days clamps to 7 days
   req3.client_nonce.fill(0x44);
   auto resp_clamp_90 = service.ProcessOfflineGrant(req3, 90, 1700000000);
   MT_CHECK(resp_clamp_90.status == ActivationStatus::kValid);
   MT_CHECK(resp_clamp_90.token.has_value());
-  MT_CHECK(resp_clamp_90.token->expires_at == 1700000000 + 30 * 86400);
+  MT_CHECK(resp_clamp_90.token->expires_at == 1700000000 + 7 * 86400);
 
   // 4. HandleOfflineGrantJson HTTP REST payload
   std::string nonce_hex(64, 'a');

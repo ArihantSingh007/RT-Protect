@@ -20,7 +20,7 @@ Before integrating RTProtect into a client application, ensure your development 
 | Operating System | Windows 10 (x64) / Windows Server 2019+ | Windows 11 (x64) 23H2+ |
 | C++ Compiler | C++20 compliant (GCC 12+, MSVC 19.30+, Clang 15+) | MinGW-w64 GCC 15.2+ or MSVC 2022 v17.9+ |
 | Build System | CMake 3.20+ with Ninja or MSBuild | CMake 3.28+ with Ninja generator |
-| Cryptography | OpenSSL 3.0+ (EVP API supported) | OpenSSL 3.4.0+ (bundled in `third_party/openssl/`) |
+| Cryptography | OpenSSL 3.0+ (EVP API supported) | OpenSSL 4.1.0 (bundled in `third_party/openssl/`) |
 
 ---
 
@@ -146,8 +146,8 @@ int main() {
 
 ## 7. Troubleshooting & FAQs
 
-### Q: Why does the integrated binary fail to find `libcrypto-3-x64.dll` at runtime?
-**A:** Ensure `third_party/openssl/bin` is added to the system `PATH` or copy `libcrypto-3-x64.dll` alongside the target executable.
+### Q: Why does the integrated binary fail to find `libcrypto-4-x64.dll` at runtime?
+**A:** Ensure `third_party/openssl/bin` is added to the system `PATH` or copy `libcrypto-4-x64.dll` alongside the target executable.
 
 ### Q: Can an attacker patch out `VerifyClientIntegrityAndLicense()`?
 **A:** In a client-controlled environment, any single check can theoretically be located and bypassed by an advanced reverse engineer with sufficient time. To mitigate this:

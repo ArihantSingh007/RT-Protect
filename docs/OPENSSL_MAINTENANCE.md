@@ -73,13 +73,13 @@ Open the **x64 Native Tools Command Prompt for VS 2022**:
 
 ```cmd
 :: 1. Download and verify official release tarball
-curl -LO https://github.com/openssl/openssl/releases/download/openssl-3.4.0/openssl-3.4.0.tar.gz
-curl -LO https://github.com/openssl/openssl/releases/download/openssl-3.4.0/openssl-3.4.0.tar.gz.sha256
-certutil -hashfile openssl-3.4.0.tar.gz SHA256
+curl -LO https://github.com/openssl/openssl/releases/download/openssl-4.1.0/openssl-4.1.0.tar.gz
+curl -LO https://github.com/openssl/openssl/releases/download/openssl-4.1.0/openssl-4.1.0.tar.gz.sha256
+certutil -hashfile openssl-4.1.0.tar.gz SHA256
 
 :: 2. Extract source tree
-tar -xzf openssl-3.4.0.tar.gz
-cd openssl-3.4.0
+tar -xzf openssl-4.1.0.tar.gz
+cd openssl-4.1.0
 
 :: 3. Configure for Windows x64 Native with binary hardening
 perl Configure VC-WIN64A ^
@@ -107,11 +107,21 @@ nmake install_sw
 
 ## 4. Checksum & Signature Verification
 
+### Vendored OpenSSL 4.1.0 Windows x64 Cryptographic Hashes (SHA-256)
+| File | SHA-256 Hash | Size (Bytes) |
+|:---|:---|:---|
+| `bin/libcrypto-4-x64.dll` | `2f0e5cdbe9e47ccf8d462ff757dca5eadd943ea04c7c5b2566d741e880c2aae2` | 7,446,088 |
+| `bin/libssl-4-x64.dll` | `82e074c11259b6c7ea062137c2b0ac1cfc66d1e1d7860a0b924b4746735222f9` | 1,469,512 |
+| `bin/openssl.exe` | `d734e14951f985c36ec26fb9d5d99849e605d35a27d992f154355fabf332c1f1` | 846,920 |
+| `lib/libcrypto.lib` | `2834f46b2729c12e7fa7b46e509e51e475c20ab81d3148cfca0932b4a747dee1` | 1,333,434 |
+| `lib/libssl.lib` | `0e187178f1d3c3a89699d3f2b714b82a6edd020e87c1a63e0ff974025a7e6c8c` | 153,324 |
+
+
 Before replacing vendored files, all upstream downloads and compiled binaries must be cryptographically verified:
 
 1. **GPG Signature Verification:** Verify release tarballs using OpenSSL Release Team public keys.
 2. **SHA256 Fingerprint Check:** Checksums are computed and recorded in release manifests.
-3. **PE Binary Authenticity:** Run `dumpbin /headers third_party/openssl/bin/libcrypto-3-x64.dll` to verify:
+3. **PE Binary Authenticity:** Run `dumpbin /headers third_party/openssl/bin/libcrypto-4-x64.dll` to verify:
    - Machine: `x64 (AMD64)`
    - Subsystem: `Windows CUI`
    - Characteristics: `DYNAMIC_BASE`, `NX_COMPAT`, `GUARD_CF` (Control Flow Guard enabled)
@@ -126,7 +136,7 @@ When performing an OpenSSL update:
 - [ ] **Step 2:** Compile x64 Release binaries using the reproducible instructions above.
 - [ ] **Step 3:** Overwrite headers in `third_party/openssl/include/openssl/`.
 - [ ] **Step 4:** Overwrite import libraries in `third_party/openssl/lib/` (`libcrypto.lib`, `libssl.lib`).
-- [ ] **Step 5:** Overwrite runtime DLLs in `third_party/openssl/bin/` (`libcrypto-3-x64.dll`, `libssl-3-x64.dll`).
+- [ ] **Step 5:** Overwrite runtime DLLs in `third_party/openssl/bin/` (`libcrypto-4-x64.dll`, `libssl-4-x64.dll`).
 - [ ] **Step 6:** Run complete build and test suite under **MSVC 2022**:
   ```powershell
   cmake -B build-vs2022 -G "Visual Studio 17 2022" -A x64

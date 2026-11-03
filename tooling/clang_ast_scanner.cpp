@@ -304,24 +304,34 @@ std::string ClangAstScanner::GetClangBinaryPath() {
     if (fs::exists(path, ec) && !fs::is_directory(path, ec)) return path;
   }
 
-  // Search system PATH environment variable
+  // Search system PATH environment variable (supports Windows ';' and POSIX ':' delimiters,
+  // searching for both 'clang.exe' and 'clang')
   const char* env_path = std::getenv("PATH");
   if (env_path) {
     std::string path_str(env_path);
-    char delimiter = ';';
-    std::string binary_name = "clang.exe";
-    std::size_t start = 0;
-    while (start < path_str.size()) {
-      auto end = path_str.find(delimiter, start);
-      if (end == std::string::npos) end = path_str.size();
-      std::string dir = path_str.substr(start, end - start);
-      if (!dir.empty()) {
-        fs::path candidate = fs::path(dir) / binary_name;
+    const char* const binary_names[] = { "clang.exe", "clang", "clang++.exe", "clang++" };
+
+    std::vector<std::string> dirs;
+    std::string cur;
+    for (char ch : path_str) {
+      if (ch == ';' || ch == ':') {
+        if (!cur.empty()) {
+          dirs.push_back(cur);
+          cur.clear();
+        }
+      } else {
+        cur.push_back(ch);
+      }
+    }
+    if (!cur.empty()) dirs.push_back(cur);
+
+    for (const auto& dir : dirs) {
+      for (const char* bname : binary_names) {
+        fs::path candidate = fs::path(dir) / bname;
         if (fs::exists(candidate, ec) && !fs::is_directory(candidate, ec)) {
           return candidate.string();
         }
       }
-      start = end + 1;
     }
   }
 

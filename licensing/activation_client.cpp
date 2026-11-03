@@ -702,8 +702,8 @@ std::optional<ActivationToken> RequestOfflineGrant(
     const std::string& activation_credential,
     std::uint64_t client_timestamp,
     const integrity::Ed25519PublicKey* cm_pubkey) {
-  if (offline_days == 0) offline_days = 14;
-  if (offline_days > 30) offline_days = 30;
+  if (offline_days == 0) offline_days = 7;
+  if (offline_days > 7) offline_days = 7;
 
   std::string hwid = GetLocalHardwareId();
 

@@ -10,7 +10,7 @@ RTProtect is engineered for reproducible compilation and hardened deployment on 
 | **Compiler** | MSVC 19.30+ (VS 2022) or MinGW-w64 GCC 12.0+ (UCRT) | MinGW-w64 GCC 15.2.0 (UCRT) |
 | **C++ Standard** | ISO C++20 (`-std=c++20` or `/std:c++20`) | C++20 |
 | **Build Generator** | CMake 3.20+ with Ninja or Visual Studio 17 2022 | CMake 4.1.2 + Ninja |
-| **Cryptography** | OpenSSL 3.0.0+ (Headers, `libcrypto.lib`, `libcrypto-3-x64.dll`) | OpenSSL 3.4.0 (in `third_party/openssl/`) |
+| **Cryptography** | OpenSSL 3.0.0+ (Headers, `libcrypto.lib`, `libcrypto-4-x64.dll`) | OpenSSL 4.1.0 (in `third_party/openssl/`) |
 
 ---
 

@@ -97,6 +97,11 @@ if(MSVC)
   endif()
 else()
   add_compile_options(-Wall -Wextra -Wpedantic -fstack-protector-strong)
+  if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+    # Silence false-positive stringop-overflow warnings emitted by GCC 12/13/14
+    # in optimized libstdc++ std::vector and std::string internal reallocations
+    add_compile_options(-Wno-stringop-overflow)
+  endif()
   if(MINGW)
     # Position-independent executable on MinGW
     add_compile_options($<$<STREQUAL:$<TARGET_PROPERTY:TYPE>,EXECUTABLE>:-fPIE>)

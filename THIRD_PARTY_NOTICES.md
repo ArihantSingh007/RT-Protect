@@ -6,7 +6,7 @@ This package incorporates components from the following third-party software:
 
 ## 1. OpenSSL
 
-* **Version:** 3.4.0
+* **Version:** 4.1.0
 * **Project URL:** https://www.openssl.org/
 * **License:** Apache License 2.0
 

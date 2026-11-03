@@ -138,7 +138,7 @@ Target Standard: C++20
 Compiler:       $CompilerInfo
 NOMINMAX:       Enforced
 Optimization:   Release (O3, Hardening Enabled)
-Dependencies:   OpenSSL 3.4.0 (Crypto & SSL)
+Dependencies:   OpenSSL 4.1.0 (Crypto & SSL)
 ================================================================================
 "@
 $BuildInfo | Out-File -FilePath (Join-Path $ToolsPkgDir "BUILD_INFO.txt") -Encoding utf8

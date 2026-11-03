@@ -33,7 +33,7 @@ Measurements comparing the reference checksum implementation against control-flo
 
 ## 2. AES-256-GCM Cryptographic Throughput
 
-Throughput measured across varying buffer sizes using OpenSSL 3.4.0's hardware-accelerated AES-NI implementation:
+Throughput measured across varying buffer sizes using OpenSSL 4.1.0's hardware-accelerated AES-NI implementation:
 
 | Payload Size | Iterations / Trial | Median Duration | Effective Throughput |
 |---|---|---|---|

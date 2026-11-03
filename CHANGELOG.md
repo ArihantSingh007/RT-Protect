@@ -48,7 +48,7 @@ This project adheres to Semantic Versioning and structured security reporting.
     1. `rtprotect-windows-x64.zip`: CLI tool, GUI profiler, benchmark runner, runtime dependencies, docs, and metadata.
     2. `rtprotect-sdk-windows-x64.zip`: Developer SDK with public C++20 headers, static libraries, exported CMake package configuration (`RTProtectConfig.cmake`), bundled OpenSSL SDK, and consumer sample project.
     3. `rtprotect-activation-server-windows-x64.zip`: Standalone activation server deployment with OpenSSL runtime DLLs.
-  - Bundled both OpenSSL runtime DLLs (`libcrypto-3-x64.dll` and `libssl-3-x64.dll`) into binary packages.
+  - Bundled both OpenSSL runtime DLLs (`libcrypto-4-x64.dll` and `libssl-4-x64.dll`) into binary packages.
   - Generated release metadata: `QUICKSTART.md`, `LICENSE`, `THIRD_PARTY_NOTICES.md`, `VERSION.txt`, `BUILD_INFO.txt`, and SPDX 2.3 `SBOM.spdx.json`.
   - Implemented automated consumer application smoke test (`examples/consumer_sample`) building against the generated SDK and executing in CI and packaging workflows.
   - Generated deterministic SHA-256 release checksum manifest (`SHA256SUMS.txt`).

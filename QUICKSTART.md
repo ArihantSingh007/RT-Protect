@@ -12,7 +12,7 @@ RTProtect releases provide three distinct artifacts:
    - `bin/rtprotect-tool.exe` — Command-line integration engine and AST scanner.
    - `bin/rtprotect-gui.exe` — Graphical protection profiler and project inspector.
    - `bin/rtprotect-bench.exe` — Protection benchmark and overhead measurement runner.
-   - Runtime dependencies (`libcrypto-3-x64.dll`, `libssl-3-x64.dll`).
+   - Runtime dependencies (`libcrypto-4-x64.dll`, `libssl-4-x64.dll`).
 
 2. **`rtprotect-sdk-windows-x64.zip`**: Developer SDK for C++ applications.
    - `include/` — C++20 header files (`bytecode_vm`, `integrity`, `crypto`, `licensing`, `antitamper`, `obfuscation`).
@@ -22,7 +22,7 @@ RTProtect releases provide three distinct artifacts:
 
 3. **`rtprotect-activation-server-windows-x64.zip`**: Licensing authority server.
    - `bin/rtprotect-activation-server.exe` — High-performance HTTP/TLS server for activation tokens.
-   - Runtime dependencies (`libcrypto-3-x64.dll`, `libssl-3-x64.dll`).
+   - Runtime dependencies (`libcrypto-4-x64.dll`, `libssl-4-x64.dll`).
 
 ---
 

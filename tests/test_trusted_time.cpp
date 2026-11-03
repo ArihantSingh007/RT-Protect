@@ -171,6 +171,7 @@ MT_TEST(TrustedTime_FreezeAndReboot_Detected) {
   MT_CHECK(res == TimeValidationResult::kClockTampered);
 
   TrustedTime::ResetTimeStateForTesting(prod);
+  TrustedTime::ResetTimeProvidersForTesting();
 }
 
 MT_TEST(TrustedTime_WriteThrottling_AvoidsAmplification) {
@@ -193,6 +194,7 @@ MT_TEST(TrustedTime_WriteThrottling_AvoidsAmplification) {
   }
 
   TrustedTime::ResetTimeStateForTesting(prod);
+  TrustedTime::ResetTimeProvidersForTesting();
 }
 
 MT_TEST(TrustedTime_OfflineExpiry_WithClockSkew) {
@@ -222,6 +224,7 @@ MT_TEST(TrustedTime_OfflineExpiry_WithClockSkew) {
   MT_CHECK(res == TimeValidationResult::kExpired);
 
   TrustedTime::ResetTimeStateForTesting(prod);
+  TrustedTime::ResetTimeProvidersForTesting();
 }
 
 MT_TEST(TrustedTime_ProductionProviders_RelaunchWithoutReboot) {
@@ -337,6 +340,7 @@ MT_TEST(TrustedTime_30DayGrant_LifecycleWithRelaunches) {
   MT_CHECK(TrustedTime::ValidateToken(prod, grant_tok, /*allow_grace=*/true) == TimeValidationResult::kExpired);
 
   TrustedTime::ResetTimeStateForTesting(prod);
+  TrustedTime::ResetTimeProvidersForTesting();
 }
 
 MT_TEST(TrustedTime_ClockFreezeAfterStartup_Detected) {
@@ -374,6 +378,7 @@ MT_TEST(TrustedTime_ClockFreezeAfterStartup_Detected) {
   MT_CHECK(res == TimeValidationResult::kClockTampered);
 
   TrustedTime::ResetTimeStateForTesting(prod);
+  TrustedTime::ResetTimeProvidersForTesting();
 }
 
 MT_TEST(TrustedTime_ClockRollback_Detected) {
@@ -406,6 +411,7 @@ MT_TEST(TrustedTime_ClockRollback_Detected) {
   MT_CHECK(res == TimeValidationResult::kClockTampered);
 
   TrustedTime::ResetTimeStateForTesting(prod);
+  TrustedTime::ResetTimeProvidersForTesting();
 }
 
 MT_TEST(TrustedTime_MultiProductWriteThrottling_Independent) {
@@ -437,6 +443,7 @@ MT_TEST(TrustedTime_MultiProductWriteThrottling_Independent) {
 
   TrustedTime::ResetTimeStateForTesting(prodA);
   TrustedTime::ResetTimeStateForTesting(prodB);
+  TrustedTime::ResetTimeProvidersForTesting();
 }
 
 MT_TEST(TrustedTime_ForwardClockExcursion_RecoversOnServerAnchor) {
@@ -478,6 +485,7 @@ MT_TEST(TrustedTime_ForwardClockExcursion_RecoversOnServerAnchor) {
   MT_CHECK(TrustedTime::ValidateToken(prod, tok) == TimeValidationResult::kValid);
 
   TrustedTime::ResetTimeStateForTesting(prod);
+  TrustedTime::ResetTimeProvidersForTesting();
 }
 
 MT_TEST(TrustedTime_MidSessionBackwardStep_DoesNotTerminate) {
@@ -530,6 +538,7 @@ MT_TEST(TrustedTime_MidSessionBackwardStep_DoesNotTerminate) {
   MT_CHECK(*t3 >= new_server_time);
 
   TrustedTime::ResetTimeStateForTesting(prod);
+  TrustedTime::ResetTimeProvidersForTesting();
 }
 
 MT_TEST(TrustedTime_RebootWithin300Seconds_Detected) {
@@ -540,7 +549,7 @@ MT_TEST(TrustedTime_RebootWithin300Seconds_Detected) {
   // Boot 1: Machine runs for 20 seconds
   s_mock_wall = t0;
   s_mock_uptime = 20;
-  s_mock_boot_id = t0 - 20;
+  s_mock_boot_id = 1001;
   TrustedTime::SetTimeProvidersForTesting(MockWall, MockUptime, MockBootId);
   TrustedTime::ResetProcessBaselineForTesting(t0, 20);
 
@@ -552,12 +561,10 @@ MT_TEST(TrustedTime_RebootWithin300Seconds_Detected) {
   // Boot 2: Machine reboots quickly within 100s (< 300s skew tolerance).
   // Wall clock advances by 100s (to t0 + 100).
   // New boot has uptime = 25 (which is >= Boot 1's uptime 20).
-  // boot_diff = |(t0 + 100 - 25) - (t0 - 20)| = |75 - (-20)| = 95s <= 300s.
-  // The drift check |Δwall - Δuptime| = |100 - (25 - 20)| = |100 - 5| = 95s > 60s
-  // correctly detects that a reboot occurred!
+  // New boot has distinct boot ID (1002 != 1001).
   std::uint64_t t2_wall = t0 + 100;
   std::uint64_t t2_uptime = 25;
-  std::uint64_t t2_boot_id = t2_wall - t2_uptime;
+  std::uint64_t t2_boot_id = 1002;
   s_mock_wall = t2_wall;
   s_mock_uptime = t2_uptime;
   s_mock_boot_id = t2_boot_id;
@@ -577,6 +584,7 @@ MT_TEST(TrustedTime_RebootWithin300Seconds_Detected) {
   MT_CHECK(accum >= 25); // Correctly added new boot uptime!
 
   TrustedTime::ResetTimeStateForTesting(prod);
+  TrustedTime::ResetTimeProvidersForTesting();
 }
 
 MT_TEST(TrustedTime_ConcurrentAccess_ThreadSafe) {
@@ -613,6 +621,243 @@ MT_TEST(TrustedTime_ConcurrentAccess_ThreadSafe) {
 
   MT_CHECK(success_count.load() == kNumThreads * kOpsPerThread);
   TrustedTime::ResetTimeStateForTesting(prod);
+}
+
+
+// ============================================================================
+// Permanent Regression Probes (A-F)
+// ============================================================================
+
+// Probe A: Anchor, then normal +100s, then +400s forward wall jump while uptime advances +100s.
+// Simulates an unverified clock forward adjustment. After a cold relaunch with the clock now
+// corrected back to true time, it MUST NOT refuse, MUST NOT set tamper_detected, and MUST NOT
+// lock out offline users.
+MT_TEST(TrustedTime_ProbeA_ForwardStep_NoLockoutOnRelaunch) {
+  std::string prod = "test_time_probe_a";
+  TrustedTime::ResetTimeStateForTesting(prod);
+
+  std::uint64_t t0 = 1700000000;
+  // 1. Initial server anchor at t0 in Boot 1
+  s_mock_wall = t0;
+  s_mock_uptime = 100;
+  s_mock_boot_id = 1;
+  TrustedTime::SetTimeProvidersForTesting(MockWall, MockUptime, MockBootId);
+  TrustedTime::ResetProcessBaselineForTesting(t0, 100);
+
+  MT_CHECK(TrustedTime::AnchorServerTime(prod, t0));
+
+  // 2. Normal run +100s
+  s_mock_wall = t0 + 100;
+  s_mock_uptime = 200;
+  auto t1 = TrustedTime::GetTrustedTime(prod);
+  MT_CHECK(t1.has_value());
+  MT_CHECK(*t1 >= t0 + 100);
+
+  // 3. +400s forward wall jump while uptime advances +100s
+  // Wall clock = (t0 + 100) + 400 + 100 = t0 + 600. Uptime = 300. Same boot (boot_id = 1).
+  s_mock_wall = t0 + 600;
+  s_mock_uptime = 300;
+  auto t2 = TrustedTime::GetTrustedTime(prod);
+  MT_CHECK(t2.has_value());
+
+  // 4. System clock is corrected back to true time (t0 + 210 with 10s elapsed).
+  // Simulate cold relaunch with corrected clock in the same boot (boot_id = 1).
+  s_mock_wall = t0 + 210;
+  s_mock_uptime = 310;
+  TrustedTime::ResetProcessBaselineForTesting(t0 + 210, 310);
+
+  // Offline query: Must NOT refuse, must NOT set tamper_detected, must NOT lock out!
+  auto t3 = TrustedTime::GetTrustedTime(prod);
+  MT_CHECK(t3.has_value());
+  MT_CHECK(*t3 >= t0 + 210);
+
+  // Active token must validate successfully
+  ActivationToken tok;
+  tok.license_id = "lic-probe-a";
+  tok.issued_at = t0;
+  tok.expires_at = t0 + 86400 * 7;
+  tok.grace_expires_at = tok.expires_at + 86400;
+  MT_CHECK(TrustedTime::ValidateToken(prod, tok) == TimeValidationResult::kValid);
+
+  TrustedTime::ResetTimeStateForTesting(prod);
+  TrustedTime::ResetTimeProvidersForTesting();
+}
+
+// Probe B: Clock freeze across relaunch.
+// Attacker freezes wall clock at t0 while monotonic uptime advances past allowed skew (300s).
+// On query / relaunch, the freeze must be detected and refused.
+MT_TEST(TrustedTime_ProbeB_ClockFreezeAcrossRelaunch_Refused) {
+  std::string prod = "test_time_probe_b";
+  TrustedTime::ResetTimeStateForTesting(prod);
+
+  std::uint64_t t0 = 1700000000;
+  s_mock_wall = t0;
+  s_mock_uptime = 100;
+  s_mock_boot_id = 1;
+  TrustedTime::SetTimeProvidersForTesting(MockWall, MockUptime, MockBootId);
+  TrustedTime::ResetProcessBaselineForTesting(t0, 100);
+
+  MT_CHECK(TrustedTime::AnchorServerTime(prod, t0));
+
+  // Active run: wall clock is frozen at t0, uptime advances to 500 (elapsed steady = 400s > 300s skew)
+  s_mock_wall = t0;
+  s_mock_uptime = 500;
+
+  auto t = TrustedTime::GetTrustedTime(prod);
+  // Must refuse frozen clock!
+  MT_CHECK(!t.has_value());
+
+  ActivationToken tok;
+  tok.license_id = "lic-probe-b";
+  tok.issued_at = t0;
+  tok.expires_at = t0 + 86400;
+  tok.grace_expires_at = tok.expires_at + 86400;
+  MT_CHECK(TrustedTime::ValidateToken(prod, tok) == TimeValidationResult::kClockTampered);
+
+  TrustedTime::ResetTimeStateForTesting(prod);
+  TrustedTime::ResetTimeProvidersForTesting();
+}
+
+// Probe C: Clock excursion forward (+10 hours) due to CMOS/NTP error.
+// System recovers cleanly once authoritative server anchor is obtained.
+MT_TEST(TrustedTime_ProbeC_Excursion_RecoversOnCorrection) {
+  std::string prod = "test_time_probe_c";
+  TrustedTime::ResetTimeStateForTesting(prod);
+
+  std::uint64_t t0 = 1700000000;
+  // +10 hour forward excursion
+  s_mock_wall = t0 + 36000;
+  s_mock_uptime = 100;
+  s_mock_boot_id = 1;
+  TrustedTime::SetTimeProvidersForTesting(MockWall, MockUptime, MockBootId);
+  TrustedTime::ResetProcessBaselineForTesting(t0 + 36000, 100);
+
+  auto t_fwd = TrustedTime::GetTrustedTime(prod);
+  MT_CHECK(t_fwd.has_value());
+
+  // Clock corrected back to true time t0 + 10 on relaunch
+  s_mock_wall = t0 + 10;
+  s_mock_uptime = 110;
+  TrustedTime::ResetProcessBaselineForTesting(t0 + 10, 110);
+
+  // Authoritative server anchor at true time recovers cleanly
+  MT_CHECK(TrustedTime::AnchorServerTime(prod, t0 + 10));
+
+  auto t_rec = TrustedTime::GetTrustedTime(prod);
+  MT_CHECK(t_rec.has_value());
+  MT_CHECK(*t_rec >= t0 + 10);
+
+  TrustedTime::ResetTimeStateForTesting(prod);
+  TrustedTime::ResetTimeProvidersForTesting();
+}
+
+// Probe D: Mid-session forward step (+300s).
+// Legitimate NTP forward sync during active run does not refuse or flag tampering.
+MT_TEST(TrustedTime_ProbeD_ForwardStep_DoesNotRefuse) {
+  std::string prod = "test_time_probe_d";
+  TrustedTime::ResetTimeStateForTesting(prod);
+
+  std::uint64_t t0 = 1700000000;
+  s_mock_wall = t0;
+  s_mock_uptime = 100;
+  s_mock_boot_id = 1;
+  TrustedTime::SetTimeProvidersForTesting(MockWall, MockUptime, MockBootId);
+  TrustedTime::ResetProcessBaselineForTesting(t0, 100);
+
+  MT_CHECK(TrustedTime::AnchorServerTime(prod, t0));
+
+  // Normal run for 50s
+  s_mock_wall = t0 + 50;
+  s_mock_uptime = 150;
+  auto t1 = TrustedTime::GetTrustedTime(prod);
+  MT_CHECK(t1.has_value());
+
+  // Forward clock step (+300s jump + 50s elapsed = +350s wall)
+  s_mock_wall = t0 + 400;
+  s_mock_uptime = 200;
+  auto t2 = TrustedTime::GetTrustedTime(prod);
+  // Forward step must NOT refuse or flag tamper!
+  MT_CHECK(t2.has_value());
+  MT_CHECK(*t2 >= t0 + 400);
+
+  TrustedTime::ResetTimeStateForTesting(prod);
+  TrustedTime::ResetTimeProvidersForTesting();
+}
+
+// Probe E: Attacker reboots into Boot 2 with frozen clock, and Boot 2 uptime outlasts
+// Boot 1's observation. Monotonic cross-boot verification catches the freeze attack.
+MT_TEST(TrustedTime_ProbeE_RebootOutlastingUptime_CatchesFreeze) {
+  std::string prod = "test_time_probe_e";
+  TrustedTime::ResetTimeStateForTesting(prod);
+
+  std::uint64_t t0 = 1700000000;
+  // Boot 1: Anchor at t0, runs for 50s uptime
+  s_mock_wall = t0;
+  s_mock_uptime = 50;
+  s_mock_boot_id = 1;
+  TrustedTime::SetTimeProvidersForTesting(MockWall, MockUptime, MockBootId);
+  TrustedTime::ResetProcessBaselineForTesting(t0, 50);
+
+  MT_CHECK(TrustedTime::AnchorServerTime(prod, t0));
+
+  auto t1 = TrustedTime::GetTrustedTime(prod);
+  MT_CHECK(t1.has_value());
+
+  // Boot 2: Machine reboots (boot_id = 2).
+  // Attacker freezes wall clock at t0.
+  // Boot 2 runs until uptime reaches 400s (outlasting Boot 1's 50s and 300s skew tolerance).
+  s_mock_boot_id = 2;
+  s_mock_wall = t0; // Frozen clock!
+  s_mock_uptime = 400;
+  TrustedTime::ResetProcessBaselineForTesting(t0, 400);
+
+  auto t2 = TrustedTime::GetTrustedTime(prod);
+  // Must catch freeze attack across reboot where uptime outlasted previous observation!
+  MT_CHECK(!t2.has_value());
+
+  ActivationToken tok;
+  tok.license_id = "lic-probe-e";
+  tok.issued_at = t0;
+  tok.expires_at = t0 + 86400;
+  tok.grace_expires_at = tok.expires_at + 86400;
+  MT_CHECK(TrustedTime::ValidateToken(prod, tok) == TimeValidationResult::kClockTampered);
+
+  TrustedTime::ResetTimeStateForTesting(prod);
+  TrustedTime::ResetTimeProvidersForTesting();
+}
+
+// Probe F: Mid-session backward step (-600s).
+// NTP or user minor backward adjustment within session does not terminate or lock out.
+MT_TEST(TrustedTime_ProbeF_BackwardStep_Succeeds) {
+  std::string prod = "test_time_probe_f";
+  TrustedTime::ResetTimeStateForTesting(prod);
+
+  std::uint64_t t0 = 1700000000;
+  s_mock_wall = t0;
+  s_mock_uptime = 100;
+  s_mock_boot_id = 1;
+  TrustedTime::SetTimeProvidersForTesting(MockWall, MockUptime, MockBootId);
+  TrustedTime::ResetProcessBaselineForTesting(t0, 100);
+
+  MT_CHECK(TrustedTime::AnchorServerTime(prod, t0));
+
+  // Normal run for 60s
+  s_mock_wall = t0 + 60;
+  s_mock_uptime = 160;
+  auto t1 = TrustedTime::GetTrustedTime(prod);
+  MT_CHECK(t1.has_value());
+
+  // Backward clock step (-600s)
+  // Wall is t0 + 60 - 600 = t0 - 540. Uptime advances +40s to 200s.
+  s_mock_wall = t0 - 540;
+  s_mock_uptime = 200;
+  auto t2 = TrustedTime::GetTrustedTime(prod);
+  // Backward step within session must NOT terminate or refuse
+  MT_CHECK(t2.has_value());
+  MT_CHECK(*t2 >= t0 + 100);
+
+  TrustedTime::ResetTimeStateForTesting(prod);
+  TrustedTime::ResetTimeProvidersForTesting();
 }
 
 MT_MAIN()

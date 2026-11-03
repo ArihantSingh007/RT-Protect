@@ -313,9 +313,9 @@ ActivateResponse ActivationService::ProcessOfflineGrant(const ActivateRequest& r
     return resp;
   }
 
-  // Bound offline grant duration: default 14 days, minimum 1 day, maximum 30 days
-  if (offline_days == 0) offline_days = 14;
-  if (offline_days > 30) offline_days = 30;
+  // Bound offline grant duration: default 7 days, minimum 1 day, maximum 7 days
+  if (offline_days == 0) offline_days = 7;
+  if (offline_days > 7) offline_days = 7;
 
   std::string anon_key = AnonymizeLicenseKey(req.license_key);
 

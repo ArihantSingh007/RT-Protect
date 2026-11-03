@@ -43,13 +43,106 @@ std::uint64_t DefaultSystemUptimeSeconds() {
 }
 #endif
 
-// Derives a stable boot session identifier from estimated boot time: (wall_now - uptime_now).
-// Stays constant across process lifecycles and relaunches within the same boot,
-// and changes reliably across machine reboots.
+// Queries a stable boot session identifier that is completely decoupled from wall-clock time.
+// On Windows: queries HKLM PrefetchParameters BootId / BaseTime written at boot by SYSTEM,
+// with NtQuerySystemInformation(SystemTimeOfDayInformation) and Session Manager Power fallbacks.
+// On Linux: reads kernel-generated /proc/sys/kernel/random/boot_id.
 std::uint64_t DefaultBootId() {
-  std::uint64_t wall = DefaultWallSeconds();
-  std::uint64_t uptime = DefaultSystemUptimeSeconds();
-  return (wall >= uptime) ? (wall - uptime) : 0;
+#if defined(_WIN32)
+  // 1. Machine-level monotonic boot counter maintained by Windows Prefetch/Cache Manager
+  HKEY hKey = nullptr;
+  if (::RegOpenKeyExA(HKEY_LOCAL_MACHINE,
+                      "SYSTEM\\CurrentControlSet\\Control\\Session Manager\\Memory Management\\PrefetchParameters",
+                      0, KEY_READ, &hKey) == ERROR_SUCCESS) {
+    DWORD boot_id = 0;
+    DWORD size = sizeof(boot_id);
+    DWORD type = 0;
+    LONG res = ::RegQueryValueExA(hKey, "BootId", nullptr, &type,
+                                  reinterpret_cast<LPBYTE>(&boot_id), &size);
+    ::RegCloseKey(hKey);
+    if (res == ERROR_SUCCESS && boot_id != 0) {
+      return static_cast<std::uint64_t>(boot_id);
+    }
+  }
+
+  // 2. NtQuerySystemInformation (SystemTimeOfDayInformation = 3)
+  typedef struct _SYSTEM_TIMEOFDAY_INFO {
+    LARGE_INTEGER BootTime;
+    LARGE_INTEGER CurrentTime;
+    LARGE_INTEGER TimeZoneBias;
+    ULONG TimeZoneId;
+    ULONG Reserved;
+    ULONGLONG BootId;
+  } SYSTEM_TIMEOFDAY_INFO;
+
+  typedef LONG (NTAPI *NtQuerySystemInformationFn)(ULONG, PVOID, ULONG, PULONG);
+  HMODULE hNtdll = ::GetModuleHandleA("ntdll.dll");
+  if (hNtdll) {
+    auto pfn = reinterpret_cast<NtQuerySystemInformationFn>(
+        reinterpret_cast<void*>(::GetProcAddress(hNtdll, "NtQuerySystemInformation")));
+    if (pfn) {
+      SYSTEM_TIMEOFDAY_INFO info{};
+      ULONG ret_len = 0;
+      if (pfn(3, &info, sizeof(info), &ret_len) == 0) {
+        if (info.BootId != 0) {
+          return info.BootId;
+        }
+      }
+    }
+  }
+
+  // 3. Fallback: Power subsystem boot markers written by Windows kernel at boot
+  if (::RegOpenKeyExA(HKEY_LOCAL_MACHINE,
+                      "SYSTEM\\CurrentControlSet\\Control\\Session Manager\\Power",
+                      0, KEY_READ, &hKey) == ERROR_SUCCESS) {
+    DWORD post_time = 0;
+    DWORD size = sizeof(post_time);
+    DWORD type = 0;
+    LONG res = ::RegQueryValueExA(hKey, "POSTTime", nullptr, &type,
+                                  reinterpret_cast<LPBYTE>(&post_time), &size);
+    ::RegCloseKey(hKey);
+    if (res == ERROR_SUCCESS && post_time != 0) {
+      return static_cast<std::uint64_t>(post_time);
+    }
+  }
+
+  return 1;
+#else
+  // Linux / POSIX: Read kernel random boot_id
+  FILE* fp = std::fopen("/proc/sys/kernel/random/boot_id", "r");
+  if (fp) {
+    char buf[128] = {0};
+    if (std::fgets(buf, sizeof(buf), fp)) {
+      std::fclose(fp);
+      std::uint64_t hash = 14695981039346656037ULL;
+      for (const char* p = buf; *p && *p != '\n' && *p != '\r'; ++p) {
+        hash ^= static_cast<std::uint8_t>(*p);
+        hash *= 1099511628211ULL;
+      }
+      if (hash != 0) return hash;
+    } else {
+      std::fclose(fp);
+    }
+  }
+
+  // Fallback to btime from /proc/stat
+  fp = std::fopen("/proc/stat", "r");
+  if (fp) {
+    char line[256];
+    while (std::fgets(line, sizeof(line), fp)) {
+      if (std::strncmp(line, "btime ", 6) == 0) {
+        std::uint64_t btime = 0;
+        if (std::sscanf(line + 6, "%llu", &btime) == 1 && btime != 0) {
+          std::fclose(fp);
+          return btime;
+        }
+      }
+    }
+    std::fclose(fp);
+  }
+
+  return 1;
+#endif
 }
 
 struct InProcessTimeBaseline {
@@ -266,38 +359,13 @@ std::optional<std::uint64_t> TrustedTime::GetTrustedTime(const std::string& prod
   TrustedTimeState state = *state_opt;
   const TrustedTimeState initial_loaded_state = state;
 
-  // Check same-boot session predicate (Finding 5 fix: require |delta_wall - delta_uptime| <= 60s for forward runs)
-  bool is_same_boot = false;
-  if (state.last_boot_id != 0 && state.last_session_uptime_seconds > 0) {
-    std::uint64_t boot_diff = (current_boot_id >= state.last_boot_id)
-                                  ? (current_boot_id - state.last_boot_id)
-                                  : (state.last_boot_id - current_boot_id);
-    if (boot_diff <= kAllowedSkewSeconds && now_uptime >= state.last_session_uptime_seconds) {
-      if (now_wall >= state.last_known_wall_time) {
-        std::uint64_t delta_wall = now_wall - state.last_known_wall_time;
-        std::uint64_t delta_uptime = now_uptime - state.last_session_uptime_seconds;
-        std::uint64_t drift = (delta_wall >= delta_uptime)
-                                  ? (delta_wall - delta_uptime)
-                                  : (delta_uptime - delta_wall);
-        if (drift <= 60) {
-          is_same_boot = true;
-        }
-      } else {
-        // Wall clock moved backward!
-        // In an active session where uptime has advanced continuously (now_uptime >= last_session_uptime),
-        // and in-process steady time has advanced, this is a mid-session backward clock step.
-        if (current_steady >= baseline.start_steady_seconds) {
-          is_same_boot = true;
-        }
-      }
-    } else if (now_uptime >= state.last_session_uptime_seconds &&
-               current_steady >= baseline.start_steady_seconds &&
-               now_wall < state.last_known_wall_time) {
-      // Wall clock backward step shifted estimated boot_id (wall - uptime),
-      // but active process runtime and monotonic uptime are intact.
-      is_same_boot = true;
-    }
-  }
+  // Check same-boot session predicate:
+  // Boot ID uniquely identifies this machine boot session and does not depend on wall-clock time.
+  // Within the same boot, uptime increases monotonically.
+  bool is_same_boot = (state.last_boot_id != 0 &&
+                       current_boot_id != 0 &&
+                       current_boot_id == state.last_boot_id &&
+                       now_uptime >= state.last_session_uptime_seconds);
 
   if (is_same_boot) {
     std::uint64_t delta = now_uptime - state.last_session_uptime_seconds;
@@ -379,6 +447,20 @@ std::optional<std::uint64_t> TrustedTime::GetTrustedTime(const std::string& prod
       state.tamper_detected = true;
       SecureStorage::Store(key, SerializeTimeState(state), "rtprotect_time_state");
       return std::nullopt;
+    }
+
+    // Monotonic anti-clock-freeze verification:
+    // If the wall clock is at or ahead of server anchor time, but monotonic execution
+    // time has outpaced wall clock progress by more than allowed skew (300s),
+    // the system clock is frozen.
+    if (state.last_known_server_time > 0 &&
+        now_wall >= state.last_known_server_time) {
+      std::uint64_t server_monotonic_projected = state.last_known_server_time + state.accumulated_monotonic_seconds;
+      if (now_wall + kAllowedSkewSeconds < server_monotonic_projected) {
+        state.tamper_detected = true;
+        SecureStorage::Store(key, SerializeTimeState(state), "rtprotect_time_state");
+        return std::nullopt;
+      }
     }
   }
 
@@ -500,7 +582,7 @@ std::optional<std::uint64_t> TrustedTime::ParseHttpDate(const std::string& http_
 
 void TrustedTime::ResetTimeStateForTesting(const std::string& product_id) {
   std::lock_guard<std::recursive_mutex> lock(s_trusted_time_mutex);
-  ResetTimeProvidersForTesting();
+  s_process_baseline.initialized = false;
   SecureStorage::Delete(MakeTimeStateKey(product_id));
 }
 

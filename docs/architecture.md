@@ -102,7 +102,7 @@ The licensing subsystem handles machine-bound entitlement enforcement and online
 
 ### 3.4 Cryptography & Memory Security (`crypto/`, `integrity/`)
 
-All cryptographic operations wrap verified OpenSSL 3.4.0 primitives:
+All cryptographic operations wrap verified OpenSSL 4.1.0 primitives:
 
 - **Authenticated Symmetric Encryption (`crypto/aead.h`):** AES-256-GCM with fresh 96-bit nonces generated via `RAND_bytes`. Decryption executes fail-closed, zeroing unauthenticated plaintext immediately on tag validation failure.
 - **Key Derivation (`crypto/kdf.h`):** HKDF-SHA256 (RFC 5869) deriving purpose-isolated keys from master secrets.
