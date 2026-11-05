@@ -10,3 +10,8 @@ add_library(rtprotect_vm STATIC
 target_include_directories(rtprotect_vm PUBLIC
     ${CMAKE_SOURCE_DIR}
 )
+
+if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+    # Scoped warning suppression: silence libstdc++ false positives under -O3 during std::vector reallocation
+    target_compile_options(rtprotect_vm PRIVATE -Wno-stringop-overflow)
+endif()

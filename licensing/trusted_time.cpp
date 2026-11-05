@@ -43,13 +43,88 @@ std::uint64_t DefaultSystemUptimeSeconds() {
 }
 #endif
 
-// Queries a stable boot session identifier that is completely decoupled from wall-clock time.
-// On Windows: queries HKLM PrefetchParameters BootId / BaseTime written at boot by SYSTEM,
-// with NtQuerySystemInformation(SystemTimeOfDayInformation) and Session Manager Power fallbacks.
-// On Linux: reads kernel-generated /proc/sys/kernel/random/boot_id.
+// Queries a verified Windows boot session identifier decoupled from wall-clock time.
+// 1. Queries the Windows Boot Manager's BootIdentifier GUID via NtQuerySystemInformation(SystemBootEnvironmentInformation = 90).
+// 2. Queries the machine-level SYSTEM-written per-boot GUID key in protected registry.
+// 3. Queries PrefetchParameters BootId if enabled.
+// If no trustworthy boot identifier is available, returns 0 to fail conservative / fail closed.
 std::uint64_t DefaultBootId() {
 #if defined(_WIN32)
-  // 1. Machine-level monotonic boot counter maintained by Windows Prefetch/Cache Manager
+  // 1. Authoritative Windows Boot Manager BootIdentifier GUID via SystemBootEnvironmentInformation (90)
+  typedef struct _GUID_DEF {
+    DWORD Data1;
+    WORD Data2;
+    WORD Data3;
+    BYTE Data4[8];
+  } GUID_DEF;
+
+  typedef struct _SYSTEM_BOOT_ENV_INFO {
+    GUID_DEF BootIdentifier;
+    ULONG FirmwareType;
+    ULONGLONG BootFlags;
+  } SYSTEM_BOOT_ENV_INFO;
+
+  typedef LONG (NTAPI *NtQuerySystemInformationFn)(ULONG, PVOID, ULONG, PULONG);
+  HMODULE hNtdll = ::GetModuleHandleA("ntdll.dll");
+  if (hNtdll) {
+    auto pfn = reinterpret_cast<NtQuerySystemInformationFn>(
+        reinterpret_cast<void*>(::GetProcAddress(hNtdll, "NtQuerySystemInformation")));
+    if (pfn) {
+      SYSTEM_BOOT_ENV_INFO info{};
+      ULONG ret_len = 0;
+      // SystemBootEnvironmentInformation = 90
+      if (pfn(90, &info, sizeof(info), &ret_len) == 0) {
+        // Hash the 16-byte BootIdentifier GUID using 64-bit FNV-1a
+        std::uint64_t hash = 14695981039346656037ULL;
+        const auto* raw = reinterpret_cast<const std::uint8_t*>(&info.BootIdentifier);
+        bool non_zero = false;
+        for (std::size_t i = 0; i < sizeof(info.BootIdentifier); ++i) {
+          if (raw[i] != 0) non_zero = true;
+          hash ^= raw[i];
+          hash *= 1099511628211ULL;
+        }
+        if (non_zero && hash != 0) {
+          return hash;
+        }
+      }
+    }
+  }
+
+  // 2. Machine-level SYSTEM-written per-boot GUID key in protected registry
+  static const char* const kProtectedKeys[] = {
+      "SYSTEM\\CurrentControlSet\\Control\\Session Manager\\RTProtect",
+      "SOFTWARE\\RTProtect"
+  };
+  for (const char* subkey : kProtectedKeys) {
+    HKEY hKey = nullptr;
+    if (::RegOpenKeyExA(HKEY_LOCAL_MACHINE, subkey, 0, KEY_READ, &hKey) == ERROR_SUCCESS) {
+      char guid_buf[64] = {0};
+      DWORD size = sizeof(guid_buf) - 1;
+      DWORD type = 0;
+      LONG res = ::RegQueryValueExA(hKey, "BootGuid", nullptr, &type,
+                                    reinterpret_cast<LPBYTE>(guid_buf), &size);
+      if (res == ERROR_SUCCESS && size > 0) {
+        std::uint64_t hash = 14695981039346656037ULL;
+        for (DWORD i = 0; i < size && guid_buf[i] != '\0'; ++i) {
+          hash ^= static_cast<std::uint8_t>(guid_buf[i]);
+          hash *= 1099511628211ULL;
+        }
+        ::RegCloseKey(hKey);
+        if (hash != 0) return hash;
+      } else {
+        DWORD num_id = 0;
+        size = sizeof(num_id);
+        res = ::RegQueryValueExA(hKey, "BootId", nullptr, &type,
+                                 reinterpret_cast<LPBYTE>(&num_id), &size);
+        ::RegCloseKey(hKey);
+        if (res == ERROR_SUCCESS && num_id != 0) {
+          return static_cast<std::uint64_t>(num_id);
+        }
+      }
+    }
+  }
+
+  // 3. PrefetchParameters BootId (monotonic boot counter if enabled)
   HKEY hKey = nullptr;
   if (::RegOpenKeyExA(HKEY_LOCAL_MACHINE,
                       "SYSTEM\\CurrentControlSet\\Control\\Session Manager\\Memory Management\\PrefetchParameters",
@@ -65,83 +140,11 @@ std::uint64_t DefaultBootId() {
     }
   }
 
-  // 2. NtQuerySystemInformation (SystemTimeOfDayInformation = 3)
-  typedef struct _SYSTEM_TIMEOFDAY_INFO {
-    LARGE_INTEGER BootTime;
-    LARGE_INTEGER CurrentTime;
-    LARGE_INTEGER TimeZoneBias;
-    ULONG TimeZoneId;
-    ULONG Reserved;
-    ULONGLONG BootId;
-  } SYSTEM_TIMEOFDAY_INFO;
-
-  typedef LONG (NTAPI *NtQuerySystemInformationFn)(ULONG, PVOID, ULONG, PULONG);
-  HMODULE hNtdll = ::GetModuleHandleA("ntdll.dll");
-  if (hNtdll) {
-    auto pfn = reinterpret_cast<NtQuerySystemInformationFn>(
-        reinterpret_cast<void*>(::GetProcAddress(hNtdll, "NtQuerySystemInformation")));
-    if (pfn) {
-      SYSTEM_TIMEOFDAY_INFO info{};
-      ULONG ret_len = 0;
-      if (pfn(3, &info, sizeof(info), &ret_len) == 0) {
-        if (info.BootId != 0) {
-          return info.BootId;
-        }
-      }
-    }
-  }
-
-  // 3. Fallback: Power subsystem boot markers written by Windows kernel at boot
-  if (::RegOpenKeyExA(HKEY_LOCAL_MACHINE,
-                      "SYSTEM\\CurrentControlSet\\Control\\Session Manager\\Power",
-                      0, KEY_READ, &hKey) == ERROR_SUCCESS) {
-    DWORD post_time = 0;
-    DWORD size = sizeof(post_time);
-    DWORD type = 0;
-    LONG res = ::RegQueryValueExA(hKey, "POSTTime", nullptr, &type,
-                                  reinterpret_cast<LPBYTE>(&post_time), &size);
-    ::RegCloseKey(hKey);
-    if (res == ERROR_SUCCESS && post_time != 0) {
-      return static_cast<std::uint64_t>(post_time);
-    }
-  }
-
-  return 1;
+  // 4. Fail closed / fail conservative: No verified boot identity source available.
+  // Must NEVER return a constant fallback (such as 1) which reopens freeze bypass attacks.
+  return 0;
 #else
-  // Linux / POSIX: Read kernel random boot_id
-  FILE* fp = std::fopen("/proc/sys/kernel/random/boot_id", "r");
-  if (fp) {
-    char buf[128] = {0};
-    if (std::fgets(buf, sizeof(buf), fp)) {
-      std::fclose(fp);
-      std::uint64_t hash = 14695981039346656037ULL;
-      for (const char* p = buf; *p && *p != '\n' && *p != '\r'; ++p) {
-        hash ^= static_cast<std::uint8_t>(*p);
-        hash *= 1099511628211ULL;
-      }
-      if (hash != 0) return hash;
-    } else {
-      std::fclose(fp);
-    }
-  }
-
-  // Fallback to btime from /proc/stat
-  fp = std::fopen("/proc/stat", "r");
-  if (fp) {
-    char line[256];
-    while (std::fgets(line, sizeof(line), fp)) {
-      if (std::strncmp(line, "btime ", 6) == 0) {
-        std::uint64_t btime = 0;
-        if (std::sscanf(line + 6, "%llu", &btime) == 1 && btime != 0) {
-          std::fclose(fp);
-          return btime;
-        }
-      }
-    }
-    std::fclose(fp);
-  }
-
-  return 1;
+  return 0;
 #endif
 }
 
@@ -300,6 +303,10 @@ bool TrustedTime::AnchorServerTime(const std::string& product_id, std::uint64_t 
 
   std::uint64_t now_uptime = s_test_uptime_fn ? s_test_uptime_fn() : DefaultSystemUptimeSeconds();
   std::uint64_t current_boot_id = s_test_boot_id_fn ? s_test_boot_id_fn() : DefaultBootId();
+  if (current_boot_id == 0) {
+    // Fail closed: cannot establish an authoritative trusted time anchor without a verified boot identity
+    return false;
+  }
 
   // Anchor server time strictly forward
   state.last_known_server_time = (std::max)(state.last_known_server_time, server_timestamp);
@@ -324,6 +331,11 @@ std::optional<std::uint64_t> TrustedTime::GetTrustedTime(const std::string& prod
   std::uint64_t now_wall = s_test_wall_fn ? s_test_wall_fn() : DefaultWallSeconds();
   std::uint64_t now_uptime = s_test_uptime_fn ? s_test_uptime_fn() : DefaultSystemUptimeSeconds();
   std::uint64_t current_boot_id = s_test_boot_id_fn ? s_test_boot_id_fn() : DefaultBootId();
+  if (current_boot_id == 0) {
+    // Fail conservative / fail closed: without a verified boot identity, offline execution
+    // cannot safely distinguish reboots from clock manipulation. Refuse trusted time.
+    return std::nullopt;
+  }
 
   const auto& baseline = GetProcessBaseline();
 

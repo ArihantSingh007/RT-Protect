@@ -196,3 +196,5 @@ sequenceDiagram
 2. **Key Isolation:** Private signing keys are never shipped inside client binaries. Client binaries embed only public Ed25519 verification keys.
 3. **Atomic Verification:** The pre-main startup hook initializes before any user code or static library code executes, preventing race conditions where unauthorized code could run prior to integrity validation.
 4. **Authoritative File Paths:** Auxiliary validation files (`client.license`, `release.manifest`, `release.sig`) are resolved strictly relative to the verified binary's parent directory (`::GetModuleFileNameA`), defeating current-working-directory redirection attacks.
+
+5. **Fail-Loud Runtime Policy:** Background periodic revalidation threads continuously evaluate token expiration, offline grant validity, and clock integrity at runtime. If revalidation fails, the engine enforces fail-loud termination via `std::exit(1)` with an explicit diagnostic message on `stderr` rather than silent credential zeroing or stubbing, guaranteeing that execution terminates immediately before corrupted game state or invalid transaction data can be written to disk.

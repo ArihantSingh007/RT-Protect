@@ -293,28 +293,18 @@ bool ClangAstScanner::IsAvailable() {
 }
 
 std::string ClangAstScanner::GetClangBinaryPath() {
-  static const char* const kKnownPaths[] = {
-      "C:\\Program Files\\LLVM\\bin\\clang.exe",
-      "C:\\msys64\\mingw64\\bin\\clang.exe",
-      "C:\\msys64\\ucrt64\\bin\\clang.exe"
-  };
-
   std::error_code ec;
-  for (const char* path : kKnownPaths) {
-    if (fs::exists(path, ec) && !fs::is_directory(path, ec)) return path;
-  }
 
-  // Search system PATH environment variable (supports Windows ';' and POSIX ':' delimiters,
-  // searching for both 'clang.exe' and 'clang')
+  // 1. Search system PATH environment variable (semicolon-delimited on Windows; preserves drive letters like C:\)
   const char* env_path = std::getenv("PATH");
   if (env_path) {
     std::string path_str(env_path);
-    const char* const binary_names[] = { "clang.exe", "clang", "clang++.exe", "clang++" };
+    const char* const binary_names[] = { "clang.exe", "clang++.exe" };
 
     std::vector<std::string> dirs;
     std::string cur;
     for (char ch : path_str) {
-      if (ch == ';' || ch == ':') {
+      if (ch == ';') {
         if (!cur.empty()) {
           dirs.push_back(cur);
           cur.clear();
@@ -335,7 +325,18 @@ std::string ClangAstScanner::GetClangBinaryPath() {
     }
   }
 
-  // Win32 where.exe fallback without shell interpolation
+  // 2. Fallback to common LLVM / MinGW installation paths on Windows
+  static const char* const kKnownPaths[] = {
+      "C:\\Program Files\\LLVM\\bin\\clang.exe",
+      "C:\\msys64\\mingw64\\bin\\clang.exe",
+      "C:\\msys64\\ucrt64\\bin\\clang.exe"
+  };
+
+  for (const char* path : kKnownPaths) {
+    if (fs::exists(path, ec) && !fs::is_directory(path, ec)) return path;
+  }
+
+  // 3. Win32 where.exe fallback without shell interpolation
   std::string out;
   if (RunProcessCaptureOutput("where.exe", { "clang.exe" }, &out) && !out.empty()) {
     auto nl = out.find('\n');

@@ -1447,8 +1447,9 @@ IntegrationReport ExecuteIntegration(const IntegrationOptions& options) {
     ss << "        }\n";
     ss << "        if (s_stop_revalidation.load(std::memory_order_relaxed)) break;\n";
     ss << "        if (!RevalidateLicenseAndTime()) {\n";
-    ss << "          std::fprintf(stderr, \"[RTProtect] Warning: Runtime license revalidation failed. Runtime credentials invalidated.\\n\");\n";
-    ss << "          break;\n";
+    ss << "          std::fprintf(stderr, \"[RTProtect] Fatal: Periodic license revalidation failed (license expired, token revoked, or clock tampering detected). Terminating per defense-in-depth security policy.\\n\");\n";
+    ss << "          std::fflush(stderr);\n";
+    ss << "          std::exit(1);\n";
     ss << "        }\n";
     ss << "      }\n";
     ss << "    });\n";

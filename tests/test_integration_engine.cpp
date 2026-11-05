@@ -15,6 +15,15 @@
 #include <fstream>
 #include <string>
 #include <openssl/rand.h>
+#if defined(_WIN32)
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#endif
 
 #define RT_TEST_ASSERT(cond)                                                    \
   do {                                                                          \
@@ -1687,6 +1696,49 @@ void TestAutoVirtualizeMultiCandidateDescendingOffsets() {
   std::printf("  PASSED: Multi-candidate auto-virtualization with descending offset processing.\n");
 }
 
+void TestClangDiscoveryWithDriveLetterPath() {
+  std::printf("Running TestClangDiscoveryWithDriveLetterPath...\n");
+
+  fs::path test_dir = fs::current_path() / "build" / "temp_test_clang_path";
+  CleanDir(test_dir);
+  fs::create_directories(test_dir / "bin");
+
+  // Create a fake clang.exe inside a drive-letter path (e.g. C:\...\temp_test_clang_path\bin\clang.exe)
+  fs::path fake_clang = test_dir / "bin" / "clang.exe";
+  WriteTextFile(fake_clang.string(), "dummy clang binary");
+
+  // Save original PATH
+  const char* orig_path_cstr = std::getenv("PATH");
+  std::string orig_path = orig_path_cstr ? orig_path_cstr : "";
+
+  // Set PATH to contain drive letter path followed by dummy probe dirs
+  std::string custom_path = (test_dir / "bin").string() + ";C:\\dummy_probe_dir;D:\\another_probe";
+#if defined(_WIN32)
+  ::SetEnvironmentVariableA("PATH", custom_path.c_str());
+  _putenv_s("PATH", custom_path.c_str());
+#else
+  setenv("PATH", custom_path.c_str(), 1);
+#endif
+
+  std::string found = tooling::ClangAstScanner::GetClangBinaryPath();
+
+  // Restore original PATH immediately
+#if defined(_WIN32)
+  ::SetEnvironmentVariableA("PATH", orig_path.c_str());
+  _putenv_s("PATH", orig_path.c_str());
+#else
+  setenv("PATH", orig_path.c_str(), 1);
+#endif
+
+  // Must have successfully resolved the fake clang without splitting on the drive colon
+  assert(!found.empty());
+  assert(fs::equivalent(fs::path(found), fake_clang));
+
+  CleanDir(test_dir);
+
+  std::printf("  PASSED: PATH parsing preserves Windows drive-letter paths without splitting on colons.\n");
+}
+
 }  // namespace
 
 int main() {
@@ -1718,6 +1770,7 @@ int main() {
   TestCandidateSelectionAndSuitabilityScoring();
   TestEntanglementLinter();
   TestAutoVirtualizeMultiCandidateDescendingOffsets();
+  TestClangDiscoveryWithDriveLetterPath();
   std::printf("ALL INTEGRATION ENGINE TESTS PASSED.\n");
   return 0;
 }

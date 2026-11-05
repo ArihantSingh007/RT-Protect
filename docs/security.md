@@ -71,3 +71,12 @@ To prevent users from extending expired evaluation licenses by modifying their l
 
 ### 3.6 Dynamic Countermeasure Channel
 The activation server can distribute signed `CountermeasureConfig` payloads during `/activate` or `/renew` requests. The client verifies the Ed25519 signature against `kCountermeasurePublicKey` before applying updated process blacklists, window title blacklists, or driver hashes. Expired policies are discarded automatically.
+
+### 3.7 Fail-Loud Periodic Runtime Revalidation Policy
+To prevent long-running applications from operating on revoked tokens, expired offline grants, or tampered system clocks, `rtprotect-tool integrate` injects a background periodic revalidation thread (`StartPeriodicRevalidation`). The thread continuously monitors token validity and trusted monotonic time progression at configurable intervals (default: 60 seconds).
+
+The revalidation subsystem strictly enforces a **fail-loud** defense-in-depth policy. Rather than silently degrading execution (such as zeroing runtime keys or returning zero/stubs while allowing the host process to continue running, which risks corrupting persistent game saves or database transactions), any revalidation failure:
+1. Emits an explicit diagnostic message to `stderr`:
+   `[RTProtect] Fatal: Periodic license revalidation failed (license expired, token revoked, or clock tampering detected). Terminating per defense-in-depth security policy.`
+2. Flushes `stderr`.
+3. Immediately terminates process execution via `std::exit(1)`.
