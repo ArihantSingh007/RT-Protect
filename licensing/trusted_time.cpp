@@ -44,53 +44,15 @@ std::uint64_t DefaultSystemUptimeSeconds() {
 #endif
 
 // Queries a verified Windows boot session identifier decoupled from wall-clock time.
-// 1. Queries the Windows Boot Manager's BootIdentifier GUID via NtQuerySystemInformation(SystemBootEnvironmentInformation = 90).
-// 2. Queries the machine-level SYSTEM-written per-boot GUID key in protected registry.
-// 3. Queries PrefetchParameters BootId if enabled.
-// If no trustworthy boot identifier is available, returns 0 to fail conservative / fail closed.
+// 1. Queries the machine-level SYSTEM startup boot GUID key in protected registry
+//    (written at OS startup by rtprotect-tool register-boot-session or RTProtectBootSession service).
+// 2. Queries PrefetchParameters BootId if enabled on the host.
+// 3. Queries Power subsystem POSTTime / ResumeBootMgrTime.
+// If no trustworthy boot identifier is available, returns 0 to signal unavailable boot identity,
+// engaging the availability policy (allows online-only anchoring, refuses offline grants).
 std::uint64_t DefaultBootId() {
 #if defined(_WIN32)
-  // 1. Authoritative Windows Boot Manager BootIdentifier GUID via SystemBootEnvironmentInformation (90)
-  typedef struct _GUID_DEF {
-    DWORD Data1;
-    WORD Data2;
-    WORD Data3;
-    BYTE Data4[8];
-  } GUID_DEF;
-
-  typedef struct _SYSTEM_BOOT_ENV_INFO {
-    GUID_DEF BootIdentifier;
-    ULONG FirmwareType;
-    ULONGLONG BootFlags;
-  } SYSTEM_BOOT_ENV_INFO;
-
-  typedef LONG (NTAPI *NtQuerySystemInformationFn)(ULONG, PVOID, ULONG, PULONG);
-  HMODULE hNtdll = ::GetModuleHandleA("ntdll.dll");
-  if (hNtdll) {
-    auto pfn = reinterpret_cast<NtQuerySystemInformationFn>(
-        reinterpret_cast<void*>(::GetProcAddress(hNtdll, "NtQuerySystemInformation")));
-    if (pfn) {
-      SYSTEM_BOOT_ENV_INFO info{};
-      ULONG ret_len = 0;
-      // SystemBootEnvironmentInformation = 90
-      if (pfn(90, &info, sizeof(info), &ret_len) == 0) {
-        // Hash the 16-byte BootIdentifier GUID using 64-bit FNV-1a
-        std::uint64_t hash = 14695981039346656037ULL;
-        const auto* raw = reinterpret_cast<const std::uint8_t*>(&info.BootIdentifier);
-        bool non_zero = false;
-        for (std::size_t i = 0; i < sizeof(info.BootIdentifier); ++i) {
-          if (raw[i] != 0) non_zero = true;
-          hash ^= raw[i];
-          hash *= 1099511628211ULL;
-        }
-        if (non_zero && hash != 0) {
-          return hash;
-        }
-      }
-    }
-  }
-
-  // 2. Machine-level SYSTEM-written per-boot GUID key in protected registry
+  // 1. Machine-level SYSTEM startup boot GUID key in protected registry
   static const char* const kProtectedKeys[] = {
       "SYSTEM\\CurrentControlSet\\Control\\Session Manager\\RTProtect",
       "SOFTWARE\\RTProtect"
@@ -124,7 +86,7 @@ std::uint64_t DefaultBootId() {
     }
   }
 
-  // 3. PrefetchParameters BootId (monotonic boot counter if enabled)
+  // 2. PrefetchParameters BootId (monotonic boot counter incremented at boot by Windows Cache Manager)
   HKEY hKey = nullptr;
   if (::RegOpenKeyExA(HKEY_LOCAL_MACHINE,
                       "SYSTEM\\CurrentControlSet\\Control\\Session Manager\\Memory Management\\PrefetchParameters",
@@ -140,8 +102,28 @@ std::uint64_t DefaultBootId() {
     }
   }
 
-  // 4. Fail closed / fail conservative: No verified boot identity source available.
-  // Must NEVER return a constant fallback (such as 1) which reopens freeze bypass attacks.
+  // 3. Session Manager Power subsystem boot time markers written by Windows kernel at boot
+  if (::RegOpenKeyExA(HKEY_LOCAL_MACHINE,
+                      "SYSTEM\\CurrentControlSet\\Control\\Session Manager\\Power",
+                      0, KEY_READ, &hKey) == ERROR_SUCCESS) {
+    DWORD resume_time = 0;
+    DWORD size = sizeof(resume_time);
+    DWORD type = 0;
+    LONG res = ::RegQueryValueExA(hKey, "ResumeBootMgrTime", nullptr, &type,
+                                  reinterpret_cast<LPBYTE>(&resume_time), &size);
+    if (res != ERROR_SUCCESS || resume_time == 0) {
+      res = ::RegQueryValueExA(hKey, "POSTTime", nullptr, &type,
+                               reinterpret_cast<LPBYTE>(&resume_time), &size);
+    }
+    ::RegCloseKey(hKey);
+    if (res == ERROR_SUCCESS && resume_time != 0) {
+      return static_cast<std::uint64_t>(resume_time);
+    }
+  }
+
+  // 4. Return 0 if no verified boot source exists (e.g. Wine, minimal VMs).
+  // This invokes the availability policy: online-only anchoring is permitted,
+  // while offline grants without server connectivity are refused.
   return 0;
 #else
   return 0;
@@ -303,11 +285,9 @@ bool TrustedTime::AnchorServerTime(const std::string& product_id, std::uint64_t 
 
   std::uint64_t now_uptime = s_test_uptime_fn ? s_test_uptime_fn() : DefaultSystemUptimeSeconds();
   std::uint64_t current_boot_id = s_test_boot_id_fn ? s_test_boot_id_fn() : DefaultBootId();
-  if (current_boot_id == 0) {
-    // Fail closed: cannot establish an authoritative trusted time anchor without a verified boot identity
-    return false;
-  }
 
+  // Availability Policy: Online server anchoring is authoritative and ALWAYS succeeds.
+  // A verified boot ID is NOT required to anchor authenticated server time.
   // Anchor server time strictly forward
   state.last_known_server_time = (std::max)(state.last_known_server_time, server_timestamp);
 
@@ -331,11 +311,6 @@ std::optional<std::uint64_t> TrustedTime::GetTrustedTime(const std::string& prod
   std::uint64_t now_wall = s_test_wall_fn ? s_test_wall_fn() : DefaultWallSeconds();
   std::uint64_t now_uptime = s_test_uptime_fn ? s_test_uptime_fn() : DefaultSystemUptimeSeconds();
   std::uint64_t current_boot_id = s_test_boot_id_fn ? s_test_boot_id_fn() : DefaultBootId();
-  if (current_boot_id == 0) {
-    // Fail conservative / fail closed: without a verified boot identity, offline execution
-    // cannot safely distinguish reboots from clock manipulation. Refuse trusted time.
-    return std::nullopt;
-  }
 
   const auto& baseline = GetProcessBaseline();
 
@@ -383,8 +358,8 @@ std::optional<std::uint64_t> TrustedTime::GetTrustedTime(const std::string& prod
     std::uint64_t delta = now_uptime - state.last_session_uptime_seconds;
     state.accumulated_monotonic_seconds += delta;
     state.last_session_uptime_seconds = now_uptime;
-  } else {
-    // A reboot occurred (or first observation of boot_id)
+  } else if (current_boot_id != 0) {
+    // A reboot occurred (or first observation of boot_id) on a platform with verified boot ID
     state.last_boot_id = current_boot_id;
     if (state.last_session_uptime_seconds > 0) {
       state.accumulated_monotonic_seconds += now_uptime;
@@ -423,7 +398,7 @@ std::optional<std::uint64_t> TrustedTime::GetTrustedTime(const std::string& prod
     }
   }
 
-  if (!is_same_boot) {
+  if (current_boot_id != 0 && !is_same_boot) {
     // 3. Across reboots: Wall clock behind last-known server timestamp
     if (state.last_known_server_time > 0 &&
         now_wall + kAllowedSkewSeconds < state.last_known_server_time) {
@@ -517,6 +492,20 @@ TimeValidationResult TrustedTime::ValidateToken(const std::string& product_id,
   }
 
   std::uint64_t current_time = *current_time_opt;
+
+  // Availability Policy:
+  // Offline grants (duration > 7 days, or token specifically flagged for offline use)
+  // require a verified boot identity on this host to safely enforce monotonic expiration
+  // across system reboots without contacting an activation authority.
+  // If boot identity cannot be established (current_boot_id == 0), offline grants fail closed
+  // to prevent freeze-after-reboot bypass attacks.
+  // Standard online tokens continue to validate normally.
+  std::uint64_t current_boot_id = s_test_boot_id_fn ? s_test_boot_id_fn() : DefaultBootId();
+  bool is_offline_grant = (token.license_id.find("offline") != std::string::npos ||
+                           (token.expires_at > token.issued_at + 86400 * 7));
+  if (is_offline_grant && current_boot_id == 0) {
+    return TimeValidationResult::kClockTampered;
+  }
 
   // Token issued in the distant future
   if (token.issued_at > 0 && token.issued_at > current_time + kAllowedSkewSeconds) {

@@ -13,5 +13,5 @@ target_include_directories(rtprotect_vm PUBLIC
 
 if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
     # Scoped warning suppression: silence libstdc++ false positives under -O3 during std::vector reallocation
-    target_compile_options(rtprotect_vm PRIVATE -Wno-stringop-overflow)
+    target_compile_options(rtprotect_vm PRIVATE -Wno-stringop-overflow -Wno-free-nonheap-object)
 endif()

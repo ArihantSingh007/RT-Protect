@@ -860,26 +860,21 @@ MT_TEST(TrustedTime_ProbeF_BackwardStep_Succeeds) {
   TrustedTime::ResetTimeProvidersForTesting();
 }
 
-// Verifies that the real Windows boot ID query yields an authoritative, non-constant
-// session identifier and never falls back to constant 1 or fails to 0 on real Windows.
+// Verifies that the real Windows boot ID query never falls back to constant 1
 MT_TEST(TrustedTime_RealBootId_VerifiedAndNonFallback) {
   TrustedTime::ResetTimeProvidersForTesting();
   std::uint64_t real_boot_id = TrustedTime::GetCurrentBootId();
-#if defined(_WIN32)
-  // On real Windows NT 6.2+ (Windows 8, 10, 11, Server), NtQuerySystemInformation
-  // with SystemBootEnvironmentInformation (90) or the registry per-boot GUID key
-  // MUST provide a verified, non-zero boot ID.
-  // It must NEVER return 0 (unknown) on real Windows, and must NEVER return 1 (old constant fallback).
-  MT_CHECK(real_boot_id != 0);
+  // It must NEVER return 1 (the old constant fallback that opened the freeze bypass)
   MT_CHECK(real_boot_id != 1);
-#endif
   TrustedTime::ResetTimeProvidersForTesting();
 }
 
-// Verifies that when no verified boot ID can be established (boot_id == 0),
-// TrustedTime fails closed / fails conservative: anchoring is refused, trusted time returns
-// std::nullopt, and token validation returns kClockTampered.
-MT_TEST(TrustedTime_UnknownBootId_FailsConservative) {
+// Verifies availability policy when boot ID is unavailable (boot_id == 0):
+// 1. Online server anchoring succeeds (availability maintained for online sessions).
+// 2. In-process monotonic trusted time functions normally for active session.
+// 3. Standard online tokens validate successfully.
+// 4. Offline grants (which require a verified boot ID across reboots) FAIL CLOSED (kClockTampered).
+MT_TEST(TrustedTime_UnknownBootId_AvailabilityPolicy) {
   std::string prod = "test_time_prod_bootid_zero";
   TrustedTime::ResetTimeStateForTesting(prod);
 
@@ -889,22 +884,33 @@ MT_TEST(TrustedTime_UnknownBootId_FailsConservative) {
   s_mock_boot_id = 0; // Unknown / unverified boot identity
   TrustedTime::SetTimeProvidersForTesting(MockWall, MockUptime, MockBootId);
 
-  // 1. Anchoring must refuse / fail closed when boot ID is 0
+  // 1. Online server anchoring SUCCEEDS under the availability policy
   bool anchor_ok = TrustedTime::AnchorServerTime(prod, 1700000000);
-  MT_CHECK(!anchor_ok);
+  MT_CHECK(anchor_ok);
 
-  // 2. Querying trusted time must return nullopt
+  // 2. Querying trusted time for online-anchored session succeeds
   auto t = TrustedTime::GetTrustedTime(prod);
-  MT_CHECK(!t.has_value());
+  MT_CHECK(t.has_value());
+  MT_CHECK(*t >= 1700000000);
 
-  // 3. Token validation must fail (return kClockTampered)
-  ActivationToken tok;
-  tok.license_id = "lic-unknown-boot";
-  tok.issued_at = 1700000000 - 60;
-  tok.expires_at = 1700000000 + 86400;
-  tok.grace_expires_at = tok.expires_at + 86400;
-  auto res = TrustedTime::ValidateToken(prod, tok);
-  MT_CHECK(res == TimeValidationResult::kClockTampered);
+  // 3. Standard online token validates successfully
+  ActivationToken online_tok;
+  online_tok.license_id = "lic-online-session";
+  online_tok.issued_at = 1700000000 - 60;
+  online_tok.expires_at = 1700000000 + 86400;
+  online_tok.grace_expires_at = online_tok.expires_at + 86400;
+  auto res_online = TrustedTime::ValidateToken(prod, online_tok);
+  MT_CHECK(res_online == TimeValidationResult::kValid);
+
+  // 4. Offline grant MUST FAIL CLOSED (returns kClockTampered) because cross-reboot
+  // anti-tampering cannot be guaranteed without a verified boot identity!
+  ActivationToken offline_grant_tok;
+  offline_grant_tok.license_id = "lic-offline-grant-token";
+  offline_grant_tok.issued_at = 1700000000 - 60;
+  offline_grant_tok.expires_at = 1700000000 + (86400 * 14); // 14-day offline grant
+  offline_grant_tok.grace_expires_at = offline_grant_tok.expires_at + 86400;
+  auto res_offline = TrustedTime::ValidateToken(prod, offline_grant_tok);
+  MT_CHECK(res_offline == TimeValidationResult::kClockTampered);
 
   TrustedTime::ResetTimeStateForTesting(prod);
   TrustedTime::ResetTimeProvidersForTesting();

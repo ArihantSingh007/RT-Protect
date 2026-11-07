@@ -2,6 +2,12 @@
 
 #include <cstring>
 
+#if defined(__GNUC__)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wstringop-overflow"
+#pragma GCC diagnostic ignored "-Wfree-nonheap-object"
+#endif
+
 namespace rtprotect::vm {
 
 namespace {
@@ -90,3 +96,7 @@ std::optional<Program> Deserialize(const std::uint8_t* data, std::size_t len) {
 }
 
 }  // namespace rtprotect::vm
+
+#if defined(__GNUC__)
+#pragma GCC diagnostic pop
+#endif

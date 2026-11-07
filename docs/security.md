@@ -73,10 +73,22 @@ To prevent users from extending expired evaluation licenses by modifying their l
 The activation server can distribute signed `CountermeasureConfig` payloads during `/activate` or `/renew` requests. The client verifies the Ed25519 signature against `kCountermeasurePublicKey` before applying updated process blacklists, window title blacklists, or driver hashes. Expired policies are discarded automatically.
 
 ### 3.7 Fail-Loud Periodic Runtime Revalidation Policy
-To prevent long-running applications from operating on revoked tokens, expired offline grants, or tampered system clocks, `rtprotect-tool integrate` injects a background periodic revalidation thread (`StartPeriodicRevalidation`). The thread continuously monitors token validity and trusted monotonic time progression at configurable intervals (default: 60 seconds).
+To prevent long-running applications from operating on revoked tokens, expired offline grants, or tampered system clocks, `rtprotect-tool integrate` injects a background periodic revalidation thread (`StartPeriodicRevalidation`). The thread continuously monitors token validity and trusted monotonic time progression at configurable intervals (default: 30 seconds).
 
 The revalidation subsystem strictly enforces a **fail-loud** defense-in-depth policy. Rather than silently degrading execution (such as zeroing runtime keys or returning zero/stubs while allowing the host process to continue running, which risks corrupting persistent game saves or database transactions), any revalidation failure:
 1. Emits an explicit diagnostic message to `stderr`:
    `[RTProtect] Fatal: Periodic license revalidation failed (license expired, token revoked, or clock tampering detected). Terminating per defense-in-depth security policy.`
 2. Flushes `stderr`.
-3. Immediately terminates process execution via `std::exit(1)`.
+3. Immediately terminates process execution via `std::_Exit(1)` (controlled shutdown avoiding static destructor execution races with concurrent threads).
+
+Additionally, thread creation is hardened against silent fail-open: if `std::thread` construction fails or throws, the handler intercepts the exception, logs a fatal diagnostic, and terminates immediately via `std::_Exit(1)`.
+
+### 3.8 Machine-Level Boot Session Identity & Availability Policy
+To defeat freeze-after-reboot attacks without compromising availability on virtualized or minimal environments:
+- **Verified Boot Identity:** In production Windows environments, the machine boot session is established via:
+  1. A machine-level startup boot session writer (`rtprotect-tool register-boot-session` / `tooling/setup_boot_writer.ps1`) executed at system startup by `NT AUTHORITY\SYSTEM`, writing an ACL-protected GUID to `HKLM\SYSTEM\CurrentControlSet\Control\Session Manager\RTProtect\BootGuid`.
+  2. Windows Cache Manager `PrefetchParameters\BootId` counter.
+  3. Kernel Power subsystem session markers (`ResumeBootMgrTime` / `POSTTime`).
+- **Availability Policy:** If no verified boot identifier source is present on the machine (e.g., Wine or minimal containerized VMs):
+  - Online server anchoring and active session token validation are **fully permitted**, ensuring 100% operational availability for connected customers.
+  - Multi-day **offline grants** are strictly refused (`kClockTampered`), maintaining uncompromising cryptographic protection against clock freeze attacks across reboots.

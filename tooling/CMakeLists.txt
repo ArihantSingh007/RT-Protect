@@ -52,3 +52,7 @@ if(WIN32 AND EXISTS "${CMAKE_SOURCE_DIR}/third_party/openssl/bin")
     file(COPY ${OPENSSL_DLLS} DESTINATION "${CMAKE_CURRENT_BINARY_DIR}/Release")
   endif()
 endif()
+
+if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+    target_compile_options(rtprotect_tooling PRIVATE -Wno-stringop-overflow)
+endif()

@@ -1449,12 +1449,20 @@ IntegrationReport ExecuteIntegration(const IntegrationOptions& options) {
     ss << "        if (!RevalidateLicenseAndTime()) {\n";
     ss << "          std::fprintf(stderr, \"[RTProtect] Fatal: Periodic license revalidation failed (license expired, token revoked, or clock tampering detected). Terminating per defense-in-depth security policy.\\n\");\n";
     ss << "          std::fflush(stderr);\n";
-    ss << "          std::exit(1);\n";
+    ss << "          std::_Exit(1);\n";
     ss << "        }\n";
     ss << "      }\n";
     ss << "    });\n";
     ss << "    t.detach();\n";
-    ss << "  } catch (...) {}\n";
+    ss << "  } catch (const std::exception& e) {\n";
+    ss << "    std::fprintf(stderr, \"[RTProtect] Fatal: Failed to spawn periodic license revalidation watchdog thread: %s. Terminating per defense-in-depth security policy.\\n\", e.what());\n";
+    ss << "    std::fflush(stderr);\n";
+    ss << "    std::_Exit(1);\n";
+    ss << "  } catch (...) {\n";
+    ss << "    std::fprintf(stderr, \"[RTProtect] Fatal: Failed to spawn periodic license revalidation watchdog thread (unknown exception). Terminating per defense-in-depth security policy.\\n\");\n";
+    ss << "    std::fflush(stderr);\n";
+    ss << "    std::_Exit(1);\n";
+    ss << "  }\n";
     ss << "}\n\n";
 
     ss << "void SetClientActivationCredential(const char* credential) {\n";

@@ -14,6 +14,7 @@
 #include <vector>
 
 #include <openssl/crypto.h>
+#include <openssl/rand.h>
 
 #include "crypto/aead.h"
 #include "integrity/keys.h"
@@ -245,6 +246,9 @@ void PrintUsage() {
       "      --credential-file <file>          Read optional activation secret from file\n"
       "      --credential-stdin                Read optional activation secret from stdin\n"
       "      --out <file>                      Optional output file to save serialized token\n"
+      "\n"
+      "    rtprotect-tool register-boot-session\n"
+      "      Record machine boot session GUID into HKLM for anti-clock-freeze verification\n" 
       "\n"
       "  Cryptographic & Integrity Primitives:\n"
       "    rtprotect-tool genkey-ed25519 <priv-out> <pub-out>\n"
@@ -1388,6 +1392,61 @@ int CmdProtectBinary(int argc, char** argv) {
   return 0;
 }
 
+int CmdRegisterBootSession(int argc, char** argv) {
+  (void)argc;
+  (void)argv;
+#if defined(_WIN32)
+  std::uint8_t random_bytes[16];
+  if (RAND_bytes(random_bytes, sizeof(random_bytes)) != 1) {
+    std::fprintf(stderr, "Error: Failed to generate cryptographic random boot GUID\n");
+    return 1;
+  }
+  char guid_str[64];
+  std::snprintf(guid_str, sizeof(guid_str),
+                "%02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-%02x%02x%02x%02x%02x%02x",
+                random_bytes[0], random_bytes[1], random_bytes[2], random_bytes[3],
+                random_bytes[4], random_bytes[5], random_bytes[6], random_bytes[7],
+                random_bytes[8], random_bytes[9], random_bytes[10], random_bytes[11],
+                random_bytes[12], random_bytes[13], random_bytes[14], random_bytes[15]);
+
+  std::uint64_t hash = 14695981039346656037ULL;
+  for (int i = 0; guid_str[i] != '\0'; ++i) {
+    hash ^= static_cast<std::uint8_t>(guid_str[i]);
+    hash *= 1099511628211ULL;
+  }
+  DWORD boot_id_dw = static_cast<DWORD>(hash & 0xFFFFFFFF);
+
+  HKEY hKey = nullptr;
+  DWORD disp = 0;
+  LONG res = ::RegCreateKeyExA(HKEY_LOCAL_MACHINE,
+                               "SYSTEM\\CurrentControlSet\\Control\\Session Manager\\RTProtect",
+                               0, nullptr, REG_OPTION_NON_VOLATILE, KEY_WRITE, nullptr, &hKey, &disp);
+  if (res != ERROR_SUCCESS) {
+    res = ::RegCreateKeyExA(HKEY_LOCAL_MACHINE,
+                            "SOFTWARE\\RTProtect",
+                            0, nullptr, REG_OPTION_NON_VOLATILE, KEY_WRITE, nullptr, &hKey, &disp);
+  }
+  if (res != ERROR_SUCCESS) {
+    std::fprintf(stderr, "Warning: Failed to open or create protected registry key (requires Administrator or SYSTEM privileges, Win32 error %ld)\n", res);
+    return 1;
+  }
+
+  ::RegSetValueExA(hKey, "BootGuid", 0, REG_SZ,
+                   reinterpret_cast<const BYTE*>(guid_str),
+                   static_cast<DWORD>(std::strlen(guid_str) + 1));
+  ::RegSetValueExA(hKey, "BootId", 0, REG_DWORD,
+                   reinterpret_cast<const BYTE*>(&boot_id_dw), sizeof(boot_id_dw));
+  ::RegCloseKey(hKey);
+
+  std::printf("Successfully registered machine boot session GUID: %s (BootId: 0x%08lX)\n",
+              guid_str, static_cast<unsigned long>(boot_id_dw));
+  return 0;
+#else
+  std::printf("Boot session registration is a Windows-only platform capability.\n");
+  return 0;
+#endif
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -1430,6 +1489,7 @@ int main(int argc, char** argv) {
     if (cmd == "activate-verify") return CmdActivateVerify(argc, argv);
     if (cmd == "activate-revoke") return CmdActivateRevoke(argc, argv);
     if (cmd == "offline-grant") return CmdOfflineGrant(argc, argv);
+    if (cmd == "register-boot-session" || cmd == "record-boot") return CmdRegisterBootSession(argc, argv);
 
     // Cryptographic Primitives
     if (cmd == "genkey-ed25519") return CmdGenkeyEd25519(argc, argv);

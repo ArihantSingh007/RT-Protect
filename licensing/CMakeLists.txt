@@ -23,3 +23,8 @@ add_library(rtprotect_licensing_buildtools STATIC
 )
 target_include_directories(rtprotect_licensing_buildtools PUBLIC ${CMAKE_SOURCE_DIR})
 target_link_libraries(rtprotect_licensing_buildtools PUBLIC rtprotect_licensing rtprotect_integrity_buildtools OpenSSL::SSL ws2_32 crypt32)
+
+if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+    target_compile_options(rtprotect_licensing PRIVATE -Wno-stringop-overflow)
+    target_compile_options(rtprotect_licensing_buildtools PRIVATE -Wno-stringop-overflow)
+endif()
